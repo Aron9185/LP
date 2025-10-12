@@ -1,0 +1,37 @@
+# bytecode / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# environments & editors
+.venv/
+env/
+.conda/
+*.egg-info/
+.vscode/
+.idea/
+
+# notebooks & checkpoints
+.ipynb_checkpoints/
+
+# logs & runs
+logs/
+runs/
+wandb/
+tensorboard/
+events.out.tfevents*
+*.log
+
+# data & artifacts
+data/
+dataset/
+pretrain/
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+*.gz
