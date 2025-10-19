@@ -28,9 +28,94 @@ from utils import *
 from input_data import CalN2V
 
 from sklearn.metrics.pairwise import cosine_similarity
+from typing import Optional, Tuple
 
-def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden2, dropout, learning_rate, weight_decay, aug_graph_weight, aug_ratio, aug_bound, alpha, beta, gamma, delta, temperature, labels, idx_train, idx_val, idx_test, ver, degree_ratio, loss_ver, feat_maske_ratio,
-                 pretrain_epochs=100, frozen_scores_path:str="", pretrained_ckpt_path:str=""):
+def train_encoder(
+    dataset_str: str,
+    device: torch.device,
+    num_epoch: int,
+    adj: torch.Tensor,                       # dense [N,N] with self-loops or edge_index upstream
+    features: torch.Tensor,                  # [N,F] (dense)
+    hidden1: int,
+    hidden2: int,
+    dropout: float,
+    learning_rate: float,
+    weight_decay: float,
+    aug_graph_weight: float,
+    aug_ratio: float,                        # GLOBAL edit budget (× |E0|)
+    aug_bound: float,                        # PER-NODE cap fraction (vs deg0)
+    alpha: float, beta: float, gamma: float, delta: float,
+    temperature: float,
+    labels: torch.Tensor,
+    idx_train, idx_val, idx_test,
+    ver: str,                                # "aron_desc/asc", "aron_db_any/intra/inter", "no", ...
+    degree_ratio: float,
+    loss_ver: str,
+    feat_maske_ratio: float,
+    pretrain_epochs: int = 100,
+    frozen_scores_path: str = "",
+    pretrained_ckpt_path: str = "",
+    *,
+    # ---- NEW: clustering / augmentation knobs ----
+    dbscan_eps: Optional[float] = None,      # None = auto (median kNN heuristic)
+    dbscan_min_samples: int = 5,
+    dbscan_metric: str = "cosine",           # "cosine" | "euclidean"
+    topk_per_node: int = 64,                 # candidate pool size per node
+    charge_both_endpoints: bool = True,      # per-node cap charged to both endpoints
+    aug_ratio_epoch: Optional[float] = None, # None disables per-epoch throttle
+    # ---- NEW: logging / reproducibility ----
+    run_tag: str = "",                       # free-form tag for logs/checkpoints
+    seed: Optional[int] = None,
+) -> Tuple[torch.Tensor, list, list, torch.Tensor]:
+    """
+    Train the encoder with budgeted graph augmentation.
+
+    Args:
+        dataset_str: Dataset name (e.g., "cora", "citeseer", "Cora_ML", "LastFMAsia").
+        device: Torch device.
+        num_epoch: Total training epochs AFTER any pretraining.
+        adj: Dense adjacency WITH self-loops for the current working graph.
+        features: Node feature matrix (dense).
+        hidden1/hidden2, dropout, learning_rate, weight_decay: Encoder architecture & optimizer hparams.
+        aug_graph_weight: Weight of the augmentation loss term (if applicable).
+        aug_ratio: GLOBAL total edit budget as a fraction of original |E0|.
+        aug_bound: PER-NODE edit cap fraction relative to ORIGINAL degree deg0 (ceil applied).
+        alpha, beta, gamma, delta, temperature: Loss/config knobs (unchanged).
+        labels, idx_train/idx_val/idx_test: Supervision / splits.
+        ver: Augmentation variant:
+             - "aron_desc"/"aron_asc" (score-guided deficit fill),
+             - "aron_db_any"/"aron_db_intra"/"aron_db_inter" (density-cluster filtered),
+             - "no" (no augmentation).
+        degree_ratio: Percentile (incl self-loop) used to derive degree floor (you subtract 1 internally).
+        loss_ver: Which loss variant to use.
+        feat_maske_ratio: Column-wise feature dropout ratio (0 disables).
+        pretrain_epochs: Warm-up epochs on ORIGINAL graph to get frozen scores (if path missing).
+        frozen_scores_path: Optional path to load/save [N,N] confidence matrix.
+        pretrained_ckpt_path: Optional path to load/save pretrained encoder weights.
+
+    Keyword Args (NEW):
+        dbscan_eps: DBSCAN epsilon; None = auto (median kNN distance).
+        dbscan_min_samples: DBSCAN min_samples.
+        dbscan_metric: "cosine" (recommended) or "euclidean".
+        topk_per_node: Per-node candidate pool size to avoid O(N^2).
+        charge_both_endpoints: If True, count both endpoints toward per-node cap; else only the lower-degree side.
+        aug_ratio_epoch: Optional per-epoch cap (fraction of |E0|); None disables throttle.
+        run_tag: Free-form tag for logging (e.g., "1007_s0_intra").
+        seed: Optional random seed.
+
+    Returns:
+        Z: Final node embeddings [N,d].
+        roc_history: List of validation ROC/AUC across epochs (if you track it).
+        modification_ratio_history: List of global mod ratios across epochs.
+        edge_index: Final edge_index of the augmented graph (COO indices).
+
+    Notes:
+        - E0, deg0_excl_self, forbid_mask are computed from ORIGINAL graph once per run.
+        - For "aron_desc/asc", if `frozen_scores_path` missing or bad shape, we derive scores via Z·Z^T once.
+        - For "aron_db_*", `frozen_scores_path` is optional; falls back to Z·Z^T.
+        - Per-node caps are enforced against ORIGINAL degrees; global cap uses ORIGINAL |E0|.
+        - Use `charge_both_endpoints=False` if helper saturation becomes a bottleneck.
+    """
     training_time_start = time.time()
 
     num_nodes = adj.shape[0]
@@ -138,7 +223,7 @@ def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden
     # PRETRAIN (only for frozen-score variants)
     # -------------------
     frozen_scores = None
-    need_frozen = ver in ["aron_desc", "aron_asc"]
+    need_frozen = ver in ["aron_desc", "aron_asc", "aron_desc_intra", "aron_desc_inter"]
     
     def _iter_edge_pairs(*edge_sets):
         """Yield (r, c) pairs from lists or numpy arrays uniformly."""
@@ -240,6 +325,16 @@ def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden
     if frozen_scores.shape != (N, N):
         raise ValueError(f"frozen_scores shape {tuple(frozen_scores.shape)} != {(N,N)} for current dataset")
     
+    best_val_roc = -float("inf")
+    best_epoch = -1
+    best_state_cpu = None   # store on CPU to save GPU mem
+    best_val_ap = 0.0
+
+    # optional: a convenient on-disk checkpoint path (safe default)
+    ckpt_dir = os.path.join("checkpoints", dataset_str)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    best_ckpt_path_runtime = os.path.join(ckpt_dir, f"{ver}_{run_tag or 'run'}_best.pt")
+
     for epoch in tqdm(range(num_epoch)):
         t = time.time()
         t1 = time.time()
@@ -341,11 +436,66 @@ def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden
                     f"| global_used_adds={global_used_adds} ({global_used_adds/E0:.4f} of E0)")
 
                 aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features.to_dense(), feat_maske_ratio)
+            # ***** NEW: confidence-guided (desc) with cluster constraint *****
+            elif ver in ("aron_desc_intra", "aron_desc_inter"):
+                # Use the same desc ordering as aron_desc
+                degree_floor = max(0, int(degree_threshold) - 1)   # align with excl-self
+                order = "desc"
+
+                # Get Z from this epoch (you computed Z above)
+                Z_for_cluster = Z.detach()
+
+                # Cluster labels (DBSCAN)
+                labels_cluster = density_cluster_embeddings(
+                    Z_for_cluster,
+                    method="hdbscan",
+                    eps=dbscan_eps,                  # <- use function args (no 'args' here)
+                    min_samples=dbscan_min_samples,
+                    metric=dbscan_metric,
+                )
+
+                # Build ALLOW mask, then merge with your existing forbid_mask
+                mode = "intra" if ver == "aron_desc_intra" else "inter"
+                allow_mask = build_cluster_allow_mask(labels_cluster, mode=mode, exclude_noise=True, device=device)
+                forbid_mask_combined = forbid_mask | (~allow_mask)
+
+                # Scores: prefer frozen_scores; if missing, fall back to Z·Z^T
+                scores_for_rank = frozen_scores if frozen_scores is not None else _scores_from_Z(Z_for_cluster).detach()
+
+                # Run the SAME deficit-filling augmentation as aron_desc, just with the tighter mask
+                g, added_this_epoch, global_used_adds, node_used_adds = degree_aug_fill_deficit_from_scores_budget(
+                    scores_frozen=scores_for_rank,
+                    adj_label=adj_label.to_dense(),
+                    num_nodes=num_nodes,
+                    degree_floor=degree_floor,
+                    order=order,
+                    forbid_mask=forbid_mask_combined,     # <— constrain by cluster
+                    # ---- budgets ----
+                    E0=E0,
+                    aug_ratio=aug_ratio,                  # GLOBAL budget
+                    global_used_adds=global_used_adds,    # cumulative count
+                    deg0_excl_self=deg0_excl_self,        # ORIGINAL degrees
+                    aug_bound=aug_bound,                  # PER-NODE cap fraction
+                    node_used_adds=node_used_adds,        # cumulative per-node counts
+                    aug_ratio_epoch=aug_ratio_epoch,      # per-epoch cap or None
+                )
+
+                adj_label = g
+                modification_ratio = added_this_epoch / float(E0)
+                print(f"[AUG-{mode}] this_epoch_add={added_this_epoch} | this_epoch_ratio={modification_ratio:.6f} "
+                    f"| global_used_adds={global_used_adds} ({global_used_adds/E0:.4f} of E0)")
+
+                aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features.to_dense(), feat_maske_ratio)
+            
             elif(ver=="no"):
                 g = adj_label.to_dense()
                 modification_ratio = 0
                 aug_feat = features
-                
+            else:
+                raise NotImplementedError(
+                    f"[AUG] ver='{ver}' is not implemented. "
+                )
+                            
             aug_edge_index = g.to_sparse().indices()
             
             # Aron (for minimum node degree)
@@ -396,12 +546,16 @@ def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden
             inference_time_start = time.time()
             Z = encoder(features, edge_index) # Z = encoder(features, adj_norm)
             A_pred = dot_product_decode(Z)
+        
         # A_pred = train_decoder(device, encoder.Z.clone().detach(), adj_label, weight_tensor, norm, train_mask)
         # print(A_pred.shape)
         train_acc = get_acc(A_pred.data.cpu(), adj_label.data.cpu())
         val_roc, val_ap, val_hit = get_scores(dataset_str, val_edges, val_edges_false, A_pred.data.cpu().numpy(), adj_orig)
         test_roc, test_ap, test_hit = get_scores(dataset_str, test_edges, test_edges_false, A_pred.data.cpu().numpy(), adj_orig)
-        roc_history.append(test_roc)
+        
+        # (Optional) track validation curve instead of test
+        roc_history.append(val_roc)  # was: test_roc
+
         # val_acc, test_acc = logist_regressor_classification(device = device, Z = encoder.Z.clone().detach(), labels = labels, idx_train = idx_train, idx_val = idx_val, idx_test = idx_test)
         # print(f'Epoch: {epoch + 1}, train_loss= {loss.item():.4f}, train_acc= {train_acc:.4f}, val_roc= {val_roc:.4f}, val_ap= {val_ap:.4f}, test_roc= {test_roc:.4f}, test_ap= {test_ap:.4f}, time= {time.time() - t:.4f}')
         # print(f'Hit@K for val: 1={val_hit[0]}, 3={val_hit[1]}, 10={val_hit[2]}, 20={val_hit[3]}, 100={val_hit[4]}')
@@ -444,6 +598,23 @@ def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden
             best_link_epoch = epoch
             #print(f'Update Best Roc, Epoch = {epoch+1}, Val_roc = {best_roc:.3f}, val_ap = {best_ap:.3f}, test_roc = {best_test_roc:.3f}, test_ap = {best_test_ap:.3f}')
         #print('-' * 100)
+        
+        # --------- SELECT BEST BY VALIDATION ROC (NO TEST LEAKAGE) ---------
+        if val_roc > best_val_roc:
+            best_val_roc = val_roc
+            best_val_ap = val_ap
+            best_epoch = epoch
+
+            # store CPU copy of the best weights
+            best_state_cpu = {k: v.detach().cpu().clone() for k, v in encoder.state_dict().items()}
+
+            # also save to disk (optional, helpful for crashes / later reuse)
+            try:
+                torch.save(best_state_cpu, best_ckpt_path_runtime)
+                print(f"[CKPT] Saved best-by-val ROC at epoch {epoch} -> {best_ckpt_path_runtime}")
+            except Exception as e:
+                print(f"[CKPT] Warning: failed to save best checkpoint: {e}")
+
 
     # print(f'best classification epoch = {best_classi_epoch+1}, val_acc = {best_acc:.3f}, test_acc = {best_test_acc:.3f}')
     print(f'best link prediction epoch = {best_link_epoch+1}, Val_roc = {best_roc:.3f}, val_ap = {best_ap:.3f}, test_roc = {best_test_roc:.3f}, test_ap = {best_test_ap:.3f}')
@@ -453,16 +624,43 @@ def train_encoder(dataset_str, device, num_epoch, adj, features, hidden1, hidden
     print(f'best hit@20 epoch = {best_hit20_ep}, hit@20 = {best_hit20}, val = {best_hit20_roc}')
     print(f'best hit@50 epoch = {best_hit50_ep}, hit@50 = {best_hit50}, val = {best_hit50_roc}')
     print(f'best hit@100 epoch = {best_hit100_ep}, hit@100 = {best_hit100}, val = {best_hit100_roc}')
-    # print(f'best hit@50 epoch = {best_hit50_ep}, hit@50 = {best_hit50}, val = {best_hit50_roc}')
-    test_roc, test_ap, test_hit = get_scores(dataset_str,test_edges, test_edges_false, A_pred.data.cpu(), adj_orig)
-    print(f'End of training!\ntest_roc={test_roc:.5f}, test_ap={test_ap:.5f}')
-    print(f'Hit@K for test: 1={test_hit[0]}, 3={test_hit[1]}, 10={test_hit[2]}, 20={test_hit[3]}, 50={test_hit[4]}, 100={test_hit[5]}')
+
+    # --------- RELOAD BEST MODEL BEFORE FINAL TEST ---------
+    if best_state_cpu is not None:
+        encoder.load_state_dict(best_state_cpu, strict=True)
+        print(f"[CKPT] Reloaded best weights (by val ROC) from epoch {best_epoch}")
+    elif os.path.exists(best_ckpt_path_runtime):
+        # fallback if only on-disk exists
+        try:
+            state = torch.load(best_ckpt_path_runtime, map_location=device)
+            encoder.load_state_dict(state, strict=True)
+            print(f"[CKPT] Reloaded best weights from disk: {best_ckpt_path_runtime}")
+        except Exception as e:
+            print(f"[CKPT] ERROR loading best checkpoint; using last epoch weights: {e}")
+    else:
+        print("[CKPT] No best checkpoint found; using last epoch weights.")
+
+    # --------- FINAL TEST EVAL WITH BEST MODEL ---------
+    encoder.eval()
+    with torch.no_grad():
+        Z_best = encoder(features, edge_index)
+        A_pred_best = dot_product_decode(Z_best)
+
+    final_test_roc, final_test_ap, final_test_hit = get_scores(
+        dataset_str, test_edges, test_edges_false, A_pred_best.data.cpu().numpy(), adj_orig
+    )
+    print(f"best link prediction epoch (by val ROC) = {best_epoch+1}, "
+        f"val_roc = {best_val_roc:.3f}, val_ap = {best_val_ap:.3f}")
+    print(f"[FINAL TEST] test_roc = {final_test_roc:.5f}, test_ap = {final_test_ap:.5f}")
+    print(f"[FINAL TEST] Hit@K: 1={final_test_hit[0]}, 3={final_test_hit[1]}, 10={final_test_hit[2]}, "
+        f"20={final_test_hit[3]}, 50={final_test_hit[4]}, 100={final_test_hit[5]}")
     
     print(f"Total training time {time.time() - training_time_start}")
     print(f"Average minimum node degree {sum(minimum_node_degree_history) / len(minimum_node_degree_history)}")
     print(minimum_node_degree_history)
     
-    return encoder.Z.clone().detach(), roc_history, modification_ratio_history, edge_index
+    # return the best embeddings, not the last ones
+    return Z_best.clone().detach(), roc_history, modification_ratio_history, edge_index
 
 
 

@@ -655,6 +655,257 @@ def degree_aug_fill_deficit_from_scores_budget(
           f"| per-node_max_used={int(node_used_adds.max().item())}")
     return g, applied, global_used_adds, node_used_adds
 
+# @torch.no_grad()
+# def _ensure_dbscan():
+#     try:
+#         from sklearn.cluster import DBSCAN  # noqa: F401
+#         return True
+#     except Exception as e:
+#         print("[CLUSTER] Need scikit-learn for DBSCAN (pip install scikit-learn).")
+#         raise e
+
+@torch.no_grad()
+def build_cluster_allow_mask(
+    labels: np.ndarray,         # np.int32 array shape [N], -1 is noise
+    mode: str,                  # "intra" or "inter"
+    exclude_noise: bool = True,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """
+    Returns a [N,N] bool matrix where True means the pair is ALLOWED by the cluster rule.
+    """
+    assert mode in ("intra", "inter")
+    lbl = torch.from_numpy(labels.astype(np.int64))
+    if device is not None:
+        lbl = lbl.to(device)
+
+    if mode == "intra":
+        ok = (lbl[:, None] == lbl[None, :])
+    else:  # inter
+        ok = (lbl[:, None] != lbl[None, :])
+
+    if exclude_noise:
+        ok = ok & (lbl[:, None] != -1) & (lbl[None, :] != -1)
+
+    # (Optional) we don't need to allow self-pairs; degree_aug will already forbid diag
+    ok.fill_diagonal_(False)
+    return ok
+
+@torch.no_grad()
+def density_cluster_embeddings(
+    Z: torch.Tensor,
+    method: str = "hdbscan",             # default now HDBSCAN
+    eps: float | None = None,            # kept for backward-compat; IGNORED
+    min_samples: int = 5,
+    metric: str = "cosine",
+    min_cluster_size: int | None = None, # NEW: HDBSCAN knob
+) -> np.ndarray:
+    """
+    Run HDBSCAN clustering on encoder features Z (N,d).
+    Returns np.ndarray labels (N,), where -1 = noise.
+
+    Notes:
+      - `eps` is ignored (HDBSCAN doesn't use eps).
+      - If metric == "cosine", we L2-normalize Z and use Euclidean distances,
+        which is equivalent to cosine distance ranking.
+    """
+    try:
+        import hdbscan
+    except ImportError as e:
+        raise RuntimeError("Please `pip install hdbscan` to use HDBSCAN.") from e
+
+    Zc = Z.detach().cpu().numpy()
+    N = Zc.shape[0]
+
+    # Normalize for stability and cosine geometry
+    Zc_norm = Zc / (np.linalg.norm(Zc, axis=1, keepdims=True) + 1e-12)
+
+    # Heuristics for defaults
+    if min_cluster_size is None:
+        min_cluster_size = max(10, int(0.005 * N))  # ~0.5% of N, at least 10
+    if min_samples is None:
+        min_samples = max(5, int(0.002 * N))        # ~0.2% of N, at least 5
+
+    if eps is not None:
+        print("[CLUSTER] HDBSCAN ignores `eps`; provided value will be ignored.")
+
+    # Use Euclidean on normalized vectors (≈ cosine). You can also set metric="cosine" directly.
+    dist_metric = "euclidean" if metric == "cosine" else metric
+
+    print(f"[CLUSTER] HDBSCAN metric={dist_metric} "
+          f"min_cluster_size={min_cluster_size} min_samples={min_samples} N={N}")
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric=dist_metric,
+        core_dist_n_jobs=1,   # deterministic-ish and safe in many envs
+    )
+    labels = clusterer.fit_predict(Zc_norm if metric == "cosine" else Zc)
+
+    # Debug: label histogram
+    uniq, cnt = np.unique(labels, return_counts=True)
+    print(f"[CLUSTER] label hist: {dict(zip(uniq.tolist(), cnt.tolist()))}")
+
+    return labels
+
+
+@torch.no_grad()
+def _scores_from_Z(Z: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+    """Fallback confidence if you don’t want to use frozen_scores."""
+    X = torch.nn.functional.normalize(Z, p=2, dim=1) if normalize else Z
+    return X @ X.t()
+
+@torch.no_grad()
+def _svd_embed_from_scores(scores: torch.Tensor, k: int = 64) -> torch.Tensor:
+    """
+    If you don't have Z handy, derive an embedding from scores via SVD.
+    Returns Z_k in R^{N×k}.
+    """
+    # scores is symmetric-ish; use top-k singular vectors
+    U, S, Vh = torch.linalg.svd(scores, full_matrices=False)
+    k = min(k, U.size(1))
+    Zk = U[:, :k] * torch.sqrt(S[:k].clamp_min(1e-12))
+    return Zk
+
+@torch.no_grad()
+def cluster_filtered_link_augmentation(
+    Z_for_cluster: torch.Tensor,        # [N,d]
+    adj_label: torch.Tensor,            # [N,N] 0/1 dense WITH self-loops
+    deg0_excl_self: torch.Tensor,       # [N] ORIGINAL degrees (exclude self)
+    E0: int,                            # ORIGINAL undirected |E|
+    *,
+    frozen_scores: torch.Tensor | None, # [N,N] confidence; if None use Z·Z^T
+    forbid_mask: torch.Tensor | None,   # [N,N] True=forbid
+    mode: str = "any",                  # "any" | "intra" | "inter"
+    labels: np.ndarray | None = None,   # clustering labels for intra/inter
+    aug_ratio: float = 0.10,            # global budget (× E0)
+    aug_bound: float = 0.10,            # per-node cap fraction vs deg0
+    topk_per_node: int = 64,            # candidate pool per node
+    exclude_noise: bool = True,         # ignore label=-1 in intra/inter
+    charge_both_endpoints: bool = True, # count both ends toward per-node cap
+):
+    """
+    Global best-first add under budgets; with cluster-based filtering.
+    """
+    device = adj_label.device
+    N = adj_label.size(0)
+    g = adj_label.clone()
+    deg = _deg_excl_self(g)
+
+    # Load frozen scores if a path was provided; else keep None
+    # NOTE: args.frozen_scores may be a string path or already a Tensor
+    if isinstance(frozen_scores, str):
+        if os.path.isfile(frozen_scores):
+            print(f"[pretrain] Loading frozen scores from {frozen_scores}")
+            frozen_scores = torch.load(frozen_scores, map_location=device)
+        else:
+            print(f"[pretrain-WARN] frozen_scores path not found: {frozen_scores}")
+            frozen_scores = None
+
+    # Safe guard: only check shape if we actually have a tensor
+    if frozen_scores is not None and tuple(frozen_scores.shape) != (N, N):
+        print(f"[pretrain-WARN] frozen_scores shape {tuple(frozen_scores.shape)} != ({N},{N}); ignoring.")
+        frozen_scores = None
+
+    # base forbid
+    if forbid_mask is None:
+        forbid = torch.eye(N, dtype=torch.bool, device=device)
+    else:
+        forbid = (forbid_mask.to(device) | torch.eye(N, dtype=torch.bool, device=device))
+    forbid = forbid | (g > 0)  # never overwrite existing edges
+
+    # cluster filtering
+    if mode in ("intra", "inter"):
+        assert labels is not None, "cluster labels are required for intra/inter"
+        lbl = torch.from_numpy(labels).to(device)
+        if mode == "intra":
+            ok_pair = (lbl[:, None] == lbl[None, :])
+            if exclude_noise:
+                ok_pair = ok_pair & (lbl[:, None] != -1) & (lbl[None, :] != -1)
+        else:
+            ok_pair = (lbl[:, None] != lbl[None, :])
+            if exclude_noise:
+                ok_pair = ok_pair & (lbl[:, None] != -1) & (lbl[None, :] != -1)
+        forbid = forbid | (~ok_pair)
+
+    # budgets
+    base = torch.maximum(deg0_excl_self.to(device), torch.ones_like(deg0_excl_self, device=device))
+    node_caps = torch.ceil(aug_bound * base.float()).to(torch.long)
+    global_cap = max(0, int(round(aug_ratio * E0)))
+    global_left = global_cap
+    print(f"[AUG-{mode}] E0={E0} | global_cap={global_cap} | per-node cap frac={aug_bound} | topk={topk_per_node}")
+
+    # build candidate list per node
+    cand = []  # (score, a, b) with a<b
+    for v in range(N):
+        s = scores[v].clone()
+        invalid = forbid[v]
+        if invalid.all():
+            continue
+        s.masked_fill_(invalid, float("-inf"))
+        k = min(topk_per_node, int((~invalid).sum().item()))
+        if k <= 0:
+            continue
+        idx = torch.topk(s, k=k, largest=True).indices
+        sv = s[idx]
+        for u, sc in zip(idx.tolist(), sv.tolist()):
+            if u == v:
+                continue
+            a, b = (v, u) if v < u else (u, v)
+            cand.append((float(sc), a, b))
+
+    if not cand:
+        print(f"[AUG-{mode}] no candidates after filtering.")
+        return g, 0
+
+    # dedup and sort global
+    best = {}
+    for sc, a, b in cand:
+        if (a, b) not in best or sc > best[(a, b)]:
+            best[(a, b)] = sc
+    cand_sorted = sorted([(sc, a, b) for (a, b), sc in best.items()],
+                         key=lambda t: t[0], reverse=True)
+    print(f"[AUG-{mode}] candidates={len(cand_sorted)}")
+
+    node_used = torch.zeros(N, dtype=torch.long, device=device)
+    applied = 0
+    for sc, a, b in cand_sorted:
+        if global_left <= 0:
+            break
+        if g[a, b] != 0:
+            continue
+
+        # per-node cap
+        if charge_both_endpoints:
+            if node_used[a] >= node_caps[a] or node_used[b] >= node_caps[b]:
+                continue
+        else:
+            aa, bb = (a, b) if deg[a] <= deg[b] else (b, a)
+            if node_used[aa] >= node_caps[aa]:
+                continue
+
+        # add
+        g[a, b] = 1
+        g[b, a] = 1
+        applied += 1
+        global_left -= 1
+        deg[a] += 1
+        deg[b] += 1
+        if charge_both_endpoints:
+            node_used[a] += 1
+            node_used[b] += 1
+        else:
+            aa, bb = (a, b) if deg[a] <= deg[b] else (b, a)
+            node_used[aa] += 1
+
+    g.fill_diagonal_(1)
+    g = torch.maximum(g, g.t())
+    print(f"[AUG-{mode}] applied_add={applied} | global_used={global_cap - global_left}/{global_cap} "
+          f"| per-node_max_used={int(node_used.max().item())}")
+    return g, applied
+# ========================================================================
+
 @torch.no_grad()
 def degree_deficit_snapshot(
     adj_label: torch.Tensor,          # [N,N] dense WITH self-loops
@@ -666,14 +917,16 @@ def degree_deficit_snapshot(
     run_name: str = "default_run",
     topk: int = 50,
     writer=None,                      # optional: SummaryWriter
+    save_snapshot: bool = False,      # <<< NEW: default False for fast per-epoch logging
 ):
     """
     Computes per-node degree deficit: max(0, degree_floor - deg_excl_self).
-    Saves:
-      - CSV: node, deg_excl_self, deficit
+    Saves (always):
+      - CSV: node, deg_excl_self, deficit   (one per epoch when called)
+    Optionally (if save_snapshot=True):
       - Histogram PNG
       - Top-K deficits bar PNG
-    Returns a metrics dict.
+    Returns a metrics dict for the logger.
     """
     os.makedirs(out_dir, exist_ok=True)
     N = adj_label.size(0)
@@ -689,7 +942,7 @@ def degree_deficit_snapshot(
     epoch_str = f"{epoch:03d}" if epoch is not None else "NA"
     base = os.path.join(out_dir, f"{run_name}_{tag}_e{epoch_str}")
 
-    # CSV
+    # CSV (per-epoch)
     nodes = torch.arange(N, device=adj_label.device)
     csv_path = base + ".csv"
     pd.DataFrame({
@@ -698,35 +951,37 @@ def degree_deficit_snapshot(
         "deficit": deficits.cpu().numpy().astype(np.int64),
     }).to_csv(csv_path, index=False)
 
-    # Histogram
-    hist_path = base + "_hist.png"
-    plt.figure(figsize=(6.5, 4.0), dpi=130)
-    bins = np.arange(-0.5, max_def + 1.5, 1.0) if max_def > 0 else np.arange(-0.5, 1.5, 1.0)
-    plt.hist(deficits.cpu().numpy(), bins=bins)
-    plt.xlabel("Degree deficit (floor - deg_excl_self)")
-    plt.ylabel("Node count")
-    plt.title(f"{run_name} | {tag} | epoch={epoch_str}\n"
-              f"total={total_def} | low_nodes={num_low} | max={max_def}")
-    plt.tight_layout()
-    plt.savefig(hist_path, bbox_inches="tight")
-    plt.close()
-
-    # Top-K bar
-    bar_path = None
-    if max_def > 0 and num_low > 0:
-        deficits_np = deficits.cpu().numpy()
-        top_idx = np.argsort(-deficits_np)[:topk]
-        top_vals = deficits_np[top_idx]
-        plt.figure(figsize=(max(6.5, min(14, 0.15 * len(top_idx) + 2)), 4.0), dpi=130)
-        plt.bar(np.arange(len(top_idx)), top_vals)
-        plt.xticks(np.arange(len(top_idx)), top_idx, rotation=90, fontsize=7)
-        plt.xlabel("Node id (sorted by deficit)")
-        plt.ylabel("Deficit")
-        plt.title(f"{run_name} | {tag} | epoch={epoch_str} | top-{len(top_idx)}")
+    # Optional heavier plots
+    hist_path, bar_path = None, None
+    if save_snapshot:
+        # Histogram
+        hist_path = base + "_hist.png"
+        plt.figure(figsize=(6.5, 4.0), dpi=130)
+        bins = np.arange(-0.5, max_def + 1.5, 1.0) if max_def > 0 else np.arange(-0.5, 1.5, 1.0)
+        plt.hist(deficits.cpu().numpy(), bins=bins)
+        plt.xlabel("Degree deficit (floor - deg_excl_self)")
+        plt.ylabel("Node count")
+        plt.title(f"{run_name} | {tag} | epoch={epoch_str}\n"
+                  f"total={total_def} | low_nodes={num_low} | max={max_def}")
         plt.tight_layout()
-        bar_path = base + f"_top{len(top_idx)}.png"
-        plt.savefig(bar_path, bbox_inches="tight")
+        plt.savefig(hist_path, bbox_inches="tight")
         plt.close()
+
+        # Top-K bar
+        if max_def > 0 and num_low > 0:
+            deficits_np = deficits.cpu().numpy()
+            top_idx = np.argsort(-deficits_np)[:topk]
+            top_vals = deficits_np[top_idx]
+            plt.figure(figsize=(max(6.5, min(14, 0.15 * len(top_idx) + 2)), 4.0), dpi=130)
+            plt.bar(np.arange(len(top_idx)), top_vals)
+            plt.xticks(np.arange(len(top_idx)), top_idx, rotation=90, fontsize=7)
+            plt.xlabel("Node id (sorted by deficit)")
+            plt.ylabel("Deficit")
+            plt.title(f"{run_name} | {tag} | epoch={epoch_str} | top-{len(top_idx)}")
+            plt.tight_layout()
+            bar_path = base + f"_top{len(top_idx)}.png"
+            plt.savefig(bar_path, bbox_inches="tight")
+            plt.close()
 
     # Optional TB scalars
     if writer is not None:
@@ -741,9 +996,9 @@ def degree_deficit_snapshot(
           f"total={total_def} low_nodes={num_low} max={max_def} "
           f"mean={mean_def:.3f} median={median_def:.3f}")
     print(f"[DEFICIT] saved: {csv_path}")
-    print(f"[DEFICIT] saved: {hist_path}")
-    if bar_path:
-        print(f"[DEFICIT] saved: {bar_path}")
+    if save_snapshot:
+        if hist_path: print(f"[DEFICIT] saved: {hist_path}")
+        if bar_path:  print(f"[DEFICIT] saved: {bar_path}")
 
     return {
         "total_deficit": total_def,
@@ -758,45 +1013,97 @@ def degree_deficit_snapshot(
 
 
 class DegreeDeficitLogger:
-    """Track deficit over epochs and emit 3 time-series PNGs at the end."""
-    def __init__(self, out_dir: str = "logs/deg_deficit", run_name: str = "default_run"):
+    """Track deficit over epochs and emit series CSV + line charts at the end."""
+    def __init__(self, out_dir: str = "logs/deg_deficit", run_name: str = "default_run", ema_alpha: float | None = None):
         self.out_dir = out_dir
         self.run_name = run_name
+        self.ema_alpha = ema_alpha
         os.makedirs(self.out_dir, exist_ok=True)
-        self.epochs, self.total, self.num_low, self.max_def = [], [], [], []
+        self.epochs, self.total, self.num_low, self.max_def, self.mean_def, self.median_def = [], [], [], [], [], []
 
     def log_point(self, epoch: int, metrics: dict):
         self.epochs.append(int(epoch))
         self.total.append(metrics["total_deficit"])
         self.num_low.append(metrics["num_low"])
         self.max_def.append(metrics["max_deficit"])
+        self.mean_def.append(metrics["mean_deficit"])
+        self.median_def.append(metrics["median_deficit"])
+
+    def _ema(self, arr):
+        if not self.ema_alpha or len(arr) < 2: return arr
+        a = self.ema_alpha
+        out = [arr[0]]
+        for x in arr[1:]:
+            out.append(a * x + (1 - a) * out[-1])
+        return out
+
+    def _normalize01(self, arr):
+        lo, hi = min(arr), max(arr)
+        if hi == lo: return [0.0 for _ in arr]
+        return [(x - lo) / (hi - lo) for x in arr]
 
     def finalize_plots(self):
         if not self.epochs:
             return
+
+        # sort by epoch in case user logged out of order
+        order = np.argsort(self.epochs)
+        ep   = list(np.array(self.epochs)[order])
+        tot  = list(np.array(self.total)[order])
+        nlow = list(np.array(self.num_low)[order])
+        mx   = list(np.array(self.max_def)[order])
+        mu   = list(np.array(self.mean_def)[order])
+        med  = list(np.array(self.median_def)[order])
+
+        # optional smoothing
+        tot_s, nlow_s, mx_s, mu_s, med_s = map(self._ema, (tot, nlow, mx, mu, med))
+
+        # series CSV
+        series_csv = os.path.join(self.out_dir, f"{self.run_name}_series.csv")
+        pd.DataFrame({
+            "epoch": ep,
+            "total_deficit": tot,
+            "num_low": nlow,
+            "max_deficit": mx,
+            "mean_deficit": mu,
+            "median_deficit": med,
+        }).to_csv(series_csv, index=False)
+        print(f"[DEFICIT] series CSV saved: {series_csv}")
+
         base = os.path.join(self.out_dir, f"{self.run_name}_series")
 
-        plt.figure(figsize=(6.8, 3.8), dpi=130)
-        plt.plot(self.epochs, self.total, marker="o")
-        plt.xlabel("Epoch"); plt.ylabel("Total degree deficit")
-        plt.title(f"{self.run_name} | total deficit over time")
-        plt.tight_layout(); p1 = base + "_total.png"; plt.savefig(p1, bbox_inches="tight"); plt.close()
+        # 1) Overlay (normalized) for quick glance
+        plt.figure(figsize=(7.5, 4.5), dpi=130)
+        plt.plot(ep, self._normalize01(tot_s),  marker="o", label="total")
+        plt.plot(ep, self._normalize01(nlow_s), marker="o", label="#low")
+        plt.plot(ep, self._normalize01(mx_s),   marker="o", label="max")
+        plt.plot(ep, self._normalize01(mu_s),   marker="o", label="mean")
+        plt.plot(ep, self._normalize01(med_s),  marker="o", label="median")
+        plt.xlabel("Epoch"); plt.ylabel("Normalized value (0–1)")
+        ttl = f"{self.run_name} | deficit metrics over time"
+        if self.ema_alpha: ttl += f" (EMA α={self.ema_alpha})"
+        plt.title(ttl); plt.legend()
+        plt.tight_layout(); p0 = base + "_overlay.png"; plt.savefig(p0, bbox_inches="tight"); plt.close()
 
-        plt.figure(figsize=(6.8, 3.8), dpi=130)
-        plt.plot(self.epochs, self.num_low, marker="o")
-        plt.xlabel("Epoch"); plt.ylabel("# nodes with deficit > 0")
-        plt.title(f"{self.run_name} | low-degree nodes over time")
-        plt.tight_layout(); p2 = base + "_numlow.png"; plt.savefig(p2, bbox_inches="tight"); plt.close()
+        # 2) Individual plots (5)
+        def _one(y, ylabel, suffix):
+            plt.figure(figsize=(6.8, 3.8), dpi=130)
+            plt.plot(ep, y, marker="o")
+            plt.xlabel("Epoch"); plt.ylabel(ylabel)
+            plt.title(f"{self.run_name} | {ylabel} over time")
+            plt.tight_layout()
+            path = f"{base}_{suffix}.png"
+            plt.savefig(path, bbox_inches="tight"); plt.close()
+            print(f"[DEFICIT] time-series saved: {path}")
 
-        plt.figure(figsize=(6.8, 3.8), dpi=130)
-        plt.plot(self.epochs, self.max_def, marker="o")
-        plt.xlabel("Epoch"); plt.ylabel("Max degree deficit")
-        plt.title(f"{self.run_name} | max deficit over time")
-        plt.tight_layout(); p3 = base + "_max.png"; plt.savefig(p3, bbox_inches="tight"); plt.close()
+        _one(tot_s, "Total degree deficit", "total")
+        _one(nlow_s, "# nodes with deficit > 0", "numlow")
+        _one(mx_s,   "Max degree deficit", "max")
+        _one(mu_s,   "Mean degree deficit", "mean")
+        _one(med_s,  "Median degree deficit", "median")
 
-        print(f"[DEFICIT] time-series saved: {p1}")
-        print(f"[DEFICIT] time-series saved: {p2}")
-        print(f"[DEFICIT] time-series saved: {p3}")
+        print(f"[DEFICIT] overlay saved: {p0}")
+
 
 @torch.no_grad()
 def drop_feature(x: torch.Tensor, drop_prob: float, inplace: bool = False, gen: torch.Generator | None = None):
