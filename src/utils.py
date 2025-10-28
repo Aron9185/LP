@@ -1,31 +1,36 @@
-from sklearn.decomposition import PCA
-import plotly.graph_objects as go
-from sklearn.manifold import TSNE
-import pandas as pd
-import numpy as np
-import math
-import matplotlib.pyplot as plt
-import torch
-from model import dot_product_decode
-
-from sklearn.neighbors import KernelDensity, kneighbors_graph
-from scipy.stats import gaussian_kde, vonmises
-from sklearn.preprocessing import normalize
-from matplotlib import colors
-import scipy.stats as st
-
-import os
 import copy
+import math
+import os
 import random
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import scipy.sparse as sp
+import scipy.stats as st
+import torch
 import torch.nn.functional as F
-from torch_geometric.utils import degree, to_undirected, add_remaining_self_loops, remove_self_loops
-from torch_geometric.utils.num_nodes import maybe_num_nodes
-from sklearn.preprocessing import QuantileTransformer
+from dev import *
+from matplotlib import colors
+from model import dot_product_decode
+from scipy.stats import gaussian_kde, vonmises
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.neighbors import KernelDensity, kneighbors_graph
+from sklearn.preprocessing import QuantileTransformer, normalize
+
 # from sklearn.neighbors import kneighbors_graph
 from torch.nn.functional import cosine_similarity
+from torch_geometric.utils import (
+    add_remaining_self_loops,
+    degree,
+    remove_self_loops,
+    to_undirected,
+)
+from torch_geometric.utils.num_nodes import maybe_num_nodes
 from torch_scatter import scatter_add
-from dev import *
+
 
 def get_sim(embeds1, embeds2):
     # normalize embeddings across feature dimension
@@ -655,15 +660,6 @@ def degree_aug_fill_deficit_from_scores_budget(
           f"| per-node_max_used={int(node_used_adds.max().item())}")
     return g, applied, global_used_adds, node_used_adds
 
-# @torch.no_grad()
-# def _ensure_dbscan():
-#     try:
-#         from sklearn.cluster import DBSCAN  # noqa: F401
-#         return True
-#     except Exception as e:
-#         print("[CLUSTER] Need scikit-learn for DBSCAN (pip install scikit-learn).")
-#         raise e
-
 @torch.no_grad()
 def build_cluster_allow_mask(
     labels: np.ndarray,         # np.int32 array shape [N], -1 is noise
@@ -775,136 +771,288 @@ def cluster_filtered_link_augmentation(
     deg0_excl_self: torch.Tensor,       # [N] ORIGINAL degrees (exclude self)
     E0: int,                            # ORIGINAL undirected |E|
     *,
-    frozen_scores: torch.Tensor | None, # [N,N] confidence; if None use Z·Z^T
-    forbid_mask: torch.Tensor | None,   # [N,N] True=forbid
+    frozen_scores: torch.Tensor | None,
+    forbid_mask: torch.Tensor | None,
     mode: str = "any",                  # "any" | "intra" | "inter"
-    labels: np.ndarray | None = None,   # clustering labels for intra/inter
-    aug_ratio: float = 0.10,            # global budget (× E0)
-    aug_bound: float = 0.10,            # per-node cap fraction vs deg0
-    topk_per_node: int = 64,            # candidate pool per node
-    exclude_noise: bool = True,         # ignore label=-1 in intra/inter
-    charge_both_endpoints: bool = True, # count both ends toward per-node cap
+    labels: np.ndarray | None = None,
+    aug_ratio: float = 0.10,
+    aug_bound: float = 0.10,
+    topk_per_node: int = 64,
+    exclude_noise: bool = True,
+    charge_both_endpoints: bool = True,
+
+    # ---- already-added relaxation knobs (keep yours) ----
+    relax_when_stuck: bool = True,
+    patience: int = 1,
+    allow_noise_tier: bool = True,
+    enable_nearby_cross: bool = True,
+    nearby_topk: int = 10,
+    late_score_q: float | None = 0.90,
+
+    # ---- NEW: epoch-bounded spending & tier gating ----
+    epoch: int | None = None,           # 0-based current epoch
+    max_epochs: int | None = None,      # total epochs
+    epoch_cap_mode: str = "linear",     # "linear" | "cosine"
+    global_used_so_far: int = 0,        # cumulative adds before this epoch
+    node_used_so_far: torch.Tensor | None = None,  # [N] cumulative per-node adds
+    # tier release points as cumulative fraction of training progress
+    # A, B, C, D become eligible when progress >= these frac thresholds
+    tier_release_fracs: tuple[float, float, float, float] = (0.00, 0.25, 0.50, 0.75),
 ):
     """
-    Global best-first add under budgets; with cluster-based filtering.
+    Same behavior as before, but:
+      - Spending is throttled by epoch quota
+      - Tiers A/B/C/D unlock by epoch progress
     """
     device = adj_label.device
     N = adj_label.size(0)
     g = adj_label.clone()
     deg = _deg_excl_self(g)
 
-    # Load frozen scores if a path was provided; else keep None
-    # NOTE: args.frozen_scores may be a string path or already a Tensor
-    if isinstance(frozen_scores, str):
-        if os.path.isfile(frozen_scores):
-            print(f"[pretrain] Loading frozen scores from {frozen_scores}")
-            frozen_scores = torch.load(frozen_scores, map_location=device)
-        else:
-            print(f"[pretrain-WARN] frozen_scores path not found: {frozen_scores}")
-            frozen_scores = None
+    # ----- scores (unchanged; keep your code here) -----
+    # ... your existing frozen_scores handling ...
+    scores = None
+    if isinstance(frozen_scores, torch.Tensor) and tuple(frozen_scores.shape) == (N, N):
+        scores = frozen_scores.to(device)
+    if scores is None:
+        scores = _scores_from_Z(Z_for_cluster)
 
-    # Safe guard: only check shape if we actually have a tensor
-    if frozen_scores is not None and tuple(frozen_scores.shape) != (N, N):
-        print(f"[pretrain-WARN] frozen_scores shape {tuple(frozen_scores.shape)} != ({N},{N}); ignoring.")
-        frozen_scores = None
-
-    # base forbid
+    # ----- base forbid (diag, existing edges, user forbid) -----
     if forbid_mask is None:
-        forbid = torch.eye(N, dtype=torch.bool, device=device)
+        forbid_base = torch.eye(N, dtype=torch.bool, device=device)
     else:
-        forbid = (forbid_mask.to(device) | torch.eye(N, dtype=torch.bool, device=device))
-    forbid = forbid | (g > 0)  # never overwrite existing edges
+        forbid_base = (forbid_mask.to(device) | torch.eye(N, dtype=torch.bool, device=device))
+    forbid_base = forbid_base | (g > 0)
 
-    # cluster filtering
-    if mode in ("intra", "inter"):
-        assert labels is not None, "cluster labels are required for intra/inter"
-        lbl = torch.from_numpy(labels).to(device)
-        if mode == "intra":
-            ok_pair = (lbl[:, None] == lbl[None, :])
-            if exclude_noise:
-                ok_pair = ok_pair & (lbl[:, None] != -1) & (lbl[None, :] != -1)
-        else:
-            ok_pair = (lbl[:, None] != lbl[None, :])
-            if exclude_noise:
-                ok_pair = ok_pair & (lbl[:, None] != -1) & (lbl[None, :] != -1)
-        forbid = forbid | (~ok_pair)
-
-    # budgets
+    # ----- budgets (persist across tiers) -----
     base = torch.maximum(deg0_excl_self.to(device), torch.ones_like(deg0_excl_self, device=device))
     node_caps = torch.ceil(aug_bound * base.float()).to(torch.long)
     global_cap = max(0, int(round(aug_ratio * E0)))
-    global_left = global_cap
-    print(f"[AUG-{mode}] E0={E0} | global_cap={global_cap} | per-node cap frac={aug_bound} | topk={topk_per_node}")
 
-    # build candidate list per node
-    cand = []  # (score, a, b) with a<b
-    for v in range(N):
-        s = scores[v].clone()
-        invalid = forbid[v]
-        if invalid.all():
-            continue
-        s.masked_fill_(invalid, float("-inf"))
-        k = min(topk_per_node, int((~invalid).sum().item()))
-        if k <= 0:
-            continue
-        idx = torch.topk(s, k=k, largest=True).indices
-        sv = s[idx]
-        for u, sc in zip(idx.tolist(), sv.tolist()):
-            if u == v:
-                continue
-            a, b = (v, u) if v < u else (u, v)
-            cand.append((float(sc), a, b))
+    # NEW: epoch quota
+    def _epoch_target_frac(ep: int, T: int) -> float:
+        # cumulative target by end of this epoch
+        # linear: (ep+1)/T ; cosine: slow start, fast later
+        if epoch_cap_mode == "cosine":
+            import math
+            return (1.0 - math.cos(math.pi * (ep + 1) / max(1, T))) * 0.5
+        return float(ep + 1) / max(1, T)
 
-    if not cand:
-        print(f"[AUG-{mode}] no candidates after filtering.")
-        return g, 0
+    if epoch is not None and max_epochs is not None:
+        target_cum = int(round(global_cap * _epoch_target_frac(epoch, max_epochs)))
+        global_left = max(0, target_cum - int(global_used_so_far))
+        print(f"[EPOCH] ep={epoch}/{max_epochs-1} | global_cap={global_cap} | target_cum={target_cum} "
+              f"| used_so_far={global_used_so_far} | epoch_quota={global_left}")
+    else:
+        global_left = global_cap
+        print(f"[EPOCH] ep-bounds disabled | global_cap={global_cap} | epoch_quota={global_left}")
 
-    # dedup and sort global
-    best = {}
-    for sc, a, b in cand:
-        if (a, b) not in best or sc > best[(a, b)]:
-            best[(a, b)] = sc
-    cand_sorted = sorted([(sc, a, b) for (a, b), sc in best.items()],
-                         key=lambda t: t[0], reverse=True)
-    print(f"[AUG-{mode}] candidates={len(cand_sorted)}")
+    # carry over per-node usage if provided
+    node_used = torch.zeros(N, dtype=torch.long, device=device) if node_used_so_far is None else node_used_so_far.to(device).clone()
 
-    node_used = torch.zeros(N, dtype=torch.long, device=device)
-    applied = 0
-    for sc, a, b in cand_sorted:
-        if global_left <= 0:
-            break
-        if g[a, b] != 0:
-            continue
+    print(f"[AUG-{mode}] per-node cap frac={aug_bound} | topk={topk_per_node}")
 
-        # per-node cap
-        if charge_both_endpoints:
-            if node_used[a] >= node_caps[a] or node_used[b] >= node_caps[b]:
-                continue
+    # ----- helpers (same as before; abridged here) -----
+    def _topk_mask_per_row(S: torch.Tensor, k: int) -> torch.Tensor:
+        k = max(0, min(k, S.size(1)))
+        if k == 0: return torch.zeros_like(S, dtype=torch.bool)
+        idx = torch.topk(S, k=k, dim=1, largest=True).indices
+        mask = torch.zeros_like(S, dtype=torch.bool)
+        rows = torch.arange(S.size(0), device=S.device).unsqueeze(1).expand_as(idx)
+        mask[rows, idx] = True
+        mask.fill_diagonal_(False)
+        return mask
+
+    def _build_cluster_allow(mode_local: str, excl_noise: bool) -> torch.Tensor:
+        if mode_local == "none" or labels is None:
+            return torch.ones((N, N), dtype=torch.bool, device=device).fill_diagonal_(False)
+        return build_cluster_allow_mask(labels=labels, mode=mode_local, exclude_noise=excl_noise, device=device)
+
+    def _add_with_forbid(current_forbid: torch.Tensor) -> int:
+        nonlocal global_left
+        cand = []
+        for v in range(N):
+            s = scores[v].clone()
+            invalid = current_forbid[v]
+            if invalid.all(): continue
+            s.masked_fill_(invalid, float("-inf"))
+            k = min(topk_per_node, int((~invalid).sum().item()))
+            if k <= 0: continue
+            idx = torch.topk(s, k=k, largest=True).indices
+            sv = s[idx]
+            for u, sc in zip(idx.tolist(), sv.tolist()):
+                if u == v: continue
+                a, b = (v, u) if v < u else (u, v)
+                cand.append((float(sc), a, b))
+        if not cand: return 0
+
+        best = {}
+        for sc, a, b in cand:
+            if (a, b) not in best or sc > best[(a, b)]:
+                best[(a, b)] = sc
+        cand_sorted = sorted([(sc, a, b) for (a, b), sc in best.items()],
+                             key=lambda t: t[0], reverse=True)
+
+        applied = 0
+        for sc, a, b in cand_sorted:
+            if global_left <= 0: break
+            if g[a, b] != 0: continue
+            # per-node cap
+            if charge_both_endpoints:
+                if node_used[a] >= node_caps[a] or node_used[b] >= node_caps[b]:
+                    continue
+            else:
+                aa, bb = (a, b) if deg[a] <= deg[b] else (b, a)
+                if node_used[aa] >= node_caps[aa]:
+                    continue
+            # add
+            g[a, b] = 1; g[b, a] = 1
+            applied += 1; global_left -= 1
+            deg[a] += 1; deg[b] += 1
+            if charge_both_endpoints:
+                node_used[a] += 1; node_used[b] += 1
+            else:
+                aa, bb = (a, b) if deg[a] <= deg[b] else (b, a)
+                node_used[aa] += 1
+        return applied
+
+    nearby_mask = _topk_mask_per_row(scores, nearby_topk) if enable_nearby_cross else None
+    score_thr = None
+    if late_score_q is not None and 0.0 < late_score_q < 1.0:
+        s_valid = scores.masked_fill(forbid_base, float("-inf"))
+        vals = s_valid[s_valid > float("-inf")]
+        if vals.numel() > 0:
+            score_thr = torch.quantile(vals, late_score_q)
+
+    # ----- epoch-gated tier schedule -----
+    def _eligible_tiers():
+        # If no labels or mode=="any": only D
+        if labels is None or mode not in ("intra", "inter"):
+            return [("D", dict(mode="none", exclude_noise=False, nearby_only=False))]
+        A_rel, B_rel, C_rel, D_rel = tier_release_fracs
+        if epoch is None or max_epochs is None:
+            progress = 1.0  # allow all
         else:
-            aa, bb = (a, b) if deg[a] <= deg[b] else (b, a)
-            if node_used[aa] >= node_caps[aa]:
-                continue
+            progress = float(epoch + 1) / max(1, max_epochs)
+        tiers = []
+        if progress >= A_rel:
+            tiers.append(("A", dict(mode=mode, exclude_noise=exclude_noise, nearby_only=False)))
+        if allow_noise_tier and progress >= B_rel:
+            tiers.append(("B", dict(mode=mode, exclude_noise=False,    nearby_only=False)))
+        if enable_nearby_cross and mode == "intra" and progress >= C_rel:
+            tiers.append(("C", dict(mode="inter", exclude_noise=False, nearby_only=True)))
+        if progress >= D_rel:
+            tiers.append(("D", dict(mode="none",  exclude_noise=False, nearby_only=False)))
+        return tiers
 
-        # add
-        g[a, b] = 1
-        g[b, a] = 1
-        applied += 1
-        global_left -= 1
-        deg[a] += 1
-        deg[b] += 1
-        if charge_both_endpoints:
-            node_used[a] += 1
-            node_used[b] += 1
+    tiers = _eligible_tiers()
+    print(f"[TIER] epoch_progress={ (epoch+1)/max_epochs if (epoch is not None and max_epochs) else 1.0 :.3f} "
+          f"| eligible={[t for t,_ in tiers]}")
+
+    applied_total = 0
+    zero_passes = 0
+    tier_idx = 0
+    while global_left > 0 and tier_idx < len(tiers):
+        tier_name, cfg = tiers[tier_idx]
+
+        forbid = forbid_base.clone()
+        allow = _build_cluster_allow(cfg["mode"], cfg["exclude_noise"])
+        if cfg.get("nearby_only", False) and nearby_mask is not None:
+            allow = allow & nearby_mask
+        forbid = forbid | (~allow)
+        if tier_name == "D" and score_thr is not None:
+            forbid = forbid | (scores < score_thr)
+
+        added = _add_with_forbid(forbid)
+        applied_total += added
+
+        print(f"[AUG-{mode}|Tier {tier_name}] added={added} | epoch_used={ ( (int(round(aug_ratio*E0)) if (epoch is None or max_epochs is None) else int(round(global_cap * _epoch_target_frac(epoch, max_epochs))) ) - global_left) } | quota_left={global_left}")
+
+        if added == 0:
+            zero_passes += 1
+            if relax_when_stuck and zero_passes >= patience:
+                tier_idx += 1
+                zero_passes = 0
+            else:
+                break
         else:
-            aa, bb = (a, b) if deg[a] <= deg[b] else (b, a)
-            node_used[aa] += 1
+            zero_passes = 0
+            # keep working on same tier until it stalls
 
     g.fill_diagonal_(1)
     g = torch.maximum(g, g.t())
-    print(f"[AUG-{mode}] applied_add={applied} | global_used={global_cap - global_left}/{global_cap} "
+    print(f"[AUG-{mode}] applied_add={applied_total} | epoch_quota_used={ ( (int(round(aug_ratio*E0)) if (epoch is None or max_epochs is None) else int(round(global_cap * _epoch_target_frac(epoch, max_epochs))) ) - global_left) } "
           f"| per-node_max_used={int(node_used.max().item())}")
-    return g, applied
+    return g, applied_total, node_used  # return node_used so caller can persist it
+
+# ---- pick one clustering method and compute once per run ----
+# GMM on Z (embedding space)
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+
+def gmm_labels(Z, K, tau=0.55, metric="cosine"):
+    X = Z.detach().cpu().numpy()
+    if metric == "cosine":
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    gmm = GaussianMixture(n_components=K, covariance_type="diag", random_state=0)
+    gmm.fit(X)
+    P = gmm.predict_proba(X)
+    lbl = P.argmax(1).astype(np.int64)
+    lbl[P.max(1) < tau] = -1  # low-confidence → noise
+    return lbl
+
+# Louvain on graph structure
+import community as community_louvain  # pip install python-louvain
+import networkx as nx
+
+
+def louvain_labels(adj_dense_or_sparse):
+    G = nx.from_scipy_sparse_array(adj_dense_or_sparse) if hasattr(adj_dense_or_sparse, "tocsr") \
+        else nx.from_numpy_array(adj_dense_or_sparse)
+    part = community_louvain.best_partition(G, random_state=0, resolution=1.0)
+    N = G.number_of_nodes()
+    return np.array([part[i] for i in range(N)], dtype=np.int64)
+
 # ========================================================================
+
+def robust_score_quantile_from_scores(
+    scores: torch.Tensor,
+    block_mask: torch.Tensor,     # True where we should ignore (e.g., forbid/edges/diag)
+    q: float | None,
+    max_elems: int = 2_000_000,   # sample size cap; tune if needed
+) -> torch.Tensor | None:
+    """
+    Returns a scalar threshold at quantile q of the allowed scores.
+    Works for huge matrices by sampling up to max_elems elements on CPU.
+    """
+    if q is None or not (0.0 < q < 1.0):
+        return None
+
+    # Mask out blocked entries
+    s_valid = scores.masked_fill(block_mask, float("-inf"))
+    vals = s_valid[s_valid > float("-inf")]   # 1-D view of allowed entries
+
+    if vals.numel() == 0:
+        return None
+
+    v = vals.detach()
+    # Always move heavy quantile to CPU float32
+    if v.is_cuda:
+        v = v.float().cpu()
+    else:
+        v = v.float()
+
+    n = v.numel()
+    if n > max_elems:
+        # Random uniform sample without replacement (good enough for thresholding)
+        idx = torch.randint(0, n, (max_elems,))
+        v = v[idx]
+        print(f"[AUG] quantile sampling: {v.numel()}/{n} elements for q={q}")
+
+    thr = torch.quantile(v, q)
+    # return on same device as scores for later comparisons
+    return thr.to(scores.device)
 
 @torch.no_grad()
 def degree_deficit_snapshot(

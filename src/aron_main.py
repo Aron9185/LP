@@ -105,6 +105,10 @@ parser.add_argument(
     default=None,
     help="Optional per-epoch budget as a fraction of |E0|; None disables throttle.",
 )
+parser.add_argument("--cluster_method", choices=["none", "gmm", "louvain"], default="none")
+parser.add_argument("--cluster_mode",   choices=["any", "intra", "inter"], default="any")
+parser.add_argument("--gmm_k", type=int, default=16)        # pick your K
+parser.add_argument("--gmm_tau", type=float, default=0.55)  # confidence→noise
 # also use: --ver aron_desc or --ver aron_asc
 
 args = parser.parse_args()
@@ -183,6 +187,9 @@ def main():
         topk_per_node=args.topk_per_node,
         aug_ratio_epoch=args.aug_ratio_epoch,
         run_tag=args.idx,
+        # NEW cluster controls
+        cluster_method=args.cluster_method,
+        cluster_mode=args.cluster_mode,
         seed=args.seed,
     )
 
@@ -244,17 +251,31 @@ class TqdmOnlyStderr(io.TextIOBase):
 # --- inside your main guard ---
 if __name__ == "__main__":
     if args.logging:
-        # Prepare log path
-        log_dir = Path("/home/retro/ARON/log") / str(args.date)
+        # mirror script: logs/<DATESTR>/...
+        log_dir = Path("log") / str(args.date)
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = (
-            log_dir
-            / f"{args.dataset}_{args.ver}_r{args.aug_ratio}_fmr{args.feat_mask_ratio}_d{args.degree_threshold}_{args.idx}_loss_{args.loss_ver}.log"
+
+        # pretty float stamps
+        r_str = f"{float(args.aug_ratio):.1f}"
+        fmr_str = f"{float(args.aug_bound):.1f}"           # <- was feat_mask_ratio
+        d_str = f"{float(args.degree_threshold):.1f}"
+
+        # cluster method suffix (optional)
+        cm = getattr(args, "cluster_method", "none")
+        cm_suffix = f"_{cm}" if cm and cm != "none" else ""
+
+        # optional loss tag (kept for backward compat)
+        loss_tag = f"_loss_{args.loss_ver}" if getattr(args, "loss_ver", "") else ""
+
+        fname = (
+            f"{args.dataset}_{args.ver}_r{r_str}_fmr{fmr_str}_d{d_str}"
+            f"{cm_suffix}_seed{args.seed}_idx{args.idx}{loss_tag}.log"
         )
+        log_path = log_dir / fname
 
-        # Open line-buffered file
+        # line-buffered append
         log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-
+        
         # Keep terminal streams
         term_out, term_err = sys.stdout, sys.stderr
 

@@ -66,6 +66,13 @@ def train_encoder(
     # ---- NEW: logging / reproducibility ----
     run_tag: str = "",                       # free-form tag for logs/checkpoints
     seed: Optional[int] = None,
+    # NEW:
+    cluster_method: str = "none",
+    cluster_mode:   str = "any",        # "any"|"intra"|"inter"
+    gmm_k:   int = 16,
+    gmm_tau: float = 0.55,
+    louvain_resolution: float = 1.0,
+    **kwargs,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor]:
     """
     Train the encoder with budgeted graph augmentation.
@@ -412,6 +419,24 @@ def train_encoder(
                 #     writer=writer if 'writer' in locals() else None,
                 # )
 
+                # ---- epoch-bounded quota (fraction of E0 for THIS epoch) ----
+                def _epoch_target_frac(ep: int, T: int, mode: str = "linear") -> float:
+                    if mode == "cosine":
+                        import math
+                        return 0.5 * (1.0 - math.cos(math.pi * float(ep + 1) / max(1, T)))
+                    return float(ep + 1) / max(1, T)
+
+                # If user passed aug_ratio_epoch, obey it; else throttle by cumulative schedule.
+                if aug_ratio_epoch is None:
+                    target_cum_edges = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
+                    epoch_quota_edges = max(0, target_cum_edges - int(global_used_adds))
+                    epoch_quota_frac  = epoch_quota_edges / float(E0)
+                else:
+                    # explicit per-epoch cap from args, but don’t exceed remaining global budget
+                    remaining_global = max(0, int(round(aug_ratio * E0)) - int(global_used_adds))
+                    epoch_quota_edges = min(int(round(aug_ratio_epoch * E0)), remaining_global)
+                    epoch_quota_frac  = epoch_quota_edges / float(E0)
+
                 g, added_this_epoch, global_used_adds, node_used_adds = degree_aug_fill_deficit_from_scores_budget(
                     scores_frozen=frozen_scores,
                     adj_label=adj_label.to_dense(),
@@ -422,11 +447,11 @@ def train_encoder(
                     # ---- budgets ----
                     E0=E0,
                     aug_ratio=aug_ratio,                     # GLOBAL budget
-                    global_used_adds=global_used_adds,            # cumulative count
-                    deg0_excl_self=deg0_excl_self,                # ORIGINAL degrees
+                    global_used_adds=global_used_adds,       # cumulative count
+                    deg0_excl_self=deg0_excl_self,           # ORIGINAL degrees
                     aug_bound=aug_bound,                     # PER-NODE cap fraction
-                    node_used_adds=node_used_adds,                # cumulative per-node counts
-                    aug_ratio_epoch=1,  # optional
+                    node_used_adds=node_used_adds,           # cumulative per-node counts
+                    aug_ratio_epoch=epoch_quota_frac,        # <-- epoch-bounded cap
                 )
 
                 adj_label = g
@@ -436,57 +461,184 @@ def train_encoder(
                     f"| global_used_adds={global_used_adds} ({global_used_adds/E0:.4f} of E0)")
 
                 aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features.to_dense(), feat_maske_ratio)
+
             # ***** NEW: confidence-guided (desc) with cluster constraint *****
             elif ver in ("aron_desc_intra", "aron_desc_inter"):
-                # Use the same desc ordering as aron_desc
-                degree_floor = max(0, int(degree_threshold) - 1)   # align with excl-self
+                # ---- config & prep ----
+                degree_floor = max(0, int(degree_threshold) - 1)
                 order = "desc"
-
-                # Get Z from this epoch (you computed Z above)
                 Z_for_cluster = Z.detach()
+                base_mode = "intra" if ver == "aron_desc_intra" else "inter"
 
-                # Cluster labels (DBSCAN)
-                labels_cluster = density_cluster_embeddings(
-                    Z_for_cluster,
-                    method="hdbscan",
-                    eps=dbscan_eps,                  # <- use function args (no 'args' here)
-                    min_samples=dbscan_min_samples,
-                    metric=dbscan_metric,
-                )
+                # ---- epoch-bounded quota (compute per-epoch target, then remaining) ----
+                def _epoch_target_frac(ep: int, T: int, mode: str = "linear") -> float:
+                    if mode == "cosine":
+                        import math
+                        return 0.5 * (1.0 - math.cos(math.pi * float(ep + 1) / max(1, T)))
+                    return float(ep + 1) / max(1, T)
 
-                # Build ALLOW mask, then merge with your existing forbid_mask
-                mode = "intra" if ver == "aron_desc_intra" else "inter"
-                allow_mask = build_cluster_allow_mask(labels_cluster, mode=mode, exclude_noise=True, device=device)
-                forbid_mask_combined = forbid_mask | (~allow_mask)
+                if aug_ratio_epoch is None:
+                    target_cum_edges = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
+                    remaining_global = max(0, int(round(aug_ratio * E0)) - int(global_used_adds))
+                    epoch_quota_edges = min(max(0, target_cum_edges - int(global_used_adds)), remaining_global)
+                else:
+                    remaining_global = max(0, int(round(aug_ratio * E0)) - int(global_used_adds))
+                    epoch_quota_edges = min(int(round(aug_ratio_epoch * E0)), remaining_global)
 
-                # Scores: prefer frozen_scores; if missing, fall back to Z·Z^T
+                print(f"[AUG-{base_mode}] epoch={epoch}/{num_epoch-1} | E0={E0} | global_cap={int(round(aug_ratio*E0))} "
+                    f"| global_used={global_used_adds} | epoch_quota_edges={epoch_quota_edges}")
+
+                # ---- clustering (SELECT METHOD) ----
+                # (keeps per-epoch behavior; move this before the epoch loop if you want "compute once")
+                if cluster_method == "gmm":
+                    labels_cluster = gmm_labels(
+                        Z_for_cluster,            # torch.Tensor [N,d]
+                        K=gmm_k,                  # e.g., 16/32
+                        tau=gmm_tau,              # confidence → noise threshold
+                        metric="cosine",
+                    )
+                elif cluster_method == "louvain":
+                    A_np = (adj_label.to_dense() > 0).detach().cpu().numpy().astype(np.int8)
+                    np.fill_diagonal(A_np, 0)     # Louvain doesn’t need self-loops
+                    # If your louvain_labels supports resolution, pass it here; otherwise ignore.
+                    labels_cluster = louvain_labels(A_np)  # or louvain_labels(A_np, resolution=louvain_resolution)
+                else:
+                    # default: your current HDBSCAN path (unchanged)
+                    labels_cluster = density_cluster_embeddings(
+                        Z_for_cluster,
+                        method="hdbscan",
+                        eps=dbscan_eps,
+                        min_samples=dbscan_min_samples,
+                        metric=dbscan_metric,
+                    )
+
+                # ---- scores for ranking ----
                 scores_for_rank = frozen_scores if frozen_scores is not None else _scores_from_Z(Z_for_cluster).detach()
 
-                # Run the SAME deficit-filling augmentation as aron_desc, just with the tighter mask
-                g, added_this_epoch, global_used_adds, node_used_adds = degree_aug_fill_deficit_from_scores_budget(
-                    scores_frozen=scores_for_rank,
-                    adj_label=adj_label.to_dense(),
-                    num_nodes=num_nodes,
-                    degree_floor=degree_floor,
-                    order=order,
-                    forbid_mask=forbid_mask_combined,     # <— constrain by cluster
-                    # ---- budgets ----
-                    E0=E0,
-                    aug_ratio=aug_ratio,                  # GLOBAL budget
-                    global_used_adds=global_used_adds,    # cumulative count
-                    deg0_excl_self=deg0_excl_self,        # ORIGINAL degrees
-                    aug_bound=aug_bound,                  # PER-NODE cap fraction
-                    node_used_adds=node_used_adds,        # cumulative per-node counts
-                    aug_ratio_epoch=aug_ratio_epoch,      # per-epoch cap or None
+                # ---- nearby mask for Tier C ----
+                def _topk_mask_per_row(S: torch.Tensor, k: int) -> torch.Tensor:
+                    Nloc = S.size(0)
+                    k = max(0, min(k, Nloc))
+                    if k == 0:
+                        return torch.zeros_like(S, dtype=torch.bool)
+                    idx = torch.topk(S, k=k, dim=1, largest=True).indices
+                    mask = torch.zeros_like(S, dtype=torch.bool)
+                    rows = torch.arange(Nloc, device=S.device).unsqueeze(1).expand_as(idx)
+                    mask[rows, idx] = True
+                    mask.fill_diagonal_(False)
+                    return mask
+
+                nearby_topk = 10
+                nearby_mask = _topk_mask_per_row(scores_for_rank, nearby_topk)
+
+                # ---- Tier D quality gate (score quantile) ----
+                late_score_q = 0.90
+                base_block = (forbid_mask | (adj_label.to_dense() > 0))
+                s_valid = scores_for_rank.masked_fill(base_block, float("-inf"))
+                vals = s_valid[s_valid > float("-inf")]
+                score_thr = robust_score_quantile_from_scores(
+                    scores_for_rank,
+                    base_block,
+                    q=late_score_q,
+                    max_elems=2_000_000,   # you can bump to 5_000_000 if RAM allows
                 )
 
-                adj_label = g
+                # ---- build allow masks for tiers ----
+                allow_A = build_cluster_allow_mask(labels_cluster, mode=base_mode, exclude_noise=True,  device=device)
+                allow_B = build_cluster_allow_mask(labels_cluster, mode=base_mode, exclude_noise=False, device=device)
+                allow_C = build_cluster_allow_mask(labels_cluster, mode="inter", exclude_noise=False, device=device) & nearby_mask
+                allow_D = torch.ones_like(allow_A, dtype=torch.bool, device=device); allow_D.fill_diagonal_(False)
+
+                # ---- epoch-gated tier release ----
+                progress = float(epoch + 1) / max(1, num_epoch)
+                A_rel, B_rel, C_rel, D_rel = 0.00, 0.30, 0.60, 0.85  # tune if desired
+                tiers: list[tuple[str, torch.Tensor]] = []
+                if progress >= A_rel: tiers.append(("A", allow_A))
+                if progress >= B_rel: tiers.append(("B", allow_B))
+                if progress >= C_rel and base_mode == "intra": tiers.append(("C", allow_C))
+                if progress >= D_rel: tiers.append(("D", allow_D))
+                print(f"[TIER-{base_mode}] progress={progress:.3f} | eligible={[t for t,_ in tiers]}")
+
+                # ---- pure helper: NO nonlocal; returns updated state ----
+                def _run_tier(
+                    allow_mask: torch.Tensor,
+                    tier_name: str,
+                    g_in: torch.Tensor,
+                    global_used_adds_in: int,
+                    node_used_adds_in: torch.Tensor,
+                    quota_edges_this_call: int | None,
+                ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
+                    # Merge forbid
+                    forbid_mask_combined = forbid_mask | (~allow_mask)
+                    if tier_name == "D" and score_thr is not None:
+                        forbid_mask_combined = forbid_mask_combined | (scores_for_rank < score_thr)
+
+                    quota_frac = None if quota_edges_this_call is None else max(0.0, float(quota_edges_this_call) / float(E0))
+
+                    g_out, added_out, global_used_out, node_used_out = degree_aug_fill_deficit_from_scores_budget(
+                        scores_frozen=scores_for_rank,
+                        adj_label=g_in,                       # pass CURRENT dense adj
+                        num_nodes=num_nodes,
+                        degree_floor=degree_floor,
+                        order=order,
+                        forbid_mask=forbid_mask_combined,
+                        # budgets
+                        E0=E0,
+                        aug_ratio=aug_ratio,
+                        global_used_adds=global_used_adds_in,
+                        deg0_excl_self=deg0_excl_self,
+                        aug_bound=aug_bound,
+                        node_used_adds=node_used_adds_in,
+                        aug_ratio_epoch=quota_frac,           # per-call epoch slice
+                    )
+                    return g_out, added_out, global_used_out, node_used_out
+
+                # ---- iterate tiers with exact epoch quota accounting ----
+                g_work = adj_label.to_dense()
+                added_this_epoch = 0
+                remaining_quota_edges = int(epoch_quota_edges)
+
+                for name, allow in tiers:
+                    if remaining_quota_edges <= 0:
+                        break
+
+                    tier_added_total = 0
+                    # Greedy within tier: keep adding until it stalls or quota is exhausted
+                    while remaining_quota_edges > 0:
+                        quota_for_call = remaining_quota_edges  # exact remaining for this call
+                        g_work, added, global_used_adds, node_used_adds = _run_tier(
+                            allow_mask=allow,
+                            tier_name=name,
+                            g_in=g_work,
+                            global_used_adds_in=global_used_adds,
+                            node_used_adds_in=node_used_adds,
+                            quota_edges_this_call=quota_for_call,
+                        )
+                        tier_added_total += added
+                        added_this_epoch += added
+
+                        # recompute remaining quota
+                        if aug_ratio_epoch is None:
+                            target_cum_edges = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
+                            remaining_quota_edges = max(0, target_cum_edges - int(global_used_adds))
+                        else:
+                            remaining_quota_edges = max(0, int(round(aug_ratio_epoch * E0)) - added_this_epoch)
+
+                        print(f"[AUG-{base_mode}|Tier {name}] added={added} | tier_total={tier_added_total} "
+                            f"| epoch_quota_left={remaining_quota_edges} | global_used={global_used_adds}/{int(round(aug_ratio*E0))}")
+
+                        if added == 0:
+                            break  # this tier stalled; move to next tier
+
+                # ---- finalize epoch changes ----
+                adj_label = g_work
+                g = g_work
                 modification_ratio = added_this_epoch / float(E0)
-                print(f"[AUG-{mode}] this_epoch_add={added_this_epoch} | this_epoch_ratio={modification_ratio:.6f} "
+                print(f"[AUG-{base_mode}] this_epoch_add={added_this_epoch} | this_epoch_ratio={modification_ratio:.6f} "
                     f"| global_used_adds={global_used_adds} ({global_used_adds/E0:.4f} of E0)")
 
                 aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features.to_dense(), feat_maske_ratio)
-            
+
             elif(ver=="no"):
                 g = adj_label.to_dense()
                 modification_ratio = 0
