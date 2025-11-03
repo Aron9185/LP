@@ -34,8 +34,8 @@ def train_encoder(
     dataset_str: str,
     device: torch.device,
     num_epoch: int,
-    adj: torch.Tensor,                       # dense [N,N] with self-loops or edge_index upstream
-    features: torch.Tensor,                  # [N,F] (dense)
+    adj: torch.Tensor,                       # dense [N,N] with self-loops
+    features: torch.Tensor,                  # [N,F]
     hidden1: int,
     hidden2: int,
     dropout: float,
@@ -48,7 +48,7 @@ def train_encoder(
     temperature: float,
     labels: torch.Tensor,
     idx_train, idx_val, idx_test,
-    ver: str,                                # "aron_desc/asc", "aron_db_any/intra/inter", "no", ...
+    ver: str,                                # "aron_desc/asc", "aron_desc_intra/inter", "no", ...
     degree_ratio: float,
     loss_ver: str,
     feat_maske_ratio: float,
@@ -56,22 +56,27 @@ def train_encoder(
     frozen_scores_path: str = "",
     pretrained_ckpt_path: str = "",
     *,
-    # ---- NEW: clustering / augmentation knobs ----
-    dbscan_eps: Optional[float] = None,      # None = auto (median kNN heuristic)
+    # ---- clustering / augmentation knobs ----
+    dbscan_eps: Optional[float] = None,
     dbscan_min_samples: int = 5,
-    dbscan_metric: str = "cosine",           # "cosine" | "euclidean"
-    topk_per_node: int = 64,                 # candidate pool size per node
-    charge_both_endpoints: bool = True,      # per-node cap charged to both endpoints
-    aug_ratio_epoch: Optional[float] = None, # None disables per-epoch throttle
-    # ---- NEW: logging / reproducibility ----
-    run_tag: str = "",                       # free-form tag for logs/checkpoints
+    dbscan_metric: str = "cosine",
+    topk_per_node: int = 64,
+    charge_both_endpoints: bool = True,
+    aug_ratio_epoch: Optional[float] = None,
+    # ---- logging / reproducibility ----
+    run_tag: str = "",
     seed: Optional[int] = None,
-    # NEW:
+    # NEW cluster controls
     cluster_method: str = "none",
     cluster_mode:   str = "any",        # "any"|"intra"|"inter"
     gmm_k:   int = 16,
     gmm_tau: float = 0.55,
     louvain_resolution: float = 1.0,
+    # NEW: restricted (α,γ, d̂) gating for augmentation (avoid name clash with loss α/γ)
+    restricted: bool = False,
+    restrict_alpha: float = 0.8,
+    restrict_gamma: float = 1.0,
+    restrict_inter: str = "off",        # "off" | "boundary" (todo)
     **kwargs,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor]:
     """
@@ -123,6 +128,8 @@ def train_encoder(
         - Per-node caps are enforced against ORIGINAL degrees; global cap uses ORIGINAL |E0|.
         - Use `charge_both_endpoints=False` if helper saturation becomes a bottleneck.
     """
+    torch.cuda.empty_cache()
+    device = adj.device if hasattr(adj, "device") else device
     training_time_start = time.time()
 
     num_nodes = adj.shape[0]
@@ -487,7 +494,7 @@ def train_encoder(
 
                 print(f"[AUG-{base_mode}] epoch={epoch}/{num_epoch-1} | E0={E0} | global_cap={int(round(aug_ratio*E0))} "
                     f"| global_used={global_used_adds} | epoch_quota_edges={epoch_quota_edges}")
-
+                
                 # ---- clustering (SELECT METHOD) ----
                 # (keeps per-epoch behavior; move this before the epoch loop if you want "compute once")
                 if cluster_method == "gmm":
@@ -511,6 +518,21 @@ def train_encoder(
                         min_samples=dbscan_min_samples,
                         metric=dbscan_metric,
                     )
+                    
+                # ---- (α,γ, d̂) restriction: compute once for this epoch (no in-place shrinking) ----
+                allow_restricted = None
+                if restricted:
+                    deg_now = _deg_excl_self(adj_label.to_dense())
+                    allow_restricted = build_alpha_gamma_allow_mask_gmm(
+                        Z_for_cluster, labels_cluster, degrees_excl_self=deg_now,
+                        alpha=restrict_alpha, gamma=restrict_gamma, B=Z_for_cluster.size(1),
+                        exclude_noise=True, require_core_endpoint=True, within_threshold=True,
+                    )
+                    if allow_restricted is not None and allow_restricted.sum() == 0:
+                        print("[RESTRICT] empty eligibility this epoch → disabling restriction")
+                        allow_restricted = None
+
+                print(f"[RESTRICT] active={allow_restricted is not None} (mode={base_mode})")
 
                 # ---- scores for ranking ----
                 scores_for_rank = frozen_scores if frozen_scores is not None else _scores_from_Z(Z_for_cluster).detach()
@@ -528,26 +550,28 @@ def train_encoder(
                     mask.fill_diagonal_(False)
                     return mask
 
-                nearby_topk = 10
+                nearby_topk = topk_per_node
                 nearby_mask = _topk_mask_per_row(scores_for_rank, nearby_topk)
 
                 # ---- Tier D quality gate (score quantile) ----
                 late_score_q = 0.90
                 base_block = (forbid_mask | (adj_label.to_dense() > 0))
-                s_valid = scores_for_rank.masked_fill(base_block, float("-inf"))
-                vals = s_valid[s_valid > float("-inf")]
+                if allow_restricted is not None:             # now safe: it's defined above
+                    base_block = base_block | (~allow_restricted)  # restrict only in candidate/quantile phase
+
                 score_thr = robust_score_quantile_from_scores(
-                    scores_for_rank,
-                    base_block,
-                    q=late_score_q,
-                    max_elems=2_000_000,   # you can bump to 5_000_000 if RAM allows
+                    scores_for_rank, base_block, q=late_score_q, max_elems=2_000_000,
                 )
 
-                # ---- build allow masks for tiers ----
+                # ---- build allow masks for tiers (base) ----
                 allow_A = build_cluster_allow_mask(labels_cluster, mode=base_mode, exclude_noise=True,  device=device)
                 allow_B = build_cluster_allow_mask(labels_cluster, mode=base_mode, exclude_noise=False, device=device)
-                allow_C = build_cluster_allow_mask(labels_cluster, mode="inter", exclude_noise=False, device=device) & nearby_mask
+                allow_C = build_cluster_allow_mask(labels_cluster, mode="inter",  exclude_noise=False, device=device) & nearby_mask
                 allow_D = torch.ones_like(allow_A, dtype=torch.bool, device=device); allow_D.fill_diagonal_(False)
+
+                
+                # IMPORTANT: do NOT intersect allow_A/B/C/D here.
+                # The restriction is applied only when merging the forbid mask in _run_tier.
 
                 # ---- epoch-gated tier release ----
                 progress = float(epoch + 1) / max(1, num_epoch)
@@ -568,20 +592,45 @@ def train_encoder(
                     node_used_adds_in: torch.Tensor,
                     quota_edges_this_call: int | None,
                 ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
-                    # Merge forbid
-                    forbid_mask_combined = forbid_mask | (~allow_mask)
+                    # 1) Start from tier allow
+                    effective_allow = allow_mask
+
+                    # 2) Apply α–γ–d eligibility ONLY for this selection call (if active)
+                    if restricted and (allow_restricted is not None):
+                        effective_allow = allow_mask & allow_restricted
+
+                        # Make it robust: symmetric + zero diag
+                        effective_allow = effective_allow & effective_allow.T
+                        effective_allow.fill_diagonal_(False)
+
+                        # If everything is wiped out once current forbids are considered, ignore restriction this call
+                        # (so we can still add edges this epoch/tier)
+                        if ((effective_allow & (~forbid_mask)).sum().item() == 0):
+                            print(f"[RESTRICT] {tier_name}: no eligible pairs after gate → ignoring restriction for this call")
+                            effective_allow = allow_mask
+                        else:
+                            kept_pairs = (effective_allow & (~forbid_mask)).float().mean().item()
+                            kept_nodes = (effective_allow.any(dim=1)).float().mean().item()
+                            print(f"[RESTRICT] {tier_name}: kept_pairs={kept_pairs:.4f} kept_nodes={kept_nodes:.4f}")
+
+                    # 3) Merge forbids (scores/used edges/etc.) AFTER the local gate
+                    forbid_mask_combined = forbid_mask | (~effective_allow)
+
+                    # Extra forbid for Tier-D score-quantile (if you use it)
                     if tier_name == "D" and score_thr is not None:
                         forbid_mask_combined = forbid_mask_combined | (scores_for_rank < score_thr)
 
+                    # 4) Per-call quota as fraction of E0 (optional)
                     quota_frac = None if quota_edges_this_call is None else max(0.0, float(quota_edges_this_call) / float(E0))
 
+                    # 5) Run the degree-aware adder on CURRENT dense adj
                     g_out, added_out, global_used_out, node_used_out = degree_aug_fill_deficit_from_scores_budget(
                         scores_frozen=scores_for_rank,
-                        adj_label=g_in,                       # pass CURRENT dense adj
+                        adj_label=g_in,                     # CURRENT adj (dense)
                         num_nodes=num_nodes,
                         degree_floor=degree_floor,
                         order=order,
-                        forbid_mask=forbid_mask_combined,
+                        forbid_mask=forbid_mask_combined,   # <- restriction enforced only here
                         # budgets
                         E0=E0,
                         aug_ratio=aug_ratio,
@@ -589,7 +638,7 @@ def train_encoder(
                         deg0_excl_self=deg0_excl_self,
                         aug_bound=aug_bound,
                         node_used_adds=node_used_adds_in,
-                        aug_ratio_epoch=quota_frac,           # per-call epoch slice
+                        aug_ratio_epoch=quota_frac,         # per-call epoch slice
                     )
                     return g_out, added_out, global_used_out, node_used_out
 

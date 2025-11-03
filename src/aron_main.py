@@ -109,6 +109,14 @@ parser.add_argument("--cluster_method", choices=["none", "gmm", "louvain"], defa
 parser.add_argument("--cluster_mode",   choices=["any", "intra", "inter"], default="any")
 parser.add_argument("--gmm_k", type=int, default=16)        # pick your K
 parser.add_argument("--gmm_tau", type=float, default=0.55)  # confidence→noise
+
+parser.add_argument("--restricted", action="store_true")
+parser.add_argument("--restrict_alpha", type=float, default=0.8)
+parser.add_argument("--restrict_gamma", type=float, default=1.0)
+parser.add_argument("--restrict_inter", type=str, default="off", choices=["off","boundary"])
+
+parser.add_argument("--run_tag", type=str, default="", help="Optional run identifier tag (used for log naming)")
+
 # also use: --ver aron_desc or --ver aron_asc
 
 args = parser.parse_args()
@@ -190,6 +198,11 @@ def main():
         # NEW cluster controls
         cluster_method=args.cluster_method,
         cluster_mode=args.cluster_mode,
+        # NEW: restricted augmentation knobs
+        restricted=args.restricted,
+        restrict_alpha=args.restrict_alpha,
+        restrict_gamma=args.restrict_gamma,
+        restrict_inter=args.restrict_inter,
         seed=args.seed,
     )
 
@@ -206,7 +219,6 @@ def main():
 
 class TqdmOnlyStderr(io.TextIOBase):
     """Forward everything to log_file; forward only tqdm-style carriage-return updates to terminal."""
-
     def __init__(self, term_stderr, log_file, show_tracebacks_on_terminal=False):
         self.term = term_stderr
         self.log = log_file
@@ -214,36 +226,28 @@ class TqdmOnlyStderr(io.TextIOBase):
         self._saw_traceback = False
 
     def write(self, data: str):
-        # Always write to the log file (strip \r so the log is clean)
         self.log.write(data.replace("\r", ""))
         self.log.flush()
 
-        # Heuristic: forward ONLY tqdm refreshes to terminal
-        is_tqdm_update = ("\r" in data and not data.endswith("\n")) or (
-            "it/s" in data and "\n" not in data
-        )
+        is_tqdm_update = ("\r" in data and not data.endswith("\n")) or ("it/s" in data and "\n" not in data)
 
-        # Optionally show tracebacks on terminal too
         if self.show_tracebacks:
             if "Traceback (most recent call last):" in data:
                 self._saw_traceback = True
             if self._saw_traceback:
-                self.term.write(data)
-                self.term.flush()
+                self.term.write(data); self.term.flush()
                 if data.endswith("\n"):
                     self._saw_traceback = False
                 return len(data)
 
         if is_tqdm_update:
-            self.term.write(data)
-            self.term.flush()
+            self.term.write(data); self.term.flush()
         return len(data)
 
     def flush(self):
         self.term.flush()
         self.log.flush()
 
-    # Make tqdm think this is a TTY so it renders properly
     def isatty(self):
         return True
 
@@ -257,25 +261,26 @@ if __name__ == "__main__":
 
         # pretty float stamps
         r_str = f"{float(args.aug_ratio):.1f}"
-        fmr_str = f"{float(args.aug_bound):.1f}"           # <- was feat_mask_ratio
+        fmr_str = f"{float(args.aug_bound):.1f}"
         d_str = f"{float(args.degree_threshold):.1f}"
 
-        # cluster method suffix (optional)
+        # optional cluster method / loss tag
         cm = getattr(args, "cluster_method", "none")
         cm_suffix = f"_{cm}" if cm and cm != "none" else ""
-
-        # optional loss tag (kept for backward compat)
         loss_tag = f"_loss_{args.loss_ver}" if getattr(args, "loss_ver", "") else ""
+
+        # 🔹 NEW: run_tag goes into filename (sanitized lightly)
+        tag_suffix = f"_tag{args.run_tag}" if args.run_tag else ""
 
         fname = (
             f"{args.dataset}_{args.ver}_r{r_str}_fmr{fmr_str}_d{d_str}"
-            f"{cm_suffix}_seed{args.seed}_idx{args.idx}{loss_tag}.log"
+            f"{cm_suffix}_seed{args.seed}_idx{args.idx}{tag_suffix}{loss_tag}.log"
         )
         log_path = log_dir / fname
 
         # line-buffered append
         log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
-        
+
         # Keep terminal streams
         term_out, term_err = sys.stdout, sys.stderr
 
@@ -283,17 +288,25 @@ if __name__ == "__main__":
         sys.stdout = log_file
 
         # Route stderr to (log + terminal only for tqdm)
-        sys.stderr = TqdmOnlyStderr(
-            term_err, log_file, show_tracebacks_on_terminal=True
-        )  # set False to hide tracebacks
+        sys.stderr = TqdmOnlyStderr(term_err, log_file, show_tracebacks_on_terminal=True)
 
-        # Ensure Python logging does NOT spam terminal: send it to stdout (which we redirected to file)
+        # Ensure Python logging goes to file (stdout redirected)
         for h in logging.root.handlers[:]:
             logging.root.removeHandler(h)
-        logging.basicConfig(
-            level=logging.INFO,
-            handlers=[logging.StreamHandler(sys.stdout)],  # goes to log_file only
-        )
+        logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
+
+        # 🔹 Optional META header at top of each run
+        print("===== RUN META =====")
+        print(f"date={args.date} time={time.strftime('%F %T')}")
+        print(f"dataset={args.dataset} ver={args.ver} mode={args.cluster_mode} method={args.cluster_method}")
+        print(f"seed={args.seed} idx={args.idx} run_tag={args.run_tag or '<none>'}")
+        print(f"aug_ratio={args.aug_ratio} aug_bound={args.aug_bound} degree_thr={args.degree_threshold}")
+        print(f"topk_per_node={args.topk_per_node} aug_ratio_epoch={args.aug_ratio_epoch}")
+        if args.restricted:
+            print(f"restricted=1 alpha={args.restrict_alpha} gamma={args.restrict_gamma}")
+        else:
+            print("restricted=0")
+        print("====================")
 
         try:
             set_random_seed(args.seed)
