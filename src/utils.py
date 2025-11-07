@@ -1106,58 +1106,42 @@ def select_gmm_cores(
       dmin_hat: dict[c] -> int
       radii: [N] float
     """
-    # basic domain checks (keep or remove as you like)
-    if not (0.0 < alpha <= 1.0):
-        raise ValueError(f"alpha must be in (0,1], got {alpha}")
-    if not (0.0 < gamma <= 1.0):
-        raise ValueError(f"gamma must be in (0,1], got {gamma}")
-    
     device = Z.device
+    import math
+    if B is None: B = Z.size(1)
     lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
-    N, d = Z.shape
-    if B is None:
-        B = d
+    X = torch.nn.functional.normalize(Z, p=2, dim=1) if normalize_cosine else Z
 
-    radii, _, _ = _per_cluster_stats_diag(Z, labels, normalize_cosine=normalize_cosine)
+    # per-cluster diagonal Mahalanobis radii
+    radii = torch.zeros(X.size(0), dtype=torch.float32, device=device)
+    uniq = sorted(set(labels.tolist()) - {-1})
+    mu, var = {}, {}
+    for c in uniq:
+        idx = (lbl == c).nonzero(as_tuple=False).view(-1)
+        Xc = X.index_select(0, idx)
+        mc = Xc.mean(0)
+        vc = Xc.var(0, unbiased=False) + 1e-6
+        mu[c], var[c] = mc, vc
+        Rc = torch.sqrt(((Xc - mc) ** 2 / vc).sum(1))
+        radii[idx] = Rc
 
-    core_mask   = torch.zeros(N, dtype=torch.bool, device=device)
-    thr_per_node= torch.zeros(N, dtype=torch.float32, device=device)
+    core_mask   = torch.zeros_like(radii, dtype=torch.bool)
+    thr_per_node= torch.zeros_like(radii)
     dmin_hat    = {}
 
-    # iterate non-noise clusters
-    uniq = torch.unique(lbl)
-    uniq = uniq[uniq != -1]
-    for c in sorted(set(labels.tolist()) - {-1}):
+    for c in uniq:
         idx = (lbl == c).nonzero(as_tuple=False).view(-1)
-        if idx.numel() == 0:
-            continue
-        
-        k = max(1, int(torch.ceil(torch.tensor(alpha * idx.numel(), device=device)).item()))
+        k = max(1, int(math.ceil(alpha * idx.numel())))
         Rc = radii.index_select(0, idx)
-        
-        # >>> FIX: take k *smallest* radii (no negative trick)
-        sel = torch.topk(Rc, k=k, largest=False).indices
+        sel = torch.topk(Rc, k=k, largest=False).indices      # k *smallest* radii
         core_idx = idx.index_select(0, sel)
         core_mask[core_idx] = True
 
-        # d_hat^{min}_p inside the (alpha) core
         dmin = int(degrees_excl_self.index_select(0, core_idx).min().item()) if core_idx.numel() > 0 else 1
         dmin = max(1, dmin)
         dmin_hat[c] = dmin
-
-        # cluster-wide threshold
         thr = float(gamma * (B ** 0.5) / (dmin ** 0.5))
         thr_per_node[idx] = thr
-
-        # Optional tightening: ensure radius <= 0.5*thr (conservative diameter check)
-        Rc_core = radii.index_select(0, core_idx)
-        if Rc_core.numel() > 0 and Rc_core.max() > 0.5 * thr:
-            Rc_sorted, order = Rc.sort()
-            keep = int((Rc_sorted <= 0.5 * thr).sum().item())
-            if keep > 0:
-                new_core_idx = idx.index_select(0, order[:keep])
-                core_mask[idx] = False
-                core_mask[new_core_idx] = True
 
     return core_mask, thr_per_node, dmin_hat, radii
 
@@ -1181,30 +1165,137 @@ def build_alpha_gamma_allow_mask_gmm(
     """
     device = Z.device
     lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
-    N = Z.size(0)
-    if B is None:
-        B = Z.size(1)
+    if B is None: B = Z.size(1)
 
     core_mask, thr_per_node, _, radii = select_gmm_cores(
         Z, labels, degrees_excl_self, alpha=alpha, gamma=gamma, B=B
     )
 
-    eligible = torch.ones(N, dtype=torch.bool, device=device)
-    if within_threshold:
-        eligible &= (radii <= 0.5 * thr_per_node)   # <= half-threshold ensures sup d(i,j) <= thr
-    if require_core_endpoint:
-        eligible &= core_mask
-    if exclude_noise:
-        eligible &= (lbl != -1)
+    eligible = torch.ones(Z.size(0), dtype=torch.bool, device=device)
+    if within_threshold:       eligible &= (radii <= 0.5 * thr_per_node)
+    if require_core_endpoint:  eligible &= core_mask
+    if exclude_noise:          eligible &= (lbl != -1)
 
-    pair_elig = eligible[:, None] & eligible[None, :]
-    pair_elig.fill_diagonal_(False)
+    pair_ok = eligible[:, None] & eligible[None, :]
+    pair_ok.fill_diagonal_(False)
+    return pair_ok
 
-    kept = float(eligible.float().mean().item())
-    print(f"[RESTRICT] α={alpha:.2f} γ={gamma:.2f} | eligible_nodes={kept:.3f} | "
-          f"pair_mask_true={pair_elig.float().mean().item():.3f}")
-    return pair_elig
+@torch.no_grad()
+def c0p_prune_outliers(
+    Z: torch.Tensor,
+    adj_label: torch.Tensor,          # [N,N] 0/1 dense WITH self-loops
+    labels: np.ndarray,               # cluster labels; -1=noise
+    drop_frac: float = 0.10,          # 0 → disable
+    alpha: float = 0.8,               # same α as C_p^0
+    gamma: float = 1.0,               # same γ as thr_p
+    prefer_low_sim: bool = True,      # True: drop lowest-sim first
+    min_keep: int = 1,                # NEW: do not go below this
+    degree_floor: int = 0,            # NEW: align with your degree_threshold-1
+    metric: str = "cosine",           # "cosine" | "euclidean"
+) -> tuple[torch.Tensor, dict]:
+    """
+    Prune a fraction of INTRA-cluster edges for 'outlier' nodes (non-core AND radius>thr),
+    to compact C0p. Returns (new_adj WITH self-loops, stats).
+    """
+    if drop_frac <= 0:
+        return adj_label, {"dropped_edges": 0, "per_cluster": {}, "isolated": 0, "min_deg_after_excl_self": 0}
 
+    import math
+    device = adj_label.device
+
+    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
+    g = adj_label.clone().to(device)
+    N = g.size(0)
+
+    # degrees (excl self) for core selection
+    deg_now = (g.sum(1) - torch.diag(g)).to(torch.long)
+
+    # core mask + per-node threshold + radii (from your C0p definition)
+    core_mask, thr_per_node, _, radii = select_gmm_cores(
+        Z, labels, deg_now, alpha=alpha, gamma=gamma, B=Z.size(1)
+    )
+
+    # prep similarity / distance
+    if metric == "cosine":
+        X = torch.nn.functional.normalize(Z, p=2, dim=1)
+        # similarity matrix (dense but we only index rows we need)
+        S = X @ X.t()
+        def _rank_keys(i, neigh):
+            return S[i, neigh]  # higher is closer
+        low_is_worse = True
+    else:
+        # euclidean dist
+        def _rank_keys(i, neigh):
+            Zi = Z[i].unsqueeze(0)
+            return (Zi - Z[neigh]).pow(2).sum(1).sqrt()  # higher is farther
+        low_is_worse = False
+
+    # drop edges: remove diag temporarily
+    g.fill_diagonal_(0)
+    dropped_total, per_cluster = 0, {}
+
+    for c in sorted(set(labels.tolist()) - {-1}):
+        idx = torch.where(lbl == c)[0]
+        before = int(idx.numel())
+
+        # outliers = non-core & radius above thr
+        outlier = idx[(~core_mask[idx]) & (radii[idx] > thr_per_node[idx])]
+
+        for i in outlier.tolist():
+            neigh = torch.where((g[i] > 0) & (lbl == c))[0]
+            deg_intra = int(neigh.numel())
+            if deg_intra == 0:
+                continue
+
+            # never go below keep_min
+            keep_min = max(int(min_keep), int(degree_floor) + 1)
+            max_drop = max(0, deg_intra - keep_min)
+            drop_k = min(max_drop, int(math.ceil(drop_frac * deg_intra)))
+            if drop_k <= 0:
+                continue
+
+            keys = _rank_keys(i, neigh)
+            if prefer_low_sim:
+                # cosine: low sim is worse; euclidean: high dist is worse
+                if metric == "cosine":
+                    order = torch.argsort(keys, descending=False)  # lowest sim first
+                else:
+                    order = torch.argsort(keys, descending=True)   # largest dist first
+            else:
+                order = torch.randperm(deg_intra, device=g.device)
+
+            to_drop = neigh[order[:drop_k]]
+            g[i, to_drop] = 0
+            g[to_drop, i] = 0
+            dropped_total += int(to_drop.numel())
+
+        # cluster stats
+        after_intra = int((g[idx][:, idx].sum(dim=1) > 0).sum().item())
+        per_cluster[c] = {
+            "nodes": before,
+            "after_intra_deg>0": after_intra,
+            "outliers_touched": int(outlier.numel()),
+        }
+
+    # restore self-loops
+    g.fill_diagonal_(1)
+
+    deg_excl_self_after = (g.sum(1) - torch.diag(g))
+    min_deg_after = int(deg_excl_self_after.min().item())
+    isolated = int((deg_excl_self_after == 0).sum().item())
+
+    print(f"[C0P-PRUNE] drop_frac={drop_frac:.3f} | dropped_edges={dropped_total} "
+          f"| min_deg_after={min_deg_after} | isolated={isolated}")
+    for c, d in per_cluster.items():
+        print(f"[C0P-PRUNE] cluster={c} nodes={d['nodes']} "
+              f"after_intra_deg>0={d['after_intra_deg>0']} outliers_touched={d['outliers_touched']}")
+
+    return g, {
+        "dropped_edges": dropped_total,
+        "per_cluster": per_cluster,
+        "isolated": isolated,
+        "min_deg_after_excl_self": min_deg_after,
+    }
 
 ###############################################
 
@@ -1218,56 +1309,24 @@ def robust_score_quantile_from_scores(scores, base_block, q: float, max_elems: i
     - Computes the quantile safely on CPU to side–step CUDA `quantile()` size limits.
     - Falls back to NumPy if PyTorch quantile still throws.
     """
-    import math
-    import numpy as _np
-    import torch as _torch
-
-    # 1) Guard + clamp q
+    import numpy as _np, torch as _torch
     if scores is None:
         return None
-    q_t = float(q)
-    if not (0.0 <= q_t <= 1.0):
-        q_t = max(0.0, min(1.0, q_t))
-
-    # 2) Mask scores
-    #    We do **not** densify anything here; caller is expected to pass dense tensors already.
-    s = scores
-    s_valid = s.masked_fill(base_block, float("-inf"))
-    vals = s_valid[s_valid > float("-inf")]
-
-    # 3) Early out
+    q = float(max(0.0, min(1.0, q)))
+    s = scores.masked_fill(base_block, float("-inf"))
+    vals = s[s > float("-inf")]
     n = vals.numel()
-    if n == 0:
-        return None
-
-    # 4) Subsample uniformly if needed (on the source device for speed)
+    if n == 0: return None
     if n > max_elems:
-        # Note: randint upper bound is exclusive
         idx = _torch.randint(low=0, high=n, size=(max_elems,), device=vals.device)
         vals = vals.view(-1).index_select(0, idx)
-        n = vals.numel()
-
-    # 5) Move to CPU for stable quantile computation on large vectors
-    vals_cpu = vals.detach().to(dtype=_torch.float32, device='cpu').contiguous().view(-1)
-
-    # 6) Try PyTorch quantile on CPU; if it fails, use NumPy
+    vals_cpu = vals.detach().to(dtype=_torch.float32, device="cpu").contiguous().view(-1)
     try:
-        thr = _torch.quantile(vals_cpu, q_t).item()
-    except RuntimeError as e:
-        # Fallback – some PyTorch versions can error with "input tensor is too large"
-        thr = float(_np.quantile(vals_cpu.numpy(), q_t))
-
-    # Defensive NaN/Inf guard
-    if not (thr == thr) or thr in (float('inf'), float('-inf')):  # NaN check via x==x
-        # As a last resort, pick max/min consistent with q
-        if q_t >= 1.0:
-            thr = float(vals_cpu.max().item())
-        elif q_t <= 0.0:
-            thr = float(vals_cpu.min().item())
-        else:
-            # Median fallback
-            thr = float(_np.quantile(vals_cpu.numpy(), 0.5))
-
+        thr = _torch.quantile(vals_cpu, q).item()
+    except RuntimeError:
+        thr = float(_np.quantile(vals_cpu.numpy(), q))
+    if not (thr == thr) or thr in (float("inf"), float("-inf")):
+        thr = float(_np.quantile(vals_cpu.numpy(), 0.5))
     return float(thr)
 
 @torch.no_grad()

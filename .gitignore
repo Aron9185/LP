@@ -16,6 +16,7 @@ env/
 
 # logs & runs
 logs/
+log/
 runs/
 wandb/
 tensorboard/

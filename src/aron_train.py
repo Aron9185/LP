@@ -76,7 +76,8 @@ def train_encoder(
     restricted: bool = False,
     restrict_alpha: float = 0.8,
     restrict_gamma: float = 1.0,
-    restrict_inter: str = "off",        # "off" | "boundary" (todo)
+    # c0p pruning (removals that also consume the budget)
+    c0p_prune_frac: float = 0.0,
     **kwargs,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor]:
     """
@@ -332,6 +333,7 @@ def train_encoder(
 
     # cumulative trackers (reset for this dataset/run)
     global_used_adds = 0
+    global_used_removals = 0             # count removals across all epochs
     node_used_adds   = torch.zeros(N, dtype=torch.long, device=g0.device)
 
     # sanity checks (helpful when switching datasets)
@@ -477,24 +479,6 @@ def train_encoder(
                 Z_for_cluster = Z.detach()
                 base_mode = "intra" if ver == "aron_desc_intra" else "inter"
 
-                # ---- epoch-bounded quota (compute per-epoch target, then remaining) ----
-                def _epoch_target_frac(ep: int, T: int, mode: str = "linear") -> float:
-                    if mode == "cosine":
-                        import math
-                        return 0.5 * (1.0 - math.cos(math.pi * float(ep + 1) / max(1, T)))
-                    return float(ep + 1) / max(1, T)
-
-                if aug_ratio_epoch is None:
-                    target_cum_edges = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
-                    remaining_global = max(0, int(round(aug_ratio * E0)) - int(global_used_adds))
-                    epoch_quota_edges = min(max(0, target_cum_edges - int(global_used_adds)), remaining_global)
-                else:
-                    remaining_global = max(0, int(round(aug_ratio * E0)) - int(global_used_adds))
-                    epoch_quota_edges = min(int(round(aug_ratio_epoch * E0)), remaining_global)
-
-                print(f"[AUG-{base_mode}] epoch={epoch}/{num_epoch-1} | E0={E0} | global_cap={int(round(aug_ratio*E0))} "
-                    f"| global_used={global_used_adds} | epoch_quota_edges={epoch_quota_edges}")
-                
                 # ---- clustering (SELECT METHOD) ----
                 # (keeps per-epoch behavior; move this before the epoch loop if you want "compute once")
                 if cluster_method == "gmm":
@@ -507,8 +491,7 @@ def train_encoder(
                 elif cluster_method == "louvain":
                     A_np = (adj_label.to_dense() > 0).detach().cpu().numpy().astype(np.int8)
                     np.fill_diagonal(A_np, 0)     # Louvain doesn’t need self-loops
-                    # If your louvain_labels supports resolution, pass it here; otherwise ignore.
-                    labels_cluster = louvain_labels(A_np)  # or louvain_labels(A_np, resolution=louvain_resolution)
+                    labels_cluster = louvain_labels(A_np)
                 else:
                     # default: your current HDBSCAN path (unchanged)
                     labels_cluster = density_cluster_embeddings(
@@ -518,7 +501,7 @@ def train_encoder(
                         min_samples=dbscan_min_samples,
                         metric=dbscan_metric,
                     )
-                    
+
                 # ---- (α,γ, d̂) restriction: compute once for this epoch (no in-place shrinking) ----
                 allow_restricted = None
                 if restricted:
@@ -533,6 +516,65 @@ def train_encoder(
                         allow_restricted = None
 
                 print(f"[RESTRICT] active={allow_restricted is not None} (mode={base_mode})")
+
+                # ---- epoch-bounded quota (compute remaining from SHARED budget) ----
+                def _epoch_target_frac(ep: int, T: int, mode: str = "linear") -> float:
+                    if mode == "cosine":
+                        import math
+                        return 0.5 * (1.0 - math.cos(math.pi * float(ep + 1) / max(1, T)))
+                    return float(ep + 1) / max(1, T)
+
+                # Use shared pool = (adds + removes)
+                if aug_ratio_epoch is None:
+                    target_cum_mods = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
+                    used_mods_global = int(global_used_adds + global_used_removals)
+                    epoch_quota_edges = max(0, target_cum_mods - used_mods_global)
+                else:
+                    remaining_global = max(0, int(round(aug_ratio * E0)) - int(global_used_adds + global_used_removals))
+                    epoch_quota_edges = min(int(round(aug_ratio_epoch * E0)), remaining_global)
+
+                print(f"[AUG-{base_mode}] epoch={epoch}/{num_epoch-1} | E0={E0} | global_cap={int(round(aug_ratio*E0))} "
+                    f"| used={global_used_adds + global_used_removals} | epoch_quota_edges={epoch_quota_edges}")
+
+                # ---- EARLY C0p prune (optional): removals spend from the SAME budget ----
+                g_work = adj_label.to_dense()
+                added_this_epoch = 0
+                removed_this_epoch = 0
+
+                if (cluster_method == "gmm") and (c0p_prune_frac > 0.0) and epoch_quota_edges > 0:
+                    try:
+                        g_work.fill_diagonal_(1)  # pruning helper expects self-loops present
+                        g_work, cstats = c0p_prune_outliers(
+                            Z=Z_for_cluster,
+                            adj_label=g_work,
+                            labels=labels_cluster,
+                            drop_frac=c0p_prune_frac,
+                            alpha=restrict_alpha,
+                            gamma=restrict_gamma,
+                            prefer_low_sim=True,
+                            min_keep=1,
+                            degree_floor=degree_floor,
+                            metric="cosine",
+                        )
+                        dropped = int(cstats["dropped_edges"])
+                        if dropped > 0:
+                            removed_this_epoch += dropped
+                            global_used_removals += dropped
+                        print(f"[C0P-PRUNE] early prune: drop_frac={c0p_prune_frac:.3f} | dropped_edges={dropped} "
+                            f"| min_deg_after={cstats.get('min_deg_after_excl_self', -1)} "
+                            f"| isolated={cstats.get('isolated', -1)}")
+                    except Exception as e:
+                        print(f"[C0P-PRUNE] ERROR during early prune: {e}")
+
+                # ---- recompute remaining epoch quota after early prune (shared pool) ----
+                if aug_ratio_epoch is None:
+                    target_cum_mods = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
+                    used_mods_global = int(global_used_adds + global_used_removals)
+                    remaining_quota_edges = max(0, target_cum_mods - used_mods_global)
+                else:
+                    target_epoch_mods = int(round(aug_ratio_epoch * E0))
+                    used_mods_epoch = int(added_this_epoch + removed_this_epoch)
+                    remaining_quota_edges = max(0, target_epoch_mods - used_mods_epoch)
 
                 # ---- scores for ranking ----
                 scores_for_rank = frozen_scores if frozen_scores is not None else _scores_from_Z(Z_for_cluster).detach()
@@ -555,9 +597,9 @@ def train_encoder(
 
                 # ---- Tier D quality gate (score quantile) ----
                 late_score_q = 0.90
-                base_block = (forbid_mask | (adj_label.to_dense() > 0))
-                if allow_restricted is not None:             # now safe: it's defined above
-                    base_block = base_block | (~allow_restricted)  # restrict only in candidate/quantile phase
+                base_block = (forbid_mask | (g_work > 0))
+                if allow_restricted is not None:             # restrict only in candidate/quantile phase
+                    base_block = base_block | (~allow_restricted)
 
                 score_thr = robust_score_quantile_from_scores(
                     scores_for_rank, base_block, q=late_score_q, max_elems=2_000_000,
@@ -569,7 +611,6 @@ def train_encoder(
                 allow_C = build_cluster_allow_mask(labels_cluster, mode="inter",  exclude_noise=False, device=device) & nearby_mask
                 allow_D = torch.ones_like(allow_A, dtype=torch.bool, device=device); allow_D.fill_diagonal_(False)
 
-                
                 # IMPORTANT: do NOT intersect allow_A/B/C/D here.
                 # The restriction is applied only when merging the forbid mask in _run_tier.
 
@@ -634,7 +675,7 @@ def train_encoder(
                         # budgets
                         E0=E0,
                         aug_ratio=aug_ratio,
-                        global_used_adds=global_used_adds_in,
+                        global_used_adds=global_used_out if False else global_used_adds_in,  # keep original signature
                         deg0_excl_self=deg0_excl_self,
                         aug_bound=aug_bound,
                         node_used_adds=node_used_adds_in,
@@ -642,11 +683,8 @@ def train_encoder(
                     )
                     return g_out, added_out, global_used_out, node_used_out
 
-                # ---- iterate tiers with exact epoch quota accounting ----
-                g_work = adj_label.to_dense()
-                added_this_epoch = 0
-                remaining_quota_edges = int(epoch_quota_edges)
-
+                # ---- iterate tiers with exact epoch quota accounting (SHARED pool) ----
+                tier_loop_added = 0
                 for name, allow in tiers:
                     if remaining_quota_edges <= 0:
                         break
@@ -665,16 +703,21 @@ def train_encoder(
                         )
                         tier_added_total += added
                         added_this_epoch += added
+                        tier_loop_added  += added
 
-                        # recompute remaining quota
+                        # recompute remaining quota (adds + removals)
                         if aug_ratio_epoch is None:
-                            target_cum_edges = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
-                            remaining_quota_edges = max(0, target_cum_edges - int(global_used_adds))
+                            target_cum_mods = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch, mode="linear")))
+                            used_mods_global = int(global_used_adds + global_used_removals)
+                            remaining_quota_edges = max(0, target_cum_mods - used_mods_global)
                         else:
-                            remaining_quota_edges = max(0, int(round(aug_ratio_epoch * E0)) - added_this_epoch)
+                            target_epoch_mods = int(round(aug_ratio_epoch * E0))
+                            used_mods_epoch = int(added_this_epoch + removed_this_epoch)
+                            remaining_quota_edges = max(0, target_epoch_mods - used_mods_epoch)
 
                         print(f"[AUG-{base_mode}|Tier {name}] added={added} | tier_total={tier_added_total} "
-                            f"| epoch_quota_left={remaining_quota_edges} | global_used={global_used_adds}/{int(round(aug_ratio*E0))}")
+                            f"| epoch_quota_left={remaining_quota_edges} "
+                            f"| global_used={global_used_adds + global_used_removals}/{int(round(aug_ratio*E0))}")
 
                         if added == 0:
                             break  # this tier stalled; move to next tier
@@ -682,9 +725,15 @@ def train_encoder(
                 # ---- finalize epoch changes ----
                 adj_label = g_work
                 g = g_work
-                modification_ratio = added_this_epoch / float(E0)
-                print(f"[AUG-{base_mode}] this_epoch_add={added_this_epoch} | this_epoch_ratio={modification_ratio:.6f} "
-                    f"| global_used_adds={global_used_adds} ({global_used_adds/E0:.4f} of E0)")
+
+                used_mods_global = int(global_used_adds + global_used_removals)   # SHARED pool
+                modification_ratio = (added_this_epoch + removed_this_epoch) / float(E0)
+
+                print(f"[AUG-{base_mode}] this_epoch_add={added_this_epoch} "
+                    f"remove={removed_this_epoch} "
+                    f"| this_epoch_ratio={modification_ratio:.6f} "
+                    f"| global_used_mods={used_mods_global}/{int(round(aug_ratio*E0))} "
+                    f"(adds={global_used_adds}, removes={global_used_removals})")
 
                 aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features.to_dense(), feat_maske_ratio)
 

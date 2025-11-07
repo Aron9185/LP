@@ -1,408 +1,237 @@
 #!/usr/bin/env python3
-import argparse, csv, glob, re, statistics, sys
+# -*- coding: utf-8 -*-
+
+import argparse, sys, re, math
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
-from collections import defaultdict
+from typing import Dict, Any, List, Optional, Tuple
+import pandas as pd
 
-# ------------------------- helpers -------------------------
-FLOAT = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+META_START = re.compile(r"^=+ RUN META =+\s*$")
+META_END   = re.compile(r"^=+\s*$")
 
-# Prefer capturing the explicit "hit@K = <value>" that appears on the same
-# 'best ...' line (e.g., "best hit@3 epoch = 153, hit@3 = 0.6923, ...")
-def BEST_HIT_VALUE_RE(k: int):
-    return re.compile(
-        rf"best[^\n]*?\bhit\s*@\s*{k}\b[^\n]*?\bhit\s*@\s*{k}\b\s*=\s*({FLOAT})",
-        re.IGNORECASE,
-    )
+RE_FIELD = {
+    "dataset": re.compile(r"\bdataset\s*=\s*([A-Za-z0-9_.-]+)"),
+    "ver":     re.compile(r"\bver\s*=\s*([A-Za-z0-9_.-]+)"),
+    "mode":    re.compile(r"\bmode\s*=\s*([A-Za-z0-9_.-]+)"),
+    "seed":    re.compile(r"\bseed\s*=\s*([0-9]+)"),
+    "idx":     re.compile(r"\bidx\s*=\s*([0-9]+)"),
+    "alpha":   re.compile(r"\balpha\s*=\s*([0-9]*\.?[0-9]+)"),
+    "gamma":   re.compile(r"\bgamma\s*=\s*([0-9]*\.?[0-9]+)"),
+    "run_tag": re.compile(r"\brun_tag\s*=\s*([A-Za-z0-9_.-]+)"),
+}
 
-# Simple fallback where logs are "best hit@K = <value>"
-def BEST_HIT_SIMPLE_RE(k: int):
-    return re.compile(
-        rf"best\s*hit\s*@\s*{k}\b[^\n]*?=\s*({FLOAT})",
-        re.IGNORECASE,
-    )
+# --- helpers ---
 
-FINAL_ROCAP_LINE_RE = re.compile(
-    r"^\[FINAL\s*TEST\][^\n]*?test_roc\s*=\s*(" + FLOAT + r")\s*,\s*test_ap\s*=\s*(" + FLOAT + r")",
-    re.IGNORECASE | re.MULTILINE,
-)
-BEST_LINK_PRED_RE = re.compile(
-    r"best\s+link\s+prediction\s+epoch[^\n]*?test_roc\s*=\s*(" + FLOAT + r")[^\n]*?test_ap\s*=\s*(" + FLOAT + r")",
-    re.IGNORECASE,
-)
-
-# Final Hit@K line variants
-TEST_LINE_FINAL_RE = re.compile(r"^\[FINAL\s*TEST\][^\n]*Hit\s*@\s*K:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
-TEST_LINE_OLD_RE   = re.compile(r"Hit\s*@\s*K\s*(?:for\s+test)?\s*:\s*(.+)", re.IGNORECASE)
-
-# generic KV within Hit@K: "3=0.712, 5=..., 10=..."
-KV_PAIR_RE = re.compile(r"(\d+)\s*=\s*(" + FLOAT + r")")
-
-ALPHA_RE = re.compile(r"\balpha\s*=\s*(" + FLOAT + r")", re.IGNORECASE)
-GAMMA_RE = re.compile(r"\bgamma\s*=\s*(" + FLOAT + r")", re.IGNORECASE)
-
-# ------------------------- filename meta -------------------------
-def parse_meta_from_filename(name: str) -> Dict[str, Optional[str]]:
-    stem = name[:-4] if name.endswith(".log") else name
-    parts = stem.split("_")
-    meta = {
-        "dataset": None, "setting": None, "cluster": None,
-        "r": None, "fmr": None, "d": None, "seed": None, "idx": None,
-        "taga": None, "g": None, "ag_tag": None,
-    }
-    if not parts:
-        return meta
-
-    # dataset: first token (e.g., citeseer, cora)
-    meta["dataset"] = parts[0]
-
-    # simply look for "inter" / "intra" anywhere
-    for p in parts:
-        if p in ("inter", "intra"):
-            meta["setting"] = p
-            break
-
-    for p in parts:
-        if re.fullmatch(r"r[0-9.]+", p):
-            meta["r"] = p[1:]
-        elif p.startswith("fmr") and re.fullmatch(r"fmr[0-9.]+", p):
-            meta["fmr"] = p[3:]
-        # STRICT: only accept 'd' followed by numeric (avoid 'desc' -> 'esc')
-        elif re.fullmatch(r"d[0-9.]+", p):
-            meta["d"] = p[1:]
-        elif p in ("gmm", "louvain"):
-            meta["cluster"] = p
-        elif p.startswith("seed") and p[4:].isdigit():
-            meta["seed"] = p[4:]
-        elif p.startswith("idx") and p[3:].isdigit():
-            meta["idx"] = p[3:]
-        elif p.startswith("taga") and p[4:]:
-            meta["taga"] = p[4:]   # alpha (string)
-        elif p.startswith("g") and len(p) > 1 and re.fullmatch(r"[0-9.]+", p[1:]):
-            meta["g"] = p[1:]     # gamma (string)
-        elif p.startswith("a") and len(p) > 1 and re.fullmatch(r"[0-9.]+", p[1:]) and meta["taga"] is None:
-            meta["taga"] = p[1:]  # accept a0.80
-
-    return meta
-
-def _parse_alpha_gamma_from_name(stem: str):
-    a = g = None
-    for p in stem.split("_"):
-        if p.startswith("taga") and p[4:] and re.fullmatch(r"[0-9.]+", p[4:]):
-            try: a = float(p[4:])
-            except: pass
-        elif p.startswith("a") and p[1:] and re.fullmatch(r"[0-9.]+", p[1:]):
-            try: a = float(p[1:])
-            except: pass
-        elif p.startswith("gamma") and p[5:] and re.fullmatch(r"[0-9.]+", p[5:]):
-            try: g = float(p[5:])
-            except: pass
-        elif p.startswith("g") and p[1:] and re.fullmatch(r"[0-9.]+", p[1:]):
-            try: g = float(p[1:])
-            except: pass
-    return a, g
-
-def _parse_alpha_gamma_from_text(text: str):
-    a = g = None
-    ma = ALPHA_RE.search(text)
-    mg = GAMMA_RE.search(text)
-    if ma:
-        try: a = float(ma.group(1))
-        except: pass
-    if mg:
-        try: g = float(mg.group(1))
-        except: pass
-    return a, g
-
-# ------------------------- log parsing -------------------------
-def parse_log(path: Path, debug: bool=False) -> Dict[str, Optional[float]]:
+def _read_text(path: Path) -> Optional[str]:
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        return path.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
-        print(f"[WARN] Failed to read {path}: {e}")
-        return {k: None for k in ("best_hit3","best_hit10","test_hit3","test_hit10","test_roc","test_ap")}
-
-    best_hit3 = best_hit10 = test_hit3 = test_hit10 = test_roc = test_ap = None
-
-    # --- best@3 / best@10 (robust) ---
-    def _best_hit(txt: str, k: int) -> Optional[float]:
-        m = list(BEST_HIT_VALUE_RE(k).finditer(txt))
-        if m:
-            try: return float(m[-1].group(1))
-            except: pass
-        m = list(BEST_HIT_SIMPLE_RE(k).finditer(txt))
-        if m:
-            try: return float(m[-1].group(1))
-            except: pass
-        # Ultra-fallback: scan lines containing "best" and "@K" and pull the hit@K value on that line
-        for line in reversed(txt.splitlines()):
-            low = line.lower()
-            if "best" in low and f"@{k}" in low:
-                mm = re.search(rf"hit\s*@\s*{k}\s*=\s*({FLOAT})", line, re.IGNORECASE)
-                if mm:
-                    try: return float(mm.group(1))
-                    except: pass
+        print(f"[READ-ERR] {path}: {e}", file=sys.stderr)
         return None
 
-    best_hit3  = _best_hit(text, 3)
-    best_hit10 = _best_hit(text, 10)
+def _to_fraction(val_str: str) -> Optional[float]:
+    try:
+        v = float(val_str)
+    except:
+        return None
+    # Treat 0-1 as-is; 1-100 as percent
+    if 1.0 < v <= 100.0:
+        v = v / 100.0
+    return v
 
-    # --- ROC/AP ---
-    rocap = FINAL_ROCAP_LINE_RE.findall(text)
-    if rocap:
-        try:
-            test_roc = float(rocap[-1][0]); test_ap = float(rocap[-1][1])
-        except: pass
-    else:
-        lp = BEST_LINK_PRED_RE.findall(text)
-        if lp:
-            try:
-                test_roc = float(lp[-1][0]); test_ap = float(lp[-1][1])
+def _extract_meta(text: str) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    lines = text.splitlines()
+    in_block, buf = False, []
+    for ln in lines:
+        if META_START.search(ln):
+            in_block, buf = True, []
+            continue
+        if in_block and META_END.search(ln):
+            joined = "\n".join(buf)
+            for k, pat in RE_FIELD.items():
+                m = pat.search(joined)
+                if m:
+                    meta[k] = m.group(1)
+            break
+        if in_block:
+            buf.append(ln)
+
+    if "mode" not in meta and "ver" in meta:
+        if "inter" in meta["ver"]:
+            meta["mode"] = "inter"
+        elif "intra" in meta["ver"]:
+            meta["mode"] = "intra"
+
+    for k in ("seed", "idx"):
+        if k in meta:
+            try: meta[k] = int(meta[k])
             except: pass
+    for k in ("alpha", "gamma"):
+        if k in meta:
+            try: meta[k] = float(meta[k])
+            except: pass
+    return meta
 
-    # --- test Hit@K payload (numerous variants) ---
-    payload = None
-    finals = TEST_LINE_FINAL_RE.findall(text)
-    olds   = TEST_LINE_OLD_RE.findall(text)
-    if finals:
-        payload = finals[-1]
-    elif olds:
-        payload = olds[-1]
-    else:
-        # last line containing "Hit@K" anywhere
-        lines = [ln for ln in text.splitlines() if "hit@k" in ln.lower()]
-        if lines:
-            payload = lines[-1]
+# --- robust metric parsing focused on your exact formats ---
 
-    if payload:
-        last_map: Dict[int, float] = {}
-        for k, v in KV_PAIR_RE.findall(payload):
-            try: last_map[int(k)] = float(v)
-            except: continue
-        test_hit3  = last_map.get(3, test_hit3)
-        test_hit10 = last_map.get(10, test_hit10)
+RE_FINAL_HITK_LINE = re.compile(r"\[FINAL TEST\][^\n]*Hit@K\s*:\s*(.+)", re.I)
+RE_PAIR = re.compile(r"(\d+)\s*=\s*([0-9]*\.?[0-9]+)")
 
-    if debug:
-        print(f"[DEBUG] {path.name}: best@3={best_hit3}, best@10={best_hit10}, test@3={test_hit3}, test@10={test_hit10}, roc={test_roc}, ap={test_ap}")
+RE_BEST_HIT3 = re.compile(r"best\s+hit@?3\s+epoch\s*=\s*\d+\s*,\s*hit@?3\s*=\s*([0-9]*\.?[0-9]+)", re.I)
+RE_BEST_HIT10 = re.compile(r"best\s+hit@?10\s+epoch\s*=\s*\d+\s*,\s*hit@?10\s*=\s*([0-9]*\.?[0-9]+)", re.I)
+
+def _parse_final_hitk(text: str) -> Tuple[Optional[float], Optional[float]]:
+    """Prefer the last '[FINAL TEST] Hit@K: 1=..., 3=..., 10=...' line."""
+    lines = RE_FINAL_HITK_LINE.findall(text)
+    if not lines:
+        return None, None
+    payload = lines[-1]  # last occurrence
+    pairs = dict((k, _to_fraction(v)) for k, v in RE_PAIR.findall(payload))
+    h3 = pairs.get("3")
+    h10 = pairs.get("10")
+    return h3, h10
+
+def _parse_best_hitk(text: str) -> Tuple[Optional[float], Optional[float]]:
+    m3 = RE_BEST_HIT3.findall(text)
+    m10 = RE_BEST_HIT10.findall(text)
+    h3 = _to_fraction(m3[-1]) if m3 else None
+    h10 = _to_fraction(m10[-1]) if m10 else None
+    return h3, h10
+
+def _parse_test_hits_from_text(text: str, verbose: bool=False) -> Tuple[Optional[float], Optional[float]]:
+    # 1) Strictly prefer [FINAL TEST] Hit@K: ... (most unambiguous)
+    h3, h10 = _parse_final_hitk(text)
+
+    # 2) Fall back to 'best hit@k epoch = ..., hit@k = ...'
+    if h3 is None or h10 is None:
+        b3, b10 = _parse_best_hitk(text)
+        if h3 is None: h3 = b3
+        if h10 is None: h10 = b10
+
+    if verbose:
+        print(f"[DEBUG][PREFER_FINAL] final: h3={h3} h10={h10}")
+    return h3, h10
+
+# --- scanning & aggregation ---
+
+def scan_one_log(path: Path, verbose=False) -> Optional[Dict[str, Any]]:
+    txt = _read_text(path)
+    if txt is None:
+        return None
+
+    meta = _extract_meta(txt)
+    if not meta.get("dataset") or not meta.get("mode"):
+        if verbose:
+            print(f"[SKIP] {path.name}: missing dataset/mode in header")
+        return None
+
+    hit3, hit10 = _parse_test_hits_from_text(txt, verbose=verbose)
+
+    if verbose:
+        print(f"[PARSE] {path.name}: ds={meta.get('dataset')} "
+              f"mode={meta.get('mode')} alpha={meta.get('alpha')} "
+              f"seed={meta.get('seed')} idx={meta.get('idx')} "
+              f"Hit@3={hit3} Hit@10={hit10}")
 
     return {
-        "best_hit3": best_hit3,
-        "best_hit10": best_hit10,
-        "test_hit3": test_hit3,
-        "test_hit10": test_hit10,
-        "test_roc": test_roc,
-        "test_ap": test_ap,
+        "dataset": meta.get("dataset"),
+        "mode": meta.get("mode"),
+        "alpha": meta.get("alpha"),
+        "gamma": meta.get("gamma"),
+        "seed": meta.get("seed"),
+        "idx": meta.get("idx"),
+        "run_tag": meta.get("run_tag"),
+        "log_file": str(path),
+        "test_hit3": hit3,
+        "test_hit10": hit10,
     }
 
-def mean_and_var(values: List[Optional[float]], ddof: int) -> Tuple[Optional[float], Optional[float]]:
-    vals = [v for v in values if v is not None]
-    if not vals: return None, None
-    if len(vals) == 1: return float(vals[0]), 0.0
-    mu = statistics.fmean(vals)
-    var = statistics.variance(vals) if ddof == 1 else statistics.pvariance(vals)
-    return mu, var
-
-def _fmt_cell(x):
-    if x is None: return ""
-    return f"{x:.6f}" if isinstance(x, float) else str(x)
-
-def _expand_globs(paths):
-    out = []
-    for patt in paths:
-        hits = glob.glob(patt)
-        if not hits:
-            print(f"[WARN] No files match: {patt}")
-        out.extend(sorted(hits))
-    return out
-
-# ------------------------- seed merge -------------------------
-def _seed_merge(rows, ddof=1, debug=False):
-    """
-    Group by (dataset, setting, alpha, gamma) and compute mean/var/std per metric.
-    Also report which files contributed no metrics to help debugging.
-    """
-    key_fields = ["dataset", "setting", "alpha", "gamma"]
-    groups = defaultdict(list)
-    for r in rows:
-        key = tuple(r.get(k) for k in key_fields)
-        groups[key].append(r)
-
-    merged_rows = []
-    for key, items in groups.items():
-        def vals(col):
-            return [x.get(col) for x in items if x.get(col) is not None]
-        def agg(col):
-            m, v = mean_and_var(vals(col), ddof)
-            return m, v, (v ** 0.5) if v is not None else None
-
-        # Check empties for this group (for user debug)
-        empty_files = []
-        for it in items:
-            if all(it.get(c) is None for c in ("best_hit3","best_hit10","test_hit3","test_hit10","test_roc","test_ap")):
-                empty_files.append(it.get("file"))
-        if empty_files and debug:
-            print(f"[DEBUG] Empty metrics for key={key}; files with missing metrics: {empty_files}")
-
-        rec = {k: v for k, v in zip(key_fields, key)}
-        rec["n_runs"] = len(items)
-
-        for col, out_prefix in [
-            ("best_hit3", "best@3"),
-            ("best_hit10", "best@10"),
-            ("test_hit3", "test@3"),
-            ("test_hit10", "test@10"),
-            ("test_roc", "test_roc"),
-            ("test_ap",  "test_ap"),
-        ]:
-            m, v, s = agg(col)
-            rec[f"{out_prefix}_mean"] = m
-            rec[f"{out_prefix}_var"]  = v
-            rec[f"{out_prefix}_std"]  = s
-
-        merged_rows.append(rec)
-
-    merged_rows.sort(key=lambda r: (
-        str(r.get("dataset") or ""),
-        str(r.get("setting") or ""),
-        -(r.get("alpha") if isinstance(r.get("alpha"), (int,float)) else -1e9),
-        -(r.get("gamma") if isinstance(r.get("gamma"), (int,float)) else -1e9),
-    ))
-    return merged_rows
-
-# ------------------------- main -------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("logs", nargs="+", help="Paths or globs to log files (e.g., logs/1030/*.log)")
-    ap.add_argument("--csv", type=str, default="", help="Write per-file metrics + metadata CSV.")
-    ap.add_argument("--ddof", type=int, default=1, choices=[0,1], help="0=population variance, 1=sample variance (default).")
-    ap.add_argument("--debug", action="store_true", help="Verbose parse debugging and list empty-metric files per group.")
-    ap.add_argument("--seed-merge", action="store_true", help="Show seed-merged table grouped by dataset × setting × alpha × gamma.")
-    ap.add_argument("--seed-merge-csv", type=str, default="", help="CSV path for the seed-merged table.")
-    ap.add_argument("--overall", action="store_true", help="Also print overall aggregates across all logs.")
-    args = ap.parse_args()
-
-    files = _expand_globs(args.logs)
-    if not files:
-        print("[ERR] No files to parse after glob expansion.")
-        sys.exit(2)
+def aggregate(df: pd.DataFrame, by_cols: List[str]) -> pd.DataFrame:
+    def _agg(sub: pd.DataFrame, col: str) -> pd.Series:
+        s = sub[col]
+        n = int(s.notna().sum())
+        return pd.Series({
+            f"{col}_mean": s.mean(skipna=True),
+            f"{col}_var":  s.var(skipna=True, ddof=1) if n > 1 else math.nan,
+            f"{col}_std":  s.std(skipna=True, ddof=1) if n > 1 else math.nan,
+            f"{col}_n_eff": float(n),
+        })
 
     rows = []
-    for fp in files:
-        path = Path(fp)
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception as e:
-            print(f"[WARN] Failed to read {fp}: {e}")
-            continue
+    for key, sub in df.groupby(by_cols, dropna=False):
+        rec = dict(zip(by_cols, key if isinstance(key, tuple) else (key,)))
+        rec.update(_agg(sub, "test_hit3").to_dict())
+        rec.update(_agg(sub, "test_hit10").to_dict())
+        rec["n_runs"] = float(len(sub))
+        rows.append(rec)
 
-        meta = parse_meta_from_filename(path.name)
-        stem = path.name[:-4] if path.name.endswith(".log") else path.name
+    out = pd.DataFrame(rows)
+    cols = by_cols + [
+        "n_runs",
+        "test_hit3_mean","test_hit3_var","test_hit3_std","test_hit3_n_eff",
+        "test_hit10_mean","test_hit10_var","test_hit10_std","test_hit10_n_eff",
+    ]
+    cols = [c for c in cols if c in out.columns]
+    return out.sort_values(by=by_cols).reset_index(drop=True)
 
-        a_name, g_name = _parse_alpha_gamma_from_name(stem)
-        a_txt,  g_txt  = _parse_alpha_gamma_from_text(text)
-        alpha = a_txt if a_txt is not None else a_name
-        gamma = g_txt if g_txt is not None else g_name
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--summary", type=str, default=None)
+    ap.add_argument("--log-dirs", nargs="+", default=None)
+    ap.add_argument("--glob", type=str, default="*.log")
+    ap.add_argument("--dump-parsed", type=str, default="c0p_parsed.csv")
+    ap.add_argument("--out", type=str, default="c0p_agg_by_dataset_mode.csv")
+    ap.add_argument("--out-by-alpha", type=str, default="c0p_agg_by_dataset_mode_alpha.csv")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
 
-        metrics = parse_log(path, debug=args.debug)
+    parsed_rows: List[Dict[str, Any]] = []
 
-        row = {
-            "file": path.name,
-            "dataset": meta.get("dataset"),
-            "setting": meta.get("setting"),
-            "cluster": meta.get("cluster"),
-            "r": meta.get("r"),
-            "fmr": meta.get("fmr"),
-            "d": meta.get("d"),
-            "seed": meta.get("seed"),
-            "idx": meta.get("idx"),
-            "taga": meta.get("taga"),
-            "g": meta.get("g"),
-            "alpha": alpha,
-            "gamma": gamma,
-            "ag_tag": meta.get("ag_tag") or (f"a{alpha}_g{gamma}" if alpha is not None and gamma is not None else None),
-            **metrics,
-        }
-        rows.append(row)
+    total_files = 0
+    if args.log_dirs:
+        for d in args.log_dirs:
+            base = Path(d)
+            if not base.exists():
+                print(f"[WARN] log dir not found: {d}")
+                continue
+            hits = list(base.rglob(args.glob))
+            total_files += len(hits)
+            if args.verbose:
+                print(f"[SCAN] {d}: {len(hits)} files matching {args.glob}")
+            for p in sorted(hits):
+                row = scan_one_log(p, verbose=args.verbose)
+                if row is not None:
+                    parsed_rows.append(row)
+    else:
+        print("[WARN] No --log-dirs provided; nothing to parse.")
 
-    if not rows:
-        print("[ERR] No rows parsed (all files failed to read?).")
-        sys.exit(2)
+    if len(parsed_rows) == 0:
+        print("[FATAL] No parsed rows from logs. Check --log-dirs / --glob.", file=sys.stderr)
+        sys.exit(1)
 
-    header_cols = ["file","dataset","setting","cluster","r","fmr","d","seed","idx","taga","g",
-                   "alpha","gamma","ag_tag","best_hit3","best_hit10","test_hit3","test_hit10","test_roc","test_ap"]
+    parsed = pd.DataFrame(parsed_rows)
+    parsed.to_csv(args.dump_parsed, index=False)
+    print(f"[WRITE] {args.dump_parsed} ({len(parsed)} rows)")
+    n3 = parsed["test_hit3"].notna().sum()
+    n10 = parsed["test_hit10"].notna().sum()
+    print(f"[STATS] files scanned={total_files} | parsed rows={len(parsed)} | with Hit@3={n3} | with Hit@10={n10}")
 
-    print("\nPer-file metrics:")
-    print("  ".join(f"{c:>12}" if c != "file" else f"{c:<55}" for c in header_cols))
-    for r in rows:
-        print("  ".join([
-            f"{_fmt_cell(r.get('file')):<55}",
-            f"{_fmt_cell(r.get('dataset')):>12}",
-            f"{_fmt_cell(r.get('setting')):>12}",
-            f"{_fmt_cell(r.get('cluster')):>12}",
-            f"{_fmt_cell(r.get('r')):>12}",
-            f"{_fmt_cell(r.get('fmr')):>12}",
-            f"{_fmt_cell(r.get('d')):>12}",
-            f"{_fmt_cell(r.get('seed')):>12}",
-            f"{_fmt_cell(r.get('idx')):>12}",
-            f"{_fmt_cell(r.get('taga')):>12}",
-            f"{_fmt_cell(r.get('g')):>12}",
-            f"{_fmt_cell(r.get('alpha')):>12}",
-            f"{_fmt_cell(r.get('gamma')):>12}",
-            f"{_fmt_cell(r.get('ag_tag')):>12}",
-            f"{_fmt_cell(r.get('best_hit3')):>12}",
-            f"{_fmt_cell(r.get('best_hit10')):>12}",
-            f"{_fmt_cell(r.get('test_hit3')):>12}",
-            f"{_fmt_cell(r.get('test_hit10')):>12}",
-            f"{_fmt_cell(r.get('test_roc')):>12}",
-            f"{_fmt_cell(r.get('test_ap')):>12}",
-        ]))
+    by_ds_mode = aggregate(parsed, ["dataset","mode"])
+    by_ds_mode.to_csv(args.out, index=False)
+    print(f"[WRITE] {args.out} ({len(by_ds_mode)} rows)")
 
-    if args.seed_merge:
-        merged = _seed_merge(rows, ddof=args.ddof, debug=args.debug)
-        mcols = [
-            "dataset","setting","alpha","gamma","n_runs",
-            "best@3_mean","best@3_var","best@3_std",
-            "best@10_mean","best@10_var","best@10_std",
-            "test@3_mean","test@3_var","test@3_std",
-            "test@10_mean","test@10_var","test@10_std",
-            "test_roc_mean","test_roc_var","test_roc_std",
-            "test_ap_mean","test_ap_var","test_ap_std",
-        ]
-        print("\nSeed-merged by dataset × setting × alpha × gamma:")
-        print("  ".join(f"{c:>14}" for c in mcols))
-        for rec in merged:
-            print("  ".join(f"{_fmt_cell(rec.get(c)):>14}" for c in mcols))
+    by_ds_mode_alpha = aggregate(parsed, ["dataset","mode","alpha"])
+    by_ds_mode_alpha.to_csv(args.out_by_alpha, index=False)
+    print(f"[WRITE] {args.out_by_alpha} ({len(by_ds_mode_alpha)} rows)")
 
-        if args.seed_merge_csv:
-            with open(args.seed_merge_csv, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(mcols)
-                for rec in merged:
-                    w.writerow([rec.get(c, "") for c in mcols])
-            print(f"\nWrote seed-merged CSV -> {args.seed_merge_csv}")
-
-    if args.overall:
-        def _vals(col): return [x.get(col) for x in rows]
-        def _show(label, vals):
-            mu, var = mean_and_var(vals, args.ddof)
-            n = len([v for v in vals if v is not None])
-            print(f"{label:<10}  count={n:<3}  mean={mu if mu is not None else 'NA'}  var={var if var is not None else 'NA'}")
-
-        print("\n[Overall aggregates across all logs] (ddof={}):".format(args.ddof))
-        _show("best@3",  _vals("best_hit3"))
-        _show("best@10", _vals("best_hit10"))
-        _show("test@3",  _vals("test_hit3"))
-        _show("test@10", _vals("test_hit10"))
-        _show("test_roc",_vals("test_roc"))
-        _show("test_ap", _vals("test_ap"))
-
-    if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(header_cols)
-            for r in rows:
-                w.writerow([r.get(c, "") for c in header_cols])
-        print(f"\nWrote CSV -> {args.csv}")
+    if args.verbose:
+        print("\n[PREVIEW] agg by dataset+mode:")
+        print(by_ds_mode.to_string(index=False))
+        print("\n[PREVIEW] agg by dataset+mode+alpha:")
+        print(by_ds_mode_alpha.to_string(index=False))
 
 if __name__ == "__main__":
+    pd.set_option("display.width", 160)
+    pd.set_option("display.max_columns", 40)
     main()

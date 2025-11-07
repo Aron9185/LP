@@ -13,6 +13,7 @@ from aron_train import logist_regressor_classification, train_classifier, train_
 from input_data import load_data
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 from utils import Plot, Visualize, Visualize_with_edge, gaussion_KDE, vMF_KDE
+import os
 
 parser = argparse.ArgumentParser()
 # parser.add_argument('--model', type=str, default='gcn_vae', help="models used")
@@ -109,13 +110,20 @@ parser.add_argument("--cluster_method", choices=["none", "gmm", "louvain"], defa
 parser.add_argument("--cluster_mode",   choices=["any", "intra", "inter"], default="any")
 parser.add_argument("--gmm_k", type=int, default=16)        # pick your K
 parser.add_argument("--gmm_tau", type=float, default=0.55)  # confidence→noise
+parser.add_argument(
+    "--c0p_prune_frac",
+    type=float,
+    default=0.10,   # 0.10 = 移除 outlier 的同群內邊 10%；設 0 可關閉
+    help="For outlier nodes (non-core with radius > thr), drop this fraction of INTRA-cluster edges to compact C0p (0 disables)."
+)
 
 parser.add_argument("--restricted", action="store_true")
 parser.add_argument("--restrict_alpha", type=float, default=0.8)
 parser.add_argument("--restrict_gamma", type=float, default=1.0)
-parser.add_argument("--restrict_inter", type=str, default="off", choices=["off","boundary"])
 
 parser.add_argument("--run_tag", type=str, default="", help="Optional run identifier tag (used for log naming)")
+parser.add_argument("--sweep_mode", action="store_true",
+    help="Do NOT hijack stdout/stderr; print metrics to stdout so external runners can capture. Also disables tqdm.")
 
 # also use: --ver aron_desc or --ver aron_asc
 
@@ -202,7 +210,7 @@ def main():
         restricted=args.restricted,
         restrict_alpha=args.restrict_alpha,
         restrict_gamma=args.restrict_gamma,
-        restrict_inter=args.restrict_inter,
+        c0p_prune_frac=args.c0p_prune_frac,
         seed=args.seed,
     )
 
@@ -252,50 +260,57 @@ class TqdmOnlyStderr(io.TextIOBase):
         return True
 
 
-# --- inside your main guard ---
 if __name__ == "__main__":
-    if args.logging:
+    # optional: align folder name with runner
+    LOG_ROOT = "log"
+
+    if args.sweep_mode:
+        # Disable tqdm noise when sweeping
+        os.environ["TQDM_DISABLE"] = "1"
+
+        # IMPORTANT: do NOT redirect stdout/stderr here.
+        # Let the external sweep script capture everything into its own log file.
+        set_random_seed(args.seed)
+        main()
+
+    elif args.logging:
         # mirror script: logs/<DATESTR>/...
-        log_dir = Path("log") / str(args.date)
+        log_dir = Path(LOG_ROOT) / str(args.date)
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        # pretty float stamps
-        r_str = f"{float(args.aug_ratio):.1f}"
-        fmr_str = f"{float(args.aug_bound):.1f}"
-        d_str = f"{float(args.degree_threshold):.1f}"
+        a_str   = f"{float(args.restrict_alpha):.2f}"
+        g_str   = f"{float(args.restrict_gamma):.2f}"
+        c0p_str = f"{float(args.c0p_prune_frac):.2f}"
 
-        # optional cluster method / loss tag
+        # keep your existing r/fmr/d and suffix tags
+        r_str   = f"{float(args.aug_ratio):.1f}"
+        fmr_str = f"{float(args.aug_bound):.1f}"
+        d_str   = f"{float(args.degree_threshold):.1f}"
+
         cm = getattr(args, "cluster_method", "none")
         cm_suffix = f"_{cm}" if cm and cm != "none" else ""
-        loss_tag = f"_loss_{args.loss_ver}" if getattr(args, "loss_ver", "") else ""
-
-        # 🔹 NEW: run_tag goes into filename (sanitized lightly)
+        loss_tag  = f"_loss_{args.loss_ver}" if getattr(args, "loss_ver", "") else ""
         tag_suffix = f"_tag{args.run_tag}" if args.run_tag else ""
 
+        # NEW filename (core pattern first, extras after)
         fname = (
-            f"{args.dataset}_{args.ver}_r{r_str}_fmr{fmr_str}_d{d_str}"
-            f"{cm_suffix}_seed{args.seed}_idx{args.idx}{tag_suffix}{loss_tag}.log"
+            f"{args.dataset}_{args.ver}"
+            f"_a{a_str}_g{g_str}_c0p{c0p_str}_seed{args.seed}"            # <-- collector-critical part
+            f"_r{r_str}_fmr{fmr_str}_d{d_str}"                            # your original fields
+            f"{cm_suffix}_idx{args.idx}{tag_suffix}{loss_tag}.log"
         )
         log_path = log_dir / fname
 
-        # line-buffered append
         log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
 
-        # Keep terminal streams
         term_out, term_err = sys.stdout, sys.stderr
-
-        # Route all prints to the log only
         sys.stdout = log_file
-
-        # Route stderr to (log + terminal only for tqdm)
         sys.stderr = TqdmOnlyStderr(term_err, log_file, show_tracebacks_on_terminal=True)
 
-        # Ensure Python logging goes to file (stdout redirected)
         for h in logging.root.handlers[:]:
             logging.root.removeHandler(h)
         logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 
-        # 🔹 Optional META header at top of each run
         print("===== RUN META =====")
         print(f"date={args.date} time={time.strftime('%F %T')}")
         print(f"dataset={args.dataset} ver={args.ver} mode={args.cluster_mode} method={args.cluster_method}")
@@ -312,10 +327,10 @@ if __name__ == "__main__":
             set_random_seed(args.seed)
             main()
         finally:
-            # Restore streams
             sys.stdout = term_out
             sys.stderr = term_err
             log_file.close()
+
     else:
         set_random_seed(args.seed)
         main()

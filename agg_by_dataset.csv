@@ -1,0 +1,5 @@
+dataset,n_runs,test3_mean,test3_var,test3_std,test10_mean,test10_var,test10_std,test@3 (mean±var),test@10 (mean±var)
+Cora_ML,20,,,,,,,,
+LastFMAsia,20,,,,,,,,
+citeseer,20,,,,,,,,
+cora,20,,,,,,,,
