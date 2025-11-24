@@ -1057,36 +1057,6 @@ def louvain_labels(adj_dense_or_sparse):
 
 # ========================================================================
 
-def _per_cluster_stats_diag(
-    Z: torch.Tensor, labels: np.ndarray, eps: float = 1e-6, normalize_cosine: bool = True
-):
-    """
-    Compute per-cluster mean/var (diag) and each node's cluster Mahalanobis radius.
-    Returns:
-      radii: [N] Mahalanobis radius
-      mu: dict[c] -> [d] mean
-      var: dict[c] -> [d] variance (diag)
-    """
-    lbl = torch.from_numpy(labels.astype(np.int64)).to(Z.device)
-    X = torch.nn.functional.normalize(Z, p=2, dim=1) if normalize_cosine else Z
-    N, d = X.shape
-    radii = torch.zeros(N, dtype=torch.float32, device=Z.device)
-
-    mu, var = {}, {}
-    uniq = torch.unique(lbl[lbl >= 0]).tolist()
-    for c in uniq:
-        idx = (lbl == c).nonzero(as_tuple=False).view(-1)
-        if idx.numel() == 0:
-            continue
-        Xc = X.index_select(0, idx)
-        mc = Xc.mean(dim=0)
-        vc = Xc.var(dim=0, unbiased=False) + eps
-        mu[c], var[c] = mc, vc
-        Rc = torch.sqrt(((Xc - mc) ** 2 / vc).sum(dim=1))  # diag-cov Mahalanobis
-        radii[idx] = Rc
-    return radii, mu, var
-
-
 @torch.no_grad()
 def select_gmm_cores(
     Z: torch.Tensor,
@@ -1297,6 +1267,201 @@ def c0p_prune_outliers(
         "min_deg_after_excl_self": min_deg_after,
     }
 
+# --- compactness helper used by remove_only_* (cosine radius per node)
+def per_cluster_stats_diag(Z: torch.Tensor, labels: np.ndarray, normalize_cosine: bool = True):
+    """
+    Returns:
+      radii: [N] per-node distance to its cluster centroid
+      centroids: {cluster_id: tensor[d]}
+      counts: {cluster_id: int}
+    Noise (-1) gets radius 0 and is ignored in aggregate stats upstream.
+    """
+    device = Z.device
+    N = Z.size(0)
+    radii = torch.zeros(N, device=device)
+    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
+
+    X = torch.nn.functional.normalize(Z, p=2, dim=1) if normalize_cosine else Z
+    centroids, counts = {}, {}
+
+    uniq = torch.unique(lbl)
+    for c in uniq.tolist():
+        if c == -1:  # skip noise
+            continue
+        idx = torch.where(lbl == c)[0]
+        if idx.numel() == 0:
+            continue
+        mu = X[idx].mean(dim=0)
+        if normalize_cosine:
+            mu = torch.nn.functional.normalize(mu.unsqueeze(0), p=2, dim=1).squeeze(0)
+            d = 1.0 - (X[idx] @ mu)               # cosine distance to centroid
+        else:
+            d = torch.norm(X[idx] - mu, dim=1)    # euclidean radius
+        radii[idx] = d
+        centroids[c] = mu
+        counts[c] = int(idx.numel())
+    return radii, centroids, counts
+
+
+@torch.no_grad()
+def cp_prune_intra(
+    Z: torch.Tensor,
+    adj_label: torch.Tensor,          # [N,N] dense 0/1 WITH self-loops
+    labels: np.ndarray,               # -1 = noise
+    *,
+    scope: str = "c0p",               # "c0p" | "noncore" | "cp"
+    drop_frac: float = 0.10,          # per-node fraction among *intra* neighbors
+    prefer_low_sim: bool = True,      # cosine: drop lowest sim first
+    min_keep: int = 1,                # never reduce below this total degree (incl self when restored)
+    degree_floor: int = 0,            # excl self; keep >= degree_floor+1
+    metric: str = "cosine",
+) -> tuple[torch.Tensor, dict]:
+    import math, torch
+    device = adj_label.device
+    g = adj_label.clone().to(device)
+    N = g.size(0)
+
+    # degrees excl self (for core + safety)
+    deg_now = (g.sum(1) - torch.diag(g)).to(torch.long)
+
+    # your existing core / thresholds / radii
+    core_mask, thr_per_node, _, radii = select_gmm_cores(
+        Z, labels, deg_now, alpha=0.8, gamma=1.0, B=Z.size(1)
+    )
+
+    # ranking key
+    if metric == "cosine":
+        X = torch.nn.functional.normalize(Z, p=2, dim=1)
+        S = X @ X.t()
+        def _rank(i, neigh): return S[i, neigh]       # higher = closer
+        low_is_worse = True
+    else:
+        def _rank(i, neigh):
+            Zi = Z[i].unsqueeze(0)
+            return (Zi - Z[neigh]).pow(2).sum(1).sqrt()   # higher = farther
+        low_is_worse = False
+
+    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
+
+    # eligibility by scope
+    if scope == "c0p":       # your outliers: non-core & radius>thr
+        eligible = (~core_mask) & (radii > thr_per_node)
+    elif scope == "noncore":
+        eligible = (~core_mask)
+    elif scope == "cp":
+        eligible = torch.ones(N, dtype=torch.bool, device=device)
+    else:
+        raise ValueError(f"unknown scope={scope}")
+
+    g.fill_diagonal_(0)
+    dropped_total = 0
+
+    for c in sorted(set(labels.tolist()) - {-1}):
+        idx = torch.where(lbl == c)[0]
+        cand = idx[eligible[idx]]
+
+        for i in cand.tolist():
+            neigh = torch.where((g[i] > 0) & (lbl == c))[0]
+            deg_intra = int(neigh.numel())
+            if deg_intra == 0: 
+                continue
+
+            keep_min = max(int(min_keep), int(degree_floor) + 1)
+            max_drop = max(0, deg_intra - keep_min)
+            drop_k   = min(max_drop, int(math.ceil(drop_frac * deg_intra)))
+            if drop_k <= 0:
+                continue
+
+            keys = _rank(i, neigh)
+            order = torch.argsort(keys, descending=not low_is_worse) if prefer_low_sim \
+                    else torch.randperm(deg_intra, device=g.device)
+            to_drop = neigh[order[:drop_k]]
+            if to_drop.numel():
+                g[i, to_drop] = 0
+                g[to_drop, i] = 0
+                dropped_total += int(to_drop.numel())
+
+    g.fill_diagonal_(1)
+    deg_excl_self_after = (g.sum(1) - torch.diag(g))
+    print(f"[CP-PRUNE] scope={scope} drop_frac={drop_frac:.3f} | dropped_edges={dropped_total} "
+          f"| min_deg_after={int(deg_excl_self_after.min().item())} "
+          f"| isolated={int((deg_excl_self_after==0).sum().item())}")
+
+    return g, {"dropped_edges": dropped_total}
+
+
+@torch.no_grad()
+def cp_prune_inter(
+    Z: torch.Tensor,
+    adj_label: torch.Tensor,          # [N,N] dense 0/1 WITH self-loops
+    labels: np.ndarray,
+    *,
+    drop_frac: float = 0.10,          # per-node fraction among *inter* neighbors
+    prefer_low_sim: bool = True,
+    min_keep: int = 1,
+    degree_floor: int = 0,            # excl self; keep >= degree_floor+1
+    metric: str = "cosine",
+    include_noise: bool = True,       # treat -1 as a distinct cluster
+) -> tuple[torch.Tensor, dict]:
+    import math, torch
+    device = adj_label.device
+    g = adj_label.clone().to(device)
+    N = g.size(0)
+
+    if metric == "cosine":
+        X = torch.nn.functional.normalize(Z, p=2, dim=1)
+        S = X @ X.t()
+        def _rank(i, neigh): return S[i, neigh]       # higher = closer
+        low_is_worse = True
+    else:
+        def _rank(i, neigh):
+            Zi = Z[i].unsqueeze(0)
+            return (Zi - Z[neigh]).pow(2).sum(1).sqrt()
+        low_is_worse = False
+
+    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
+
+    g.fill_diagonal_(0)
+    dropped_total = 0
+
+    for i in range(N):
+        deg_total = int(g[i].sum().item())
+        keep_min = max(int(min_keep), int(degree_floor) + 1)
+        max_drop_total = max(0, deg_total - keep_min)
+        if max_drop_total <= 0:
+            continue
+
+        if include_noise:
+            neigh = torch.where((g[i] > 0) & (lbl != lbl[i]))[0]
+        else:
+            neigh = torch.where((g[i] > 0) & (lbl != -1) & (lbl[i] != -1) & (lbl != lbl[i]))[0]
+
+        inter_deg = int(neigh.numel())
+        if inter_deg == 0:
+            continue
+
+        drop_k = min(max_drop_total, int(math.ceil(drop_frac * inter_deg)))
+        if drop_k <= 0:
+            continue
+
+        keys = _rank(i, neigh)
+        order = torch.argsort(keys, descending=not low_is_worse) if prefer_low_sim \
+                else torch.randperm(inter_deg, device=g.device)
+        to_drop = neigh[order[:drop_k]]
+        if to_drop.numel():
+            g[i, to_drop] = 0
+            g[to_drop, i] = 0
+            dropped_total += int(to_drop.numel())
+
+    g.fill_diagonal_(1)
+    deg_excl_self_after = (g.sum(1) - torch.diag(g))
+    print(f"[CP-PRUNE-INTER] drop_frac={drop_frac:.3f} | dropped_edges={dropped_total} "
+          f"| min_deg_after={int(deg_excl_self_after.min().item())} "
+          f"| isolated={int((deg_excl_self_after==0).sum().item())}")
+
+    return g, {"dropped_edges": dropped_total}
+
+
 ###############################################
 
 @torch.no_grad()
@@ -1309,6 +1474,8 @@ def robust_score_quantile_from_scores(scores, base_block, q: float, max_elems: i
     - Computes the quantile safely on CPU to side–step CUDA `quantile()` size limits.
     - Falls back to NumPy if PyTorch quantile still throws.
     """
+    if forbid_mask is not None and base_block is None:
+        base_block = forbid_mask
     import numpy as _np, torch as _torch
     if scores is None:
         return None
@@ -1328,205 +1495,6 @@ def robust_score_quantile_from_scores(scores, base_block, q: float, max_elems: i
     if not (thr == thr) or thr in (float("inf"), float("-inf")):
         thr = float(_np.quantile(vals_cpu.numpy(), 0.5))
     return float(thr)
-
-@torch.no_grad()
-def degree_deficit_snapshot(
-    adj_label: torch.Tensor,          # [N,N] dense WITH self-loops
-    degree_floor: int,                # target min degree (EXCLUDING self)
-    *,
-    out_dir: str = "logs/deg_deficit",
-    tag: str = "before",              # "before" | "after"
-    epoch: int | None = None,
-    run_name: str = "default_run",
-    topk: int = 50,
-    writer=None,                      # optional: SummaryWriter
-    save_snapshot: bool = False,      # <<< NEW: default False for fast per-epoch logging
-):
-    """
-    Computes per-node degree deficit: max(0, degree_floor - deg_excl_self).
-    Saves (always):
-      - CSV: node, deg_excl_self, deficit   (one per epoch when called)
-    Optionally (if save_snapshot=True):
-      - Histogram PNG
-      - Top-K deficits bar PNG
-    Returns a metrics dict for the logger.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    N = adj_label.size(0)
-    deg = _deg_excl_self(adj_label)
-    deficits = torch.clamp(degree_floor - deg, min=0).to(torch.long)
-
-    total_def = int(deficits.sum().item())
-    num_low = int((deficits > 0).sum().item())
-    max_def = int(deficits.max().item())
-    mean_def = float(deficits.float().mean().item())
-    median_def = float(deficits.float().median().item())
-
-    epoch_str = f"{epoch:03d}" if epoch is not None else "NA"
-    base = os.path.join(out_dir, f"{run_name}_{tag}_e{epoch_str}")
-
-    # CSV (per-epoch)
-    nodes = torch.arange(N, device=adj_label.device)
-    csv_path = base + ".csv"
-    pd.DataFrame({
-        "node": nodes.cpu().numpy(),
-        "deg_excl_self": deg.cpu().numpy().astype(np.int64),
-        "deficit": deficits.cpu().numpy().astype(np.int64),
-    }).to_csv(csv_path, index=False)
-
-    # Optional heavier plots
-    hist_path, bar_path = None, None
-    if save_snapshot:
-        # Histogram
-        hist_path = base + "_hist.png"
-        plt.figure(figsize=(6.5, 4.0), dpi=130)
-        bins = np.arange(-0.5, max_def + 1.5, 1.0) if max_def > 0 else np.arange(-0.5, 1.5, 1.0)
-        plt.hist(deficits.cpu().numpy(), bins=bins)
-        plt.xlabel("Degree deficit (floor - deg_excl_self)")
-        plt.ylabel("Node count")
-        plt.title(f"{run_name} | {tag} | epoch={epoch_str}\n"
-                  f"total={total_def} | low_nodes={num_low} | max={max_def}")
-        plt.tight_layout()
-        plt.savefig(hist_path, bbox_inches="tight")
-        plt.close()
-
-        # Top-K bar
-        if max_def > 0 and num_low > 0:
-            deficits_np = deficits.cpu().numpy()
-            top_idx = np.argsort(-deficits_np)[:topk]
-            top_vals = deficits_np[top_idx]
-            plt.figure(figsize=(max(6.5, min(14, 0.15 * len(top_idx) + 2)), 4.0), dpi=130)
-            plt.bar(np.arange(len(top_idx)), top_vals)
-            plt.xticks(np.arange(len(top_idx)), top_idx, rotation=90, fontsize=7)
-            plt.xlabel("Node id (sorted by deficit)")
-            plt.ylabel("Deficit")
-            plt.title(f"{run_name} | {tag} | epoch={epoch_str} | top-{len(top_idx)}")
-            plt.tight_layout()
-            bar_path = base + f"_top{len(top_idx)}.png"
-            plt.savefig(bar_path, bbox_inches="tight")
-            plt.close()
-
-    # Optional TB scalars
-    if writer is not None:
-        step = 0 if epoch is None else int(epoch)
-        writer.add_scalar(f"{run_name}/deg_deficit_total/{tag}", total_def, step)
-        writer.add_scalar(f"{run_name}/deg_deficit_num_low/{tag}", num_low, step)
-        writer.add_scalar(f"{run_name}/deg_deficit_max/{tag}", max_def, step)
-        writer.add_scalar(f"{run_name}/deg_deficit_mean/{tag}", mean_def, step)
-        writer.add_scalar(f"{run_name}/deg_deficit_median/{tag}", median_def, step)
-
-    print(f"[DEFICIT] tag={tag} epoch={epoch_str} N={N} "
-          f"total={total_def} low_nodes={num_low} max={max_def} "
-          f"mean={mean_def:.3f} median={median_def:.3f}")
-    print(f"[DEFICIT] saved: {csv_path}")
-    if save_snapshot:
-        if hist_path: print(f"[DEFICIT] saved: {hist_path}")
-        if bar_path:  print(f"[DEFICIT] saved: {bar_path}")
-
-    return {
-        "total_deficit": total_def,
-        "num_low": num_low,
-        "max_deficit": max_def,
-        "mean_deficit": mean_def,
-        "median_deficit": median_def,
-        "csv_path": csv_path,
-        "hist_path": hist_path,
-        "bar_path": bar_path,
-    }
-
-
-class DegreeDeficitLogger:
-    """Track deficit over epochs and emit series CSV + line charts at the end."""
-    def __init__(self, out_dir: str = "logs/deg_deficit", run_name: str = "default_run", ema_alpha: float | None = None):
-        self.out_dir = out_dir
-        self.run_name = run_name
-        self.ema_alpha = ema_alpha
-        os.makedirs(self.out_dir, exist_ok=True)
-        self.epochs, self.total, self.num_low, self.max_def, self.mean_def, self.median_def = [], [], [], [], [], []
-
-    def log_point(self, epoch: int, metrics: dict):
-        self.epochs.append(int(epoch))
-        self.total.append(metrics["total_deficit"])
-        self.num_low.append(metrics["num_low"])
-        self.max_def.append(metrics["max_deficit"])
-        self.mean_def.append(metrics["mean_deficit"])
-        self.median_def.append(metrics["median_deficit"])
-
-    def _ema(self, arr):
-        if not self.ema_alpha or len(arr) < 2: return arr
-        a = self.ema_alpha
-        out = [arr[0]]
-        for x in arr[1:]:
-            out.append(a * x + (1 - a) * out[-1])
-        return out
-
-    def _normalize01(self, arr):
-        lo, hi = min(arr), max(arr)
-        if hi == lo: return [0.0 for _ in arr]
-        return [(x - lo) / (hi - lo) for x in arr]
-
-    def finalize_plots(self):
-        if not self.epochs:
-            return
-
-        # sort by epoch in case user logged out of order
-        order = np.argsort(self.epochs)
-        ep   = list(np.array(self.epochs)[order])
-        tot  = list(np.array(self.total)[order])
-        nlow = list(np.array(self.num_low)[order])
-        mx   = list(np.array(self.max_def)[order])
-        mu   = list(np.array(self.mean_def)[order])
-        med  = list(np.array(self.median_def)[order])
-
-        # optional smoothing
-        tot_s, nlow_s, mx_s, mu_s, med_s = map(self._ema, (tot, nlow, mx, mu, med))
-
-        # series CSV
-        series_csv = os.path.join(self.out_dir, f"{self.run_name}_series.csv")
-        pd.DataFrame({
-            "epoch": ep,
-            "total_deficit": tot,
-            "num_low": nlow,
-            "max_deficit": mx,
-            "mean_deficit": mu,
-            "median_deficit": med,
-        }).to_csv(series_csv, index=False)
-        print(f"[DEFICIT] series CSV saved: {series_csv}")
-
-        base = os.path.join(self.out_dir, f"{self.run_name}_series")
-
-        # 1) Overlay (normalized) for quick glance
-        plt.figure(figsize=(7.5, 4.5), dpi=130)
-        plt.plot(ep, self._normalize01(tot_s),  marker="o", label="total")
-        plt.plot(ep, self._normalize01(nlow_s), marker="o", label="#low")
-        plt.plot(ep, self._normalize01(mx_s),   marker="o", label="max")
-        plt.plot(ep, self._normalize01(mu_s),   marker="o", label="mean")
-        plt.plot(ep, self._normalize01(med_s),  marker="o", label="median")
-        plt.xlabel("Epoch"); plt.ylabel("Normalized value (0–1)")
-        ttl = f"{self.run_name} | deficit metrics over time"
-        if self.ema_alpha: ttl += f" (EMA α={self.ema_alpha})"
-        plt.title(ttl); plt.legend()
-        plt.tight_layout(); p0 = base + "_overlay.png"; plt.savefig(p0, bbox_inches="tight"); plt.close()
-
-        # 2) Individual plots (5)
-        def _one(y, ylabel, suffix):
-            plt.figure(figsize=(6.8, 3.8), dpi=130)
-            plt.plot(ep, y, marker="o")
-            plt.xlabel("Epoch"); plt.ylabel(ylabel)
-            plt.title(f"{self.run_name} | {ylabel} over time")
-            plt.tight_layout()
-            path = f"{base}_{suffix}.png"
-            plt.savefig(path, bbox_inches="tight"); plt.close()
-            print(f"[DEFICIT] time-series saved: {path}")
-
-        _one(tot_s, "Total degree deficit", "total")
-        _one(nlow_s, "# nodes with deficit > 0", "numlow")
-        _one(mx_s,   "Max degree deficit", "max")
-        _one(mu_s,   "Mean degree deficit", "mean")
-        _one(med_s,  "Median degree deficit", "median")
-
-        print(f"[DEFICIT] overlay saved: {p0}")
-
 
 @torch.no_grad()
 def drop_feature(x: torch.Tensor, drop_prob: float, inplace: bool = False, gen: torch.Generator | None = None):

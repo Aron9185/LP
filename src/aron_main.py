@@ -58,8 +58,8 @@ parser.add_argument(
     "--logging", dest="logging", action="store_true", help="Enable file logging"
 )
 parser.add_argument("--date", type=str, default="0000", help="date")
-parser.add_argument(
-    "--ver", type=str, default="origin", help="modified version"
+parser.add_argument("--ver", type=str, default="origin",
+    help="version: origin | aron_* | remove_only_intra[_c0p|_noncore|_cp][_fracX] | remove_only_inter[_fracX] | remove_only_both[_fracX]"
 )  # [origin, thm_exp, uncover]
 parser.add_argument("--idx", type=str, default="1", help="index")  # [1,2,3,4,5]
 parser.add_argument(
@@ -106,7 +106,7 @@ parser.add_argument(
     default=None,
     help="Optional per-epoch budget as a fraction of |E0|; None disables throttle.",
 )
-parser.add_argument("--cluster_method", choices=["none", "gmm", "louvain"], default="none")
+parser.add_argument("--cluster_method", choices=["none", "gmm", "louvain"], default="gmm")
 parser.add_argument("--cluster_mode",   choices=["any", "intra", "inter"], default="any")
 parser.add_argument("--gmm_k", type=int, default=16)        # pick your K
 parser.add_argument("--gmm_tau", type=float, default=0.55)  # confidence→noise

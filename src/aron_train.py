@@ -30,6 +30,10 @@ from input_data import CalN2V
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import Optional, Tuple
 
+# --- dense helper: works for both sparse and dense tensors
+def _to_dense(A: torch.Tensor) -> torch.Tensor:
+    return A.to_dense() if getattr(A, "is_sparse", False) else A
+
 def train_encoder(
     dataset_str: str,
     device: torch.device,
@@ -199,11 +203,20 @@ def train_encoder(
     best_hit1 = 0.0;best_hit3 = 0.0;best_hit10 = 0.0; best_hit20 = 0.0; best_hit50 = 0.0; best_hit100 = 0.0
     best_hit1_roc = 0.0;best_hit3_roc = 0.0;best_hit10_roc = 0.0; best_hit20_roc = 0.0; best_hit50_roc = 0.0; best_hit100_roc = 0.0
     best_hit1_ep = 0.0;best_hit3_ep = 0.0;best_hit10_ep = 0.0; best_hit20_ep = 0.0; best_hit50_ep = 0.0; best_hit100_ep = 0.0
-    modification_ratio_history = []
     minimum_node_degree_history = []
     roc_history = []
-    # train model
+    modification_ratio_history = []
+    radius_hist = []          # mean compactness per epoch (↓ better)
+    add_hist = []             # added edges per epoch
+    remove_hist = []          # removed edges per epoch
 
+    # which epoch each radius entry comes from
+    radius_epoch_hist = []
+
+    # store validation Hit@K per epoch (each entry is a list of 6 floats)
+    val_hit_history = []
+        
+    # train model
     neighbors = {}
 
     for u, v in zip(edge_index[0], edge_index[1]):
@@ -239,6 +252,9 @@ def train_encoder(
     # -------------------
     frozen_scores = None
     need_frozen = ver in ["aron_desc", "aron_asc", "aron_desc_intra", "aron_desc_inter"]
+    
+    is_remove_only = isinstance(ver, str) and ver.startswith("remove_only_")
+    needs_scores   = isinstance(ver, str) and ver.startswith("aron_") and ("desc" in ver or "asc" in ver)
     
     def _iter_edge_pairs(*edge_sets):
         """Yield (r, c) pairs from lists or numpy arrays uniformly."""
@@ -308,6 +324,11 @@ def train_encoder(
                     print(f"[pretrain] Saved frozen scores -> {frozen_scores_path}")
                 except Exception as e:
                     print(f"[pretrain] Save frozen scores failed: {e}")
+            # only enforce shape if needed
+            if needs_scores:
+                if frozen_scores is None or frozen_scores.shape != (N, N):
+                    print("[WARN] score-based adds disabled (no valid frozen_scores).")
+                    frozen_scores = None
             if pretrained_ckpt_path:
                 try:
                     torch.save(encoder.state_dict(), pretrained_ckpt_path)
@@ -338,7 +359,7 @@ def train_encoder(
 
     # sanity checks (helpful when switching datasets)
     print(f"[AUG-INIT] N={N} | E0={E0} | aug_ratio(global)={aug_ratio} | aug_bound(per-node)={aug_bound}")
-    if frozen_scores.shape != (N, N):
+    if frozen_scores is not None and frozen_scores.shape != (N, N):
         raise ValueError(f"frozen_scores shape {tuple(frozen_scores.shape)} != {(N,N)} for current dataset")
     
     best_val_roc = -float("inf")
@@ -489,7 +510,7 @@ def train_encoder(
                         metric="cosine",
                     )
                 elif cluster_method == "louvain":
-                    A_np = (adj_label.to_dense() > 0).detach().cpu().numpy().astype(np.int8)
+                    A_np = (_to_dense(adj_label) > 0).detach().cpu().numpy().astype(np.int8)
                     np.fill_diagonal(A_np, 0)     # Louvain doesn’t need self-loops
                     labels_cluster = louvain_labels(A_np)
                 else:
@@ -737,6 +758,161 @@ def train_encoder(
 
                 aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features.to_dense(), feat_maske_ratio)
 
+            elif ver.startswith("remove_only_"):
+                import re
+
+                # per-epoch defaults to avoid UnboundLocalError
+                modification_ratio = 0.0
+                added_this_epoch = 0
+                removed_this_epoch = 0
+
+                # ------------------------------------------------------------
+                # Inline parse from `ver`
+                # Formats:
+                #   remove_only_intra
+                #   remove_only_inter
+                #   remove_only_both
+                #   + optional scope:  _c0p | _noncore | _cp           (for INTRA only)
+                #   + optional frac :  _frac0.05                        (steady per-node fraction hint)
+                # Examples:
+                #   remove_only_intra_c0p
+                #   remove_only_intra_cp_frac0.07
+                #   remove_only_inter_frac0.03
+                # ------------------------------------------------------------
+                m = re.match(r"^remove_only_(intra|inter|both)(?:_(c0p|noncore|cp))?(?:_frac([0-9]*\.?[0-9]+))?$", ver)
+                if not m:
+                    print(f"[REMOVE-ONLY] Unrecognized ver={ver}; skipping this epoch.")
+                    # keep graph & features unchanged this epoch
+                    g = _to_dense(adj_label)
+                    aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
+                else:
+                    kind  = m.group(1)                  # "intra" | "inter" | "both"
+                    scope = m.group(2) or "c0p"         # default scope for INTRA
+                    frac_hint = float(m.group(3)) if m.group(3) else None
+
+                    # ---- cluster labels ----
+                    if cluster_method == "gmm":
+                        labels_cluster = gmm_labels(Z.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
+                    elif cluster_method == "louvain":
+                        A_np = (_to_dense(adj_label) > 0).detach().cpu().numpy().astype(np.int8)
+                        np.fill_diagonal(A_np, 0)
+                        labels_cluster = louvain_labels(A_np)
+                    else:
+                        labels_cluster = density_cluster_embeddings(Z.detach(), method="hdbscan")
+
+                    # ---- compactness BEFORE ----
+                    # (radius uses Z & labels; it won’t change until the next epoch after updates)
+                    radii, _, _ = per_cluster_stats_diag(Z.detach(), labels_cluster, normalize_cosine=True)
+                    if (labels_cluster != -1).sum() > 0:
+                        mean_radius = float(radii[torch.from_numpy(labels_cluster) != -1].mean().item())
+                    else:
+                        mean_radius = float(radii.mean().item())
+                    print(f"[RADIUS] epoch={epoch} mean={mean_radius:.6f}")
+                    radius_hist.append(mean_radius)
+                    radius_epoch_hist.append(epoch)
+
+                    # ---- epoch quota from GLOBAL pool (adds+removes shared) ----
+                    # E0 is ORIGINAL undirected |E|, computed earlier
+                    def _epoch_target_frac(ep: int, T: int) -> float:
+                        return float(ep + 1) / max(1, T)
+
+                    target_cum_mods = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch)))
+                    used_mods_global = int(global_used_adds + global_used_removals)
+                    epoch_quota_edges = max(0, target_cum_mods - used_mods_global)
+                    print(f"[REMOVE-ONLY] epoch_quota_left={epoch_quota_edges} / global_cap={int(round(aug_ratio*E0))}")
+
+                    dropped_intra = 0
+                    dropped_inter = 0
+
+                    if epoch_quota_edges > 0:
+                        g_dense = _to_dense(adj_label)
+                        lbl_t = torch.from_numpy(labels_cluster).to(g_dense.device)
+
+                        same = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+                        diff = (lbl_t[:, None] != lbl_t[None, :]) | (lbl_t[:, None] == -1) | (lbl_t[None, :] == -1)
+
+                        # undirected counts
+                        intra_edges = int(((g_dense > 0) & same).sum().item() // 2)
+                        inter_edges = int(((g_dense > 0) & diff).sum().item() // 2)
+
+                        # split quota by kind
+                        if kind == "intra":
+                            q_intra, q_inter = epoch_quota_edges, 0
+                        elif kind == "inter":
+                            q_intra, q_inter = 0, epoch_quota_edges
+                        else:
+                            # both: 50/50, but shift to the other side if one empty
+                            if intra_edges == 0 and inter_edges > 0:
+                                q_intra, q_inter = 0, epoch_quota_edges
+                            elif inter_edges == 0 and intra_edges > 0:
+                                q_intra, q_inter = epoch_quota_edges, 0
+                            else:
+                                q_intra = epoch_quota_edges // 2
+                                q_inter = epoch_quota_edges - q_intra
+
+                        # per-node drop fractions (allow steady override via _fracX)
+                        if frac_hint is not None:
+                            drop_intra = max(0.0, min(0.9, float(frac_hint)))
+                            drop_inter = max(0.0, min(0.9, float(frac_hint)))
+                        else:
+                            drop_intra = max(0.0, min(0.6, q_intra / max(1, intra_edges)))
+                            drop_inter = max(0.0, min(0.6, q_inter / max(1, inter_edges)))
+
+                        degree_floor = max(0, int(degree_threshold) - 1)
+
+                        # ---- INTRA prune ----
+                        if q_intra > 0 and intra_edges > 0:
+                            new_adj, stats_intra = cp_prune_intra(
+                                Z=Z.detach(),
+                                adj_label=g_dense,
+                                labels=labels_cluster,
+                                scope=scope,                      # "c0p" | "noncore" | "cp"
+                                drop_frac=drop_intra,
+                                prefer_low_sim=True,
+                                min_keep=1,
+                                degree_floor=degree_floor,
+                                metric="cosine",
+                            )
+                            dropped_intra = int(stats_intra["dropped_edges"])
+                            adj_label = new_adj
+                            print(f"[REMOVE-ONLY:INTRA] scope={scope} drop_frac≈{drop_intra:.4f} dropped={dropped_intra}")
+
+                        # ---- INTER prune ----
+                        if q_inter > 0 and inter_edges > 0:
+                            new_adj, stats_inter = cp_prune_inter(
+                                Z=Z.detach(),
+                                adj_label=adj_label,              # current (may already be dense from INTRA)
+                                labels=labels_cluster,
+                                drop_frac=drop_inter,
+                                prefer_low_sim=True,
+                                min_keep=1,
+                                degree_floor=degree_floor,
+                                metric="cosine",
+                                include_noise=True,
+                            )
+                            dropped_inter = int(stats_inter["dropped_edges"])
+                            adj_label = new_adj
+                            print(f"[REMOVE-ONLY:INTER] drop_frac≈{drop_inter:.4f} dropped={dropped_inter}")
+
+                    # bookkeeping: adds=0 in remove-only
+                    added_this_epoch = 0
+                    removed_this_epoch = dropped_intra + dropped_inter
+                    global_used_adds     += added_this_epoch
+                    global_used_removals += removed_this_epoch
+
+                    # per-epoch modification ratio (relative to ORIGINAL undirected |E| = E0)
+                    modification_ratio = (added_this_epoch + removed_this_epoch) / float(max(1, E0))
+
+                    print(f"[BUDGET] add/remove this epoch = {added_this_epoch}/{removed_this_epoch} "
+                        f"(intra={dropped_intra}, inter={dropped_inter}) | "
+                        f"global_used adds/removes = {global_used_adds}/{global_used_removals}")
+
+                    # keep feature aug behavior consistent with others
+                    aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
+
+                    # optional: maintain `g` mirror like other branches
+                    g = _to_dense(adj_label)
+
             elif(ver=="no"):
                 g = adj_label.to_dense()
                 modification_ratio = 0
@@ -759,6 +935,8 @@ def train_encoder(
             minimum_node_degree_history.append(min_degree.item())
 
         modification_ratio_history.append(modification_ratio)
+        add_hist.append(int(added_this_epoch))
+        remove_hist.append(int(removed_this_epoch))
 
         # Calcualte Augment View
         # bias_Z = encoder(features, aug_edge_index)
@@ -800,11 +978,14 @@ def train_encoder(
         # A_pred = train_decoder(device, encoder.Z.clone().detach(), adj_label, weight_tensor, norm, train_mask)
         # print(A_pred.shape)
         train_acc = get_acc(A_pred.data.cpu(), adj_label.data.cpu())
-        val_roc, val_ap, val_hit = get_scores(dataset_str, val_edges, val_edges_false, A_pred.data.cpu().numpy(), adj_orig)
-        test_roc, test_ap, test_hit = get_scores(dataset_str, test_edges, test_edges_false, A_pred.data.cpu().numpy(), adj_orig)
-        
-        # (Optional) track validation curve instead of test
-        roc_history.append(val_roc)  # was: test_roc
+        val_roc, val_ap, val_hit = get_scores(dataset_str, val_edges, val_edges_false,
+                                      A_pred.data.cpu().numpy(), adj_orig)
+        test_roc, test_ap, test_hit = get_scores(dataset_str, test_edges, test_edges_false,
+                                                A_pred.data.cpu().numpy(), adj_orig)
+
+        # track validation curve instead of test
+        roc_history.append(val_roc)              # per-epoch val ROC
+        val_hit_history.append([float(h) for h in val_hit])   # per-epoch val Hit@K
 
         # val_acc, test_acc = logist_regressor_classification(device = device, Z = encoder.Z.clone().detach(), labels = labels, idx_train = idx_train, idx_val = idx_val, idx_test = idx_test)
         # print(f'Epoch: {epoch + 1}, train_loss= {loss.item():.4f}, train_acc= {train_acc:.4f}, val_roc= {val_roc:.4f}, val_ap= {val_ap:.4f}, test_roc= {test_roc:.4f}, test_ap= {test_ap:.4f}, time= {time.time() - t:.4f}')
@@ -908,6 +1089,106 @@ def train_encoder(
     print(f"Total training time {time.time() - training_time_start}")
     print(f"Average minimum node degree {sum(minimum_node_degree_history) / len(minimum_node_degree_history)}")
     print(minimum_node_degree_history)
+    
+    # ==================== RADIUS HISTORY FINALIZE ====================
+    try:
+        if len(radius_hist) > 0:
+            out_dir = os.path.join("logs", "radius")
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Stable run id (easy to aggregate across runs)
+            run_id = f"{dataset_str}_{ver}_seed{seed}_idx{run_tag}"
+            csv_path = os.path.join(out_dir, f"{run_id}.csv")
+
+            # Align defensively: radius_hist[i] corresponds to epoch radius_epoch_hist[i]
+            if len(radius_hist) != len(radius_epoch_hist):
+                print(f"[RADIUS] WARNING: len(radius_hist)={len(radius_hist)} "
+                    f"!= len(radius_epoch_hist)={len(radius_epoch_hist)}; "
+                    f"using min length for export.")
+            L = min(len(radius_hist), len(radius_epoch_hist))
+
+            # Actual epochs where we measured radius (e.g., 0, 10, 20, ...)
+            epochs = radius_epoch_hist[:L]
+
+            # Radius values in the same order
+            radius_vals = [float(radius_hist[i]) for i in range(L)]
+
+            # Validation Hit@K for those epochs
+            # (val_hit_history is indexed by epoch)
+            val_hit1  = []
+            val_hit3  = []
+            val_hit10 = []
+            val_hit20 = []
+            val_hit50 = []
+            val_hit100 = []
+            for e in epochs:
+                if e < len(val_hit_history):
+                    h = val_hit_history[e]
+                    val_hit1.append(h[0])
+                    val_hit3.append(h[1])
+                    val_hit10.append(h[2])
+                    val_hit20.append(h[3])
+                    val_hit50.append(h[4])
+                    val_hit100.append(h[5])
+                else:
+                    # If for some reason we have fewer val entries, fill with NaN
+                    val_hit1.append(float("nan"))
+                    val_hit3.append(float("nan"))
+                    val_hit10.append(float("nan"))
+                    val_hit20.append(float("nan"))
+                    val_hit50.append(float("nan"))
+                    val_hit100.append(float("nan"))
+
+            # Added/removed/mod_ratio values for those epochs
+            added   = [add_hist[e] if e < len(add_hist) else 0 for e in epochs]
+            removed = [remove_hist[e] if e < len(remove_hist) else 0 for e in epochs]
+            mod     = [modification_ratio_history[e] if e < len(modification_ratio_history) else 0.0 for e in epochs]
+
+            df = pd.DataFrame({
+                "epoch": epochs,
+                "radius_mean": radius_vals,
+                "val_hit@1": val_hit1,
+                "val_hit@3": val_hit3,
+                "val_hit@10": val_hit10,
+                "val_hit@20": val_hit20,
+                "val_hit@50": val_hit50,
+                "val_hit@100": val_hit100,
+                "added": added,
+                "removed": removed,
+                "mod_ratio": mod,
+            })
+            df.to_csv(csv_path, index=False)
+            print(f"[RADIUS] series CSV saved: {csv_path}")
+
+            # Plot radius over epochs
+            try:
+                fig = plt.figure(figsize=(7.5, 4.5), dpi=130)
+                plt.plot(epochs, radius_vals, marker="o")
+                plt.xlabel("Epoch")
+                plt.ylabel("Mean radius (↓ better)")
+                plt.title(run_id)
+                plt.tight_layout()
+                png_path = os.path.join(out_dir, f"{run_id}.png")
+                plt.savefig(png_path, bbox_inches="tight")
+                plt.close(fig)
+                print(f"[RADIUS] plot saved: {png_path}")
+            except Exception as e:
+                print(f"[RADIUS] plot skipped: {e}")
+
+            # Log summary stats for easy grepping later
+            start_r = float(radius_vals[0])
+            end_r   = float(radius_vals[-1])
+            delta_r = end_r - start_r
+            best_r  = float(min(radius_vals))
+            best_idx = int(radius_vals.index(best_r))
+            best_ep = epochs[best_idx]
+            print(f"[RADIUS] summary start={start_r:.6f} end={end_r:.6f} Δ={delta_r:+.6f} best={best_r:.6f}@e{best_ep}")
+        else:
+            print("[RADIUS] no radius history recorded for this run.")
+    except Exception as e:
+        print(f"[RADIUS] finalize failed: {e}")
+    # ================================================================
+
     
     # return the best embeddings, not the last ones
     return Z_best.clone().detach(), roc_history, modification_ratio_history, edge_index
