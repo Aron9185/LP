@@ -1267,6 +1267,118 @@ def c0p_prune_outliers(
         "min_deg_after_excl_self": min_deg_after,
     }
 
+
+def build_c0p_intra_edge_order(
+    Z: torch.Tensor,
+    adj_label: torch.Tensor,      # [N,N] 0/1, with or without diag
+    labels: np.ndarray,           # -1 = noise
+    alpha: float = 0.8,
+    gamma: float = 1.0,
+    metric: str = "cosine",
+) -> dict:
+    """
+    給定固定的 encoder 表示 Z、adj_label 以及 GMM labels，
+    把「同 cluster 且 C0p 允許」的邊全部抓出來，依照「越糟越前面」排序。
+
+    回傳:
+      - pairs: LongTensor [M,2]，每個是 (i,j), i<j
+      - scores: Tensor [M]，對應的 score（越大 = 越糟 / 越該先砍）
+      - num_intra: M（intra-cluster C0p 邊數量）
+    """
+    device = adj_label.device
+    g = adj_label.clone().to(device)
+    # 我們不會砍 self-loop
+    g.fill_diagonal_(0)
+
+    # degree (不含 self)
+    deg_excl_self = g.sum(dim=1).to(torch.long)
+
+    # 先依照 (α, γ, d̂) 找出「個別 node 有資格參與 C0p」的 pair-level mask
+    allow_pairs = build_alpha_gamma_allow_mask_gmm(
+        Z=Z,
+        labels=labels,
+        degrees_excl_self=deg_excl_self,
+        alpha=alpha,
+        gamma=gamma,
+        B=Z.size(1),
+        exclude_noise=True,
+        require_core_endpoint=True,
+        within_threshold=True,
+    )
+
+    lbl_t = torch.from_numpy(labels.astype(np.int64)).to(device)
+    same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+
+    # 只考慮：目前有邊 ∧ 同 cluster ∧ 兩端都在 C0p eligibility 裡
+    cand = (g > 0) & same_cluster & allow_pairs
+    cand.fill_diagonal_(False)
+
+    # 無向圖 → 只看上三角
+    idx_i, idx_j = cand.triu(1).nonzero(as_tuple=True)
+    num_intra = int(idx_i.numel())
+    if num_intra == 0:
+        return {
+            "pairs": torch.zeros(0, 2, dtype=torch.long, device=device),
+            "scores": torch.zeros(0, dtype=torch.float32, device=device),
+            "num_intra": 0,
+        }
+
+    if metric == "cosine":
+        X = F.normalize(Z, p=2, dim=1)
+        S = X @ X.t()                      # cosine similarity
+        s = S[idx_i, idx_j]
+        # 相似度越低越糟 → ascending
+        order = torch.argsort(s, descending=False)
+    else:
+        diff = Z[idx_i] - Z[idx_j]
+        s = torch.sqrt((diff ** 2).sum(dim=1) + 1e-8)
+        # 距離越大越糟 → descending
+        order = torch.argsort(s, descending=True)
+
+    pairs = torch.stack([idx_i[order], idx_j[order]], dim=1)
+    scores = s[order]
+
+    print(f"[C0P-RANK] num_intra={num_intra} (eligible intra-cluster C0p edges)")
+
+    return {
+        "pairs": pairs,
+        "scores": scores,
+        "num_intra": num_intra,
+    }
+    
+@torch.no_grad()
+def radii_to_fixed_centers(
+    Z: torch.Tensor,
+    labels: np.ndarray,
+    centers_fixed: dict[int, torch.Tensor],
+    normalize_cosine: bool = True,
+) -> torch.Tensor:
+    """
+    Compute per-node radius to a FIXED centroid per cluster id.
+    Noise (-1) → radius 0.
+    If normalize_cosine=True: radius = 1 - cos(x, center).
+    """
+    device = Z.device
+    N = Z.size(0)
+    radii = torch.zeros(N, device=device)
+    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
+
+    X = torch.nn.functional.normalize(Z, p=2, dim=1) if normalize_cosine else Z
+
+    for c, mu in centers_fixed.items():
+        idx = (lbl == c).nonzero(as_tuple=False).view(-1)
+        if idx.numel() == 0:
+            continue
+        if normalize_cosine:
+            mu = torch.nn.functional.normalize(mu.unsqueeze(0), p=2, dim=1).squeeze(0)
+            d = 1.0 - (X.index_select(0, idx) @ mu)
+        else:
+            d = torch.norm(X.index_select(0, idx) - mu, dim=1)
+        radii.index_copy_(0, idx, d)
+
+    return radii
+
+
 # --- compactness helper used by remove_only_* (cosine radius per node)
 def per_cluster_stats_diag(Z: torch.Tensor, labels: np.ndarray, normalize_cosine: bool = True):
     """
@@ -1888,3 +2000,206 @@ def Visualize_with_edge(dataset_str, Z, labels, edge_index):
                     yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
                     )
     fig.show()
+    
+@torch.no_grad()
+def run_c0p_sweep_static(
+    *,
+    dataset_str: str,
+    ver: str,
+    seed: int | None,
+    run_tag: str,
+    device: torch.device,
+    encoder: torch.nn.Module,
+    features: torch.Tensor,
+    adj_train,
+    adj_orig,
+    val_edges, val_edges_false, test_edges, test_edges_false,
+    gmm_k: int, gmm_tau: float,
+    alpha_c0p: float, gamma_c0p: float,
+    degree_floor: int,
+    step_frac: float = 0.01,
+    max_frac: float = 1.0,
+    sweep_scope: str = "cp_all",
+    out_dir: str | None = None,
+):
+    if dataset_str.startswith("ogbl-"):
+        print(f"[CP-SWEEP] skip sweep for large OGB dataset: {dataset_str}")
+        return []
+
+    enforce_floor = degree_floor is not None and degree_floor > 0
+    print(f"[CP-SWEEP] degree_floor={degree_floor} (enforce={enforce_floor})")
+
+    encoder.eval()
+    features = features.to(device)
+
+    # Base graph: original train split (no val/test edges)
+    g_np = adj_train.toarray().astype(np.float32)
+    np.fill_diagonal(g_np, 0.0)
+    N = g_np.shape[0]
+
+    # ---- BASE embedding & labels (fixed for ranking/scope) ----
+    adj0 = sp.csr_matrix(g_np)
+    edge_index0 = from_scipy_sparse_matrix(adj0)[0].to(device)
+    Z0 = encoder(features, edge_index0)
+
+    labels_cluster = gmm_labels(Z0.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
+    uniq, counts = np.unique(labels_cluster[labels_cluster >= 0], return_counts=True)
+    print(f"[CP-SWEEP] GMM clusters (non-noise): {len(uniq)} | sizes={counts.tolist()}")
+
+    # ---- FIXED core mask (C0p) from BASE (used for candidate scopes) ----
+    deg_base_np = g_np.sum(axis=1).astype(np.int64)
+    deg_base = torch.from_numpy(deg_base_np).to(Z0.device)
+    core_mask_fixed, thr_per_node_fixed, _, radii_maha_base = select_gmm_cores(
+        Z0, labels_cluster, degrees_excl_self=deg_base,
+        alpha=alpha_c0p, gamma=gamma_c0p, B=Z0.size(1)
+    )
+    core_mask_fixed_np = core_mask_fixed.bool().detach().cpu().numpy()
+
+    # ---- Candidate construction per scope (defined on BASE) ----
+    g_torch = torch.from_numpy(g_np).to(device)
+    lbl_t = torch.from_numpy(labels_cluster.astype(np.int64)).to(device)
+    same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+    existing = (g_torch > 0)
+    core_t = torch.from_numpy(core_mask_fixed_np).to(device)
+
+    if sweep_scope == "cp_all":
+        # all existing edges (intra + inter)
+        cand = existing.clone()
+    elif sweep_scope == "c0p_only":
+        # intra-cluster AND both endpoints are core (compact part)
+        both_core = (core_t[:, None] & core_t[None, :])
+        cand = existing & same_cluster & both_core
+    elif sweep_scope == "cp_minus_c0p":
+        # intra-cluster AND NOT both endpoints core (outside compact but within cp)
+        both_core = (core_t[:, None] & core_t[None, :])
+        cand = existing & same_cluster & (~both_core)
+    else:
+        raise ValueError(f"Unknown sweep_scope: {sweep_scope}")
+
+    cand.fill_diagonal_(False)
+    idx_i, idx_j = cand.triu(1).nonzero(as_tuple=True)
+    num_cand = int(idx_i.numel())
+
+    num_edges_total = int((g_torch.triu(1) > 0).sum().item())
+    print(f"[CP-SWEEP] total undirected edges = {num_edges_total}")
+    print(f"[CP-SWEEP] candidate edges ({sweep_scope}) = {num_cand}")
+
+    if num_cand == 0:
+        print("[CP-SWEEP] nothing to prune (num candidates = 0); aborting.")
+        return []
+
+    # ---- Rank by BASE cosine similarity (lowest first) ----
+    X0 = F.normalize(Z0.detach(), p=2, dim=1)
+    S0 = X0 @ X0.t()
+    sim = S0[idx_i, idx_j]
+    order = torch.argsort(sim, descending=False)
+    pairs = torch.stack([idx_i[order], idx_j[order]], dim=1).cpu().numpy()
+
+    step_edges = max(1, int(round(step_frac * num_cand)))
+    max_remove = max(1, int(round(max_frac * num_cand)))
+    print(f"[CP-SWEEP] step_edges={step_edges}, max_remove={max_remove} "
+          f"({max_frac*100:.1f}% of {sweep_scope} candidates)")
+
+    # Degree (excl self) for floor checks
+    deg = g_np.sum(axis=1).astype(np.int64).reshape(-1)
+
+    results = []
+
+    def _eval_current(removed_edges: int):
+        """Re-embed on CURRENT graph and log radius to UPDATED centroids."""
+        frac_removed = removed_edges / float(num_cand)
+        adj_cur = sp.csr_matrix(g_np)
+        edge_index = from_scipy_sparse_matrix(adj_cur)[0].to(device)
+
+        with torch.no_grad():
+            Z = encoder(features, edge_index)               # re-embed each step
+            A_pred = dot_product_decode(Z).data.cpu().numpy()
+
+        # ---- UPDATED centroids: recompute centers from current Z (labels fixed) ----
+        radii_cp_cur, centers_cur, _ = per_cluster_stats_diag(
+            Z.detach(), labels_cluster, normalize_cosine=True
+        )
+        mask_non_noise = torch.from_numpy(labels_cluster != -1).to(radii_cp_cur.device)
+        if mask_non_noise.any():
+            r_cp_mean = float(radii_cp_cur[mask_non_noise].mean().item())
+            r_cp_med  = float(radii_cp_cur[mask_non_noise].median().item())
+        else:
+            r_cp_mean = float(radii_cp_cur.mean().item())
+            r_cp_med  = float(radii_cp_cur.median().item())
+
+        # ---- C0p radius: same UPDATED centroids, but restricted to FIXED cores ----
+        mask_core_fixed_t = torch.from_numpy(core_mask_fixed_np).to(radii_cp_cur.device) & mask_non_noise
+        if mask_core_fixed_t.any():
+            r_c0p_mean = float(radii_cp_cur[mask_core_fixed_t].mean().item())
+        else:
+            r_c0p_mean = float("nan")
+
+        rec = {
+            "frac_removed": frac_removed,
+            "removed_edges": removed_edges,
+            "radius_cp_mean": r_cp_mean,
+            "radius_cp_median": r_cp_med,
+            f"radius_c0p_a{alpha_c0p}_g{gamma_c0p}": r_c0p_mean,
+        }
+
+        # ---- Link prediction metrics ----
+        val_roc, val_ap, val_hit = get_scores(
+            dataset_str, val_edges, val_edges_false, A_pred, adj_orig
+        )
+        test_roc, test_ap, test_hit = get_scores(
+            dataset_str, test_edges, test_edges_false, A_pred, adj_orig
+        )
+
+        rec.update({
+            "val_roc": float(val_roc),
+            "val_ap": float(val_ap),
+            "val_hit1": float(val_hit[0]),
+            "val_hit3": float(val_hit[1]),
+            "val_hit10": float(val_hit[2]),
+            "test_roc": float(test_roc),
+            "test_ap": float(test_ap),
+            "test_hit1": float(test_hit[0]),
+            "test_hit3": float(test_hit[1]),
+            "test_hit10": float(test_hit[2]),
+        })
+
+        print(f"[CP-SWEEP] frac={frac_removed:.3f} "
+              f"cp_r={r_cp_mean:.4f} "
+              f"test_hit@3={rec['test_hit3']:.4f} test_hit@10={rec['test_hit10']:.4f}")
+        results.append(rec)
+
+    # 0% removed baseline
+    _eval_current(removed_edges=0)
+
+    # ---- Greedy deletions in ranked order ----
+    removed = 0
+    for i, j in pairs:
+        if removed >= max_remove:
+            break
+        i = int(i); j = int(j)
+        if g_np[i, j] == 0.0:
+            continue
+        if enforce_floor and (deg[i] <= degree_floor or deg[j] <= degree_floor):
+            continue
+
+        # remove undirected edge
+        g_np[i, j] = 0.0
+        g_np[j, i] = 0.0
+        deg[i] -= 1
+        deg[j] -= 1
+        removed += 1
+
+        if removed % step_edges == 0 or removed == max_remove:
+            _eval_current(removed_edges=removed)
+
+    # ---- Save CSV (include sweep_scope in name) ----
+    if out_dir is None:
+        out_dir = os.path.join("logs", "c0p_sweep", dataset_str)
+    os.makedirs(out_dir, exist_ok=True)
+    tag_seed = seed if seed is not None else -1
+    tag = f"{dataset_str}_{ver}_{sweep_scope}_seed{tag_seed}_idx{run_tag}"
+    out_path = os.path.join(out_dir, f"{tag}.csv")
+    pd.DataFrame(results).to_csv(out_path, index=False)
+    print(f"[CP-SWEEP] saved curve to {out_path}")
+    return results
+

@@ -116,6 +116,13 @@ parser.add_argument(
     default=0.10,   # 0.10 = 移除 outlier 的同群內邊 10%；設 0 可關閉
     help="For outlier nodes (non-core with radius > thr), drop this fraction of INTRA-cluster edges to compact C0p (0 disables)."
 )
+parser.add_argument(
+    "--sweep_scope",
+    type=str,
+    default="cp_all",
+    choices=["cp_all", "c0p_only", "cp_minus_c0p"],
+    help="Edge-candidate scope for offline sweep after training."
+)
 
 parser.add_argument("--restricted", action="store_true")
 parser.add_argument("--restrict_alpha", type=float, default=0.8)
@@ -211,6 +218,7 @@ def main():
         restrict_alpha=args.restrict_alpha,
         restrict_gamma=args.restrict_gamma,
         c0p_prune_frac=args.c0p_prune_frac,
+        sweep_scope=args.sweep_scope,
         seed=args.seed,
     )
 

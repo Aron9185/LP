@@ -2,22 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Plot per-epoch compactness (radius) and hit rates (Hit@3/Hit@10) for each run.
+Parse ARON remove-only logs to extract per-epoch radius & performance trends,
+plot them per run, and write per-run CSVs + an overall summary.
 
-Example:
-  python tools/plot_epoch_trends.py \
+USAGE EXAMPLE:
+  python tools/parse_trends.py \
     --log-dirs logs/1108 logs/1109 \
     --radius-dir logs/radius \
     --out-dir plots/remove_only \
     --glob "*.log" \
-    --include-splits VAL
+    --save-per-run-csv
 
-Outputs per run (under out-dir/{dataset}/{scope}/):
-  - {dataset}_{ver}_seed{seed}_idx{idx}_trend.csv
-  - {dataset}_{ver}_seed{seed}_idx{idx}_radius.png
-  - {dataset}_{ver}_seed{seed}_idx{idx}_hits.png
-And an overall index:
-  - {out-dir}/per_run_summary.csv
+Notes:
+- Expected radius CSV path for a run:
+    {radius_dir}/{dataset}_{ver}_seed{seed}_idx{idx}.csv
+  with columns: epoch,radius_mean,added,removed,mod_ratio
+- If the radius CSV is missing, we fallback to parsing lines like:
+    "[RADIUS] epoch=123 mean=0.612345"
+- Performance series are parsed from lines like:
+    "[VAL] ... Hit@K: 1=..., 3=..., 10=..."
+  Final and "best" are parsed from:
+    "[FINAL TEST] Hit@K: ..."
+    "best hit@3 epoch = 55, hit@3 = 0.5197"
 """
 
 import argparse, re, sys
@@ -27,71 +33,77 @@ from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ------------------ meta block in logs ------------------
+# ----------------------------- meta block (optional) -----------------------------
 META_START = re.compile(r"^=+ RUN META =+\s*$")
 META_END   = re.compile(r"^=+\s*$")
 RE_FIELD = {
     "dataset": re.compile(r"\bdataset\s*=\s*([A-Za-z0-9_.-]+)"),
     "ver":     re.compile(r"\bver\s*=\s*([A-Za-z0-9_.-]+)"),
+    "mode":    re.compile(r"\bmode\s*=\s*([A-Za-z0-9_.-]+)"),
     "seed":    re.compile(r"\bseed\s*=\s*([0-9]+)"),
     "idx":     re.compile(r"\bidx\s*=\s*([0-9]+)"),
 }
 
-# ------------------ filename fallback ------------------
-RE_FNAME = re.compile(
+# ----------------------------- filename patterns (your style) -----------------------------
+RE_FNAME_SIMPLE = re.compile(
     r"""^
     (?P<dataset>[A-Za-z0-9_]+)_
     (?P<ver>remove_only_[^_]+(?:_[^_]+)*)_
-    .*?seed(?P<seed>\d+).*?_idx(?P<idx>\d+).*?\.log$
-    """, re.X
+    .*?
+    seed(?P<seed>\d+).*?
+    _idx(?P<idx>\d+)
+    .*?\.log$
+    """,
+    re.X
 )
 
-# scope/frac from ver
+# Scope/frac parser
 RE_VER = re.compile(r"^remove_only_(intra|inter|both)(?:_(c0p|noncore|cp))?(?:_frac([0-9]*\.?[0-9]+))?$")
 
-# ------------------ in-body patterns ------------------
-RE_RADIUS = re.compile(r"\[RADIUS\]\s*epoch\s*=\s*(\d+)\s*mean\s*=\s*([0-9]*\.?[0-9]+)")
-RE_HITK   = re.compile(r"\[(VAL|TEST|FINAL TEST)\][^\n]*Hit@K\s*:\s*(.+)", re.I)
-RE_PAIR   = re.compile(r"(\d+)\s*=\s*([0-9]*\.?[0-9]+)")
+# ----------------------------- in-body patterns -----------------------------
+RE_RADIUS_LINE = re.compile(r"\[RADIUS\]\s*epoch\s*=\s*(\d+)\s*mean\s*=\s*([0-9]*\.?[0-9]+)")
+RE_BUDGET_LINE = re.compile(r"\[BUDGET\].*add/remove this epoch\s*=\s*(\d+)\s*/\s*(\d+)", re.I)
 
-# epoch trackers that appear in many formats
-RE_EPOCH_INLINE = [
-    re.compile(r"\bepoch\s*[:=]\s*(\d+)", re.I),
-    re.compile(r"\bEpoch\s*[:# ]\s*(\d+)", re.I),
-    re.compile(r"\[ep(?:och)?\s*=?\s*(\d+)\]", re.I),
-]
+RE_HIT_LINE    = re.compile(r"\[(VAL|TEST|FINAL TEST)\][^\n]*Hit@K\s*:\s*(.+)", re.I)
+RE_PAIR        = re.compile(r"(\d+)\s*=\s*([0-9]*\.?[0-9]+)")
+RE_BEST_H3     = re.compile(r"best\s+hit@?3\s+epoch\s*=\s*(\d+)\s*,\s*hit@?3\s*=\s*([0-9]*\.?[0-9]+)", re.I)
+RE_BEST_H10    = re.compile(r"best\s+hit@?10\s+epoch\s*=\s*(\d+)\s*,\s*hit@?10\s*=\s*([0-9]*\.?[0-9]+)", re.I)
 
-def _read_text(p: Path) -> Optional[str]:
+# ----------------------------- helpers -----------------------------
+def _read_text(path: Path) -> Optional[str]:
     try:
-        return p.read_text(encoding="utf-8", errors="ignore")
+        return path.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
-        print(f"[READ-ERR] {p}: {e}", file=sys.stderr)
+        print(f"[READ-ERR] {path}: {e}", file=sys.stderr)
         return None
 
-def _to_fraction(s: str) -> Optional[float]:
+def _to_fraction(val_str: str) -> Optional[float]:
     try:
-        v = float(s)
+        v = float(val_str)
     except:
         return None
-    if 1.0 < v <= 100.0:  # tolerate percents
-        v /= 100.0
+    if 1.0 < v <= 100.0:
+        v = v / 100.0
     return v
 
 def _extract_meta_block(text: str) -> Dict[str, Any]:
-    meta = {}
-    inb, buf = False, []
-    for ln in text.splitlines():
+    meta: Dict[str, Any] = {}
+    lines = text.splitlines()
+    in_block, buf = False, []
+    for ln in lines:
         if META_START.search(ln):
-            inb, buf = True, []
+            in_block, buf = True, []
             continue
-        if inb and META_END.search(ln):
+        if in_block and META_END.search(ln):
             joined = "\n".join(buf)
             for k, pat in RE_FIELD.items():
                 m = pat.search(joined)
-                if m: meta[k] = m.group(1)
+                if m:
+                    meta[k] = m.group(1)
             break
-        if inb:
+        if in_block:
             buf.append(ln)
+    # Cast
     for k in ("seed","idx"):
         if k in meta:
             try: meta[k] = int(meta[k])
@@ -99,95 +111,118 @@ def _extract_meta_block(text: str) -> Dict[str, Any]:
     return meta
 
 def _parse_from_fname(name: str) -> Dict[str, Any]:
-    d = {}
-    m = RE_FNAME.match(name)
+    d: Dict[str, Any] = {}
+    m = RE_FNAME_SIMPLE.match(name)
     if m:
-        d = m.groupdict()
+        d.update({k: m.group(k) for k in m.groupdict().keys()})
         for k in ("seed","idx"):
-            d[k] = int(d[k])
+            if k in d:
+                try: d[k] = int(d[k])
+                except: pass
     return d
 
-def _scope_from_ver(ver: Optional[str]) -> Optional[str]:
-    if not ver: return None
+def _parse_scope_frac(ver: Optional[str]) -> Tuple[Optional[str], Optional[float]]:
+    if not ver:
+        return None, None
     m = RE_VER.match(ver)
-    if m: return m.group(2) or None
-    for s in ("c0p","noncore","cp"):
-        if f"_{s}" in ver: return s
-    return None
+    if not m:
+        # fallback: scan tokens
+        scope = None
+        for s in ("c0p","noncore","cp"):
+            if f"_{s}" in ver:
+                scope = s
+                break
+        frac = None
+        mf = re.search(r"_frac([0-9]*\.?[0-9]+)", ver)
+        if mf: frac = float(mf.group(1))
+        return scope, frac
+    scope = m.group(2) or None
+    frac = float(m.group(3)) if m.group(3) else None
+    return scope, frac
 
 def _expected_radius_csv(radius_dir: Path, dataset: str, ver: str, seed: int, idx: int) -> Path:
-    return radius_dir / f"{dataset}_{ver}_seed{seed}_idx{idx}.csv"
+    name = f"{dataset}_{ver}_seed{seed}_idx{idx}.csv"
+    return radius_dir / name
 
-def _load_radius_series(radius_csv: Path, log_text: str) -> pd.DataFrame:
-    if radius_csv.exists():
-        try:
-            df = pd.read_csv(radius_csv)
-            # require at least epoch & radius_mean
-            if not {"epoch","radius_mean"}.issubset(df.columns):
-                raise ValueError("missing epoch/radius_mean in radius CSV")
-            for c in ("added","removed","mod_ratio"):
-                if c not in df.columns: df[c] = pd.NA
-            return df[["epoch","radius_mean","added","removed","mod_ratio"]].copy()
-        except Exception as e:
-            print(f"[WARN] bad radius CSV {radius_csv}: {e}")
-
-    # fallback: parse from log
-    rows = []
-    for m in RE_RADIUS.finditer(log_text):
-        rows.append({"epoch": int(m.group(1)), "radius_mean": float(m.group(2))})
-    if not rows:
-        return pd.DataFrame(columns=["epoch","radius_mean","added","removed","mod_ratio"])
-    df = pd.DataFrame(rows).sort_values("epoch")
-    df["added"] = pd.NA
-    df["removed"] = pd.NA
-    df["mod_ratio"] = pd.NA
-    return df
-
-def _parse_hits_with_epoch(text: str, include_splits: List[str]) -> pd.DataFrame:
+def _parse_hit_series(text: str) -> pd.DataFrame:
     """
-    Attach epoch to each Hit@K line. We keep a rolling 'current_epoch' updated
-    whenever a line contains something like 'epoch=12', 'Epoch 12', or '[ep=12]'.
+    Returns a dataframe with columns: step, split, hit1, hit3, hit10
+    'step' is an increasing counter when epoch index cannot be recovered.
     """
     rows = []
-    current_epoch: Optional[int] = None
-    for ln in text.splitlines():
-        # update epoch cursor if the line mentions an epoch
-        for rx in RE_EPOCH_INLINE:
-            me = rx.search(ln)
-            if me:
-                try:
-                    current_epoch = int(me.group(1))
-                except:
-                    pass
-                break
-
-        mh = RE_HITK.search(ln)
-        if not mh:
-            continue
-        split = mh.group(1).upper()
-        if include_splits and split not in include_splits:
-            continue
-
-        payload = mh.group(2)
+    step = 0
+    for m in RE_HIT_LINE.finditer(text):
+        split = m.group(1).upper()  # VAL / TEST / FINAL TEST
+        payload = m.group(2)
         pairs = dict((k, _to_fraction(v)) for k, v in RE_PAIR.findall(payload))
         rows.append({
-            "epoch": current_epoch,  # may be None if your log never prints epochs with hits
+            "step": step,
             "split": split,
             "hit1": pairs.get("1"),
             "hit3": pairs.get("3"),
             "hit10": pairs.get("10"),
         })
+        step += 1
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["step","split","hit1","hit3","hit10"])
+
+def _parse_best_markers(text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    m3 = RE_BEST_H3.findall(text)
+    if m3:
+        out["best_hit3_epoch"] = int(m3[-1][0])
+        out["best_hit3"] = _to_fraction(m3[-1][1])
+    m10 = RE_BEST_H10.findall(text)
+    if m10:
+        out["best_hit10_epoch"] = int(m10[-1][0])
+        out["best_hit10"] = _to_fraction(m10[-1][1])
+    return out
+
+def _parse_radius_from_log(text: str) -> pd.DataFrame:
+    rows = []
+    # try to also collect add/remove if available
+    budget_rows: Dict[int, Tuple[int,int]] = {}
+    # pre-pass for budget lines
+    for b in RE_BUDGET_LINE.finditer(text):
+        # These lines often appear once per epoch, but may not include epoch.
+        # We'll attach them later if counts match rows length; otherwise leave NaN.
+        pass
+
+    for m in RE_RADIUS_LINE.finditer(text):
+        epoch = int(m.group(1))
+        r     = float(m.group(2))
+        rows.append({"epoch": epoch, "radius_mean": r})
 
     df = pd.DataFrame(rows)
-    # If epochs are missing, try to backfill by order (0..N-1)
-    if not df.empty and df["epoch"].isna().all():
-        df = df.reset_index(drop=True)
-        df["epoch"] = df.index  # best effort fallback
+    if df.empty:
+        return pd.DataFrame(columns=["epoch","radius_mean","added","removed","mod_ratio"])
+
+    # added/removed per-epoch are only guaranteed in CSV; leave NaN if unknown
+    df["added"] = pd.NA
+    df["removed"] = pd.NA
+    df["mod_ratio"] = pd.NA
     return df
+
+def _load_radius_series(radius_csv: Path, log_text: str) -> pd.DataFrame:
+    if radius_csv.exists():
+        try:
+            df = pd.read_csv(radius_csv)
+            need_cols = {"epoch","radius_mean"}
+            if not need_cols.issubset(set(df.columns)):
+                raise ValueError("radius CSV missing required columns")
+            # Make sure added/removed/mod_ratio exist
+            for c in ("added","removed","mod_ratio"):
+                if c not in df.columns:
+                    df[c] = pd.NA
+            return df
+        except Exception as e:
+            print(f"[WARN] bad radius CSV {radius_csv}: {e}")
+    # fallback to parse from log
+    return _parse_radius_from_log(log_text)
 
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
+# ----------------------------- plotting helpers -----------------------------
 def _plot_radius(df_r: pd.DataFrame, title: str, out_png: Path):
     plt.figure()
     if not df_r.empty:
@@ -199,31 +234,42 @@ def _plot_radius(df_r: pd.DataFrame, title: str, out_png: Path):
     plt.savefig(out_png, dpi=160)
     plt.close()
 
-def _plot_hits(df_h: pd.DataFrame, title: str, out_png: Path):
+def _plot_perf(df_p: pd.DataFrame, title: str, out_png: Path):
     plt.figure()
-    if not df_h.empty:
-        # draw lines for hit@3 and hit@10 (VAL/TEST merged if both included)
-        # aggregate by epoch taking the last value seen per epoch
-        g = df_h.groupby("epoch", as_index=False).agg({"hit3":"last","hit10":"last"})
-        if not g.empty:
-            plt.plot(g["epoch"], g["hit3"], label="Hit@3")
-            plt.plot(g["epoch"], g["hit10"], label="Hit@10")
+    if not df_p.empty:
+        # If we have VAL steps, draw VAL hit@3 and hit@10 as lines by step
+        df_val = df_p[df_p["split"]=="VAL"]
+        if not df_val.empty:
+            plt.plot(df_val["step"], df_val["hit3"], label="VAL Hit@3")
+            plt.plot(df_val["step"], df_val["hit10"], label="VAL Hit@10")
+        # Always mark FINAL TEST if present
+        df_fin = df_p[df_p["split"]=="FINAL TEST"]
+        if not df_fin.empty:
+            # mark the last final test hit@3/10 as horizontal lines
+            h3 = df_fin["hit3"].dropna().iloc[-1] if df_fin["hit3"].notna().any() else None
+            h10 = df_fin["hit10"].dropna().iloc[-1] if df_fin["hit10"].notna().any() else None
+            if h3 is not None:
+                plt.axhline(h3, linestyle="--", label=f"FINAL Hit@3={h3:.3f}")
+            if h10 is not None:
+                plt.axhline(h10, linestyle="--", label=f"FINAL Hit@10={h10:.3f}")
+        # Legend only if something was drawn
+        if not df_val.empty or not df_fin.empty:
             plt.legend()
-    plt.xlabel("epoch")
+    plt.xlabel("step (VAL eval order)")
     plt.ylabel("Hit@K")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(out_png, dpi=160)
     plt.close()
 
+# ----------------------------- main -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--log-dirs", nargs="+", required=True)
     ap.add_argument("--glob", type=str, default="*.log")
     ap.add_argument("--radius-dir", type=str, default="logs/radius")
     ap.add_argument("--out-dir", type=str, default="plots/remove_only")
-    ap.add_argument("--include-splits", nargs="+", default=["VAL"], help="Which splits to use for epoch curves (e.g., VAL TEST)")
-    ap.add_argument("--save-merged-csv", action="store_true")
+    ap.add_argument("--save-per-run-csv", action="store_true")
     args = ap.parse_args()
 
     radius_dir = Path(args.radius_dir)
@@ -231,93 +277,101 @@ def main():
     _ensure_dir(out_dir)
 
     summary_rows: List[Dict[str, Any]] = []
-    total_logs = 0
-    processed  = 0
 
-    for d in args.log_dirs:
+    total_logs = 0
+    processed = 0
+
+    for d in args.log-dirs if hasattr(args, "log-dirs") else args.log_dirs:  # argparse hyphen fix
         base = Path(d)
         if not base.exists():
             print(f"[WARN] missing log dir: {d}")
             continue
         hits = list(base.rglob(args.glob))
         total_logs += len(hits)
-
         for p in sorted(hits):
             txt = _read_text(p)
             if txt is None:
                 continue
 
             meta_blk = _extract_meta_block(txt)
-            fmeta    = _parse_from_fname(p.name)
+            fname    = _parse_from_fname(p.name)
 
-            dataset = meta_blk.get("dataset") or fmeta.get("dataset")
-            ver     = meta_blk.get("ver") or fmeta.get("ver")
-            seed    = meta_blk.get("seed") if "seed" in meta_blk else fmeta.get("seed")
-            idx     = meta_blk.get("idx")  if "idx" in meta_blk  else fmeta.get("idx")
+            dataset = meta_blk.get("dataset") or fname.get("dataset")
+            ver     = meta_blk.get("ver") or fname.get("ver")
+            seed    = meta_blk.get("seed") if "seed" in meta_blk else fname.get("seed")
+            idx     = meta_blk.get("idx")  if "idx" in meta_blk  else fname.get("idx")
+
             if not dataset or not ver or seed is None or idx is None:
+                # Not a remove-only run (or malformed)
                 continue
 
-            scope = _scope_from_ver(ver) or "NA"
+            scope, frac_hint = _parse_scope_frac(ver)
             run_tag = f"{dataset}_{ver}_seed{seed}_idx{idx}"
-            run_dir = out_dir / dataset / scope
+            run_dir = out_dir / dataset / (scope or "NA")
             _ensure_dir(run_dir)
 
             # radius series
             r_csv = _expected_radius_csv(radius_dir, dataset, ver, seed, idx)
-            df_r = _load_radius_series(r_csv, txt).copy()
-            # performance series (per-epoch)
-            df_h = _parse_hits_with_epoch(txt, include_splits=[s.upper() for s in args.include_splits]).copy()
+            df_r = _load_radius_series(r_csv, txt)
 
-            # Merge by epoch (outer join), keep last seen hit per epoch
-            if not df_h.empty:
-                df_h_last = df_h.sort_values("epoch").groupby("epoch", as_index=False).last()
-            else:
-                df_h_last = pd.DataFrame(columns=["epoch","split","hit1","hit3","hit10"])
+            # performance series
+            df_p = _parse_hit_series(txt)
+            best_marks = _parse_best_markers(txt)
 
-            merged = pd.merge(df_r, df_h_last[["epoch","hit3","hit10"]], on="epoch", how="outer").sort_values("epoch")
+            # save per-run merged csv if requested
+            if args.save_per_run_csv:
+                merged_csv = run_dir / f"{run_tag}_trend.csv"
+                # Merge on nearest step/epoch is undefined; we keep separate tabs by writing two CSVs
+                df_r.to_csv(run_dir / f"{run_tag}_radius.csv", index=False)
+                df_p.to_csv(run_dir / f"{run_tag}_perf.csv", index=False)
 
-            # Save per-run merged CSV if requested
-            if args.save_merged_csv:
-                merged.to_csv(run_dir / f"{run_tag}_trend.csv", index=False)
+            # plots
+            _plot_radius(df_r, title=f"{run_tag} — radius", out_png=run_dir / f"{run_tag}_radius.png")
+            _plot_perf(df_p, title=f"{run_tag} — performance", out_png=run_dir / f"{run_tag}_perf.png")
 
-            # Plots
-            _plot_radius(merged.dropna(subset=["epoch"]), title=f"{run_tag} — radius", out_png=run_dir / f"{run_tag}_radius.png")
-            _plot_hits(merged.dropna(subset=["epoch"]), title=f"{run_tag} — Hit@K", out_png=run_dir / f"{run_tag}_hits.png")
-
-            # Summary row
-            start_r = float(merged["radius_mean"].dropna().iloc[0]) if merged["radius_mean"].notna().any() else None
-            end_r   = float(merged["radius_mean"].dropna().iloc[-1]) if merged["radius_mean"].notna().any() else None
+            # summary stats for this run
+            start_r = float(df_r["radius_mean"].iloc[0]) if not df_r.empty else None
+            end_r   = float(df_r["radius_mean"].iloc[-1]) if not df_r.empty else None
             delta_r = (end_r - start_r) if (start_r is not None and end_r is not None) else None
-            n_ep_r  = int(merged["radius_mean"].notna().sum())
-            n_ep_h  = int((merged["hit3"].notna() | merged["hit10"].notna()).sum())
 
             total_removed = None
-            if "removed" in merged.columns and merged["removed"].notna().any():
+            if "removed" in df_r.columns and df_r["removed"].notna().any():
                 try:
-                    total_removed = int(pd.to_numeric(merged["removed"], errors="coerce").fillna(0).sum())
+                    total_removed = int(pd.to_numeric(df_r["removed"], errors="coerce").fillna(0).sum())
                 except Exception:
                     total_removed = None
 
-            summary_rows.append({
+            final_row = df_p[df_p["split"]=="FINAL TEST"].tail(1)
+            final_h3 = float(final_row["hit3"].iloc[0]) if not final_row.empty and final_row["hit3"].notna().any() else None
+            final_h10 = float(final_row["hit10"].iloc[0]) if not final_row.empty and final_row["hit10"].notna().any() else None
+
+            rec = {
                 "dataset": dataset,
-                "scope": scope,
                 "ver": ver,
+                "scope": scope,
+                "frac_hint": frac_hint,
                 "seed": seed,
                 "idx": idx,
                 "log_file": str(p),
                 "radius_csv": str(r_csv),
-                "epochs_with_radius": n_ep_r,
-                "epochs_with_hits": n_ep_h,
                 "start_radius": start_r,
                 "end_radius": end_r,
                 "delta_radius": delta_r,
                 "total_removed": total_removed,
-            })
+                "final_hit3": final_h3,
+                "final_hit10": final_h10,
+                "best_hit3": best_marks.get("best_hit3"),
+                "best_hit3_epoch": best_marks.get("best_hit3_epoch"),
+                "best_hit10": best_marks.get("best_hit10"),
+                "best_hit10_epoch": best_marks.get("best_hit10_epoch"),
+            }
+            summary_rows.append(rec)
             processed += 1
 
     summary = pd.DataFrame(summary_rows)
-    summary.to_csv(out_dir / "per_run_summary.csv", index=False)
-    print(f"[DONE] scanned={total_logs} | processed={processed} | summary={out_dir/'per_run_summary.csv'}")
+    summ_path = out_dir / "per_run_summary.csv"
+    summary.to_csv(summ_path, index=False)
+    print(f"[DONE] scanned={total_logs} | processed={processed} | summary={summ_path}")
 
 if __name__ == "__main__":
     pd.set_option("display.width", 160)

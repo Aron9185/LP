@@ -4,6 +4,7 @@ import math
 import numpy as np
 import networkx as nx
 import scipy.sparse as sp
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +30,14 @@ from input_data import CalN2V
 
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import Optional, Tuple
+
+# # ---- side experiment: offline C0p "remove until done" curve ----
+# # 要跑這個實驗的時候把這個改成 True，就會在 train 結束後多跑一趟 sweep
+# ENABLE_C0P_SWEEP = False
+
+# # 每次評估的步長 & 最大刪除比例（以「intra-cluster C0p 邊的數量」為基準）
+# C0P_SWEEP_STEP_FRAC = 0.001   # 每刪掉 1% 的 intra C0p 邊評一次
+# C0P_SWEEP_MAX_FRAC  = 1.0    # 最多刪到 100% 的 intra C0p 邊
 
 # --- dense helper: works for both sparse and dense tensors
 def _to_dense(A: torch.Tensor) -> torch.Tensor:
@@ -82,6 +91,9 @@ def train_encoder(
     restrict_gamma: float = 1.0,
     # c0p pruning (removals that also consume the budget)
     c0p_prune_frac: float = 0.0,
+    # ===== NEW: online prune knobs (scope is encoded in `ver=prune_*`) =====
+    prune_step_frac: float = 0.01, # 0.1% of candidates pruned per epoch
+    prune_max_frac:  float = 1.0,     # up to 100% of candidates in total
     **kwargs,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor]:
     """
@@ -215,7 +227,138 @@ def train_encoder(
 
     # store validation Hit@K per epoch (each entry is a list of 6 floats)
     val_hit_history = []
-        
+    
+    # --- PRUNE sweep logging state & helper (for ver starting with "prune_") ---
+    prune_state = None
+
+    # --- sweep-style CSV logger for prune_* versions (NOW uses CURRENT Z + drop orphan nodes) ---
+    def _append_prune_sweep_row(
+        Z_cur: torch.Tensor,
+        val_roc: float, val_ap: float, val_hit: list,
+        test_roc: float, test_ap: float, test_hit: list,
+    ):
+        """
+        Append one sweep-style row using the *CURRENT* embedding Z_cur
+        + FIXED GMM labels.
+
+        New behavior:
+          - Nodes with label=-1 are ignored.
+          - Nodes that have NO intra-cluster neighbors in the *current* graph
+            are also ignored for CP/C0p radius (treated as removed from CP).
+        """
+        if prune_state is None:
+            return
+
+        # 1) Current Z and labels
+        Z_cur = Z_cur.detach()
+        labels_np: np.ndarray = prune_state["labels"]      # shape [N], -1 for noise
+        device = Z_cur.device
+
+        # 2) Per-node radii r[i] = 1 - cos( x_i, c_{label(i)} ) for current Z_cur
+        radii_cp_all: torch.Tensor = _cosine_radii_to_centroid(Z_cur, labels_np)  # [N]
+        lbl_t = torch.from_numpy(labels_np.astype(np.int64)).to(device)
+        mask_non_noise: torch.Tensor = (lbl_t != -1)
+
+        # 3) Compute which nodes still have ≥1 *real* intra-cluster neighbor
+        #    (ignore self-loops) using the current graph after pruning.
+        g_now = adj_label.to_dense().to(device)  # [N,N], with diag=1
+        g_now = g_now.clone()
+        g_now.fill_diagonal_(0)                  # <-- critical: do NOT count self-loop
+
+        same = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+        intra = (g_now > 0) & same
+        deg_intra = intra.sum(dim=1)                # [N]
+        has_intra = (deg_intra > 0)                 # bool [N]
+
+        # valid CP nodes: non-noise AND still have at least one intra-cluster neighbor
+        mask_valid_cp = mask_non_noise & has_intra
+
+        # ---- CP radius stats (node-level, after dropping orphan nodes) ----
+        if mask_valid_cp.any():
+            cp_vals = radii_cp_all[mask_valid_cp]
+        else:
+            # fallback: if all nodes lost intra neighbors, use all nodes to avoid NaNs
+            cp_vals = radii_cp_all
+
+        r_cp_mean = float(cp_vals.mean().item())
+        r_cp_med  = float(cp_vals.median().item())
+
+        # tail-sensitive stats
+        try:
+            r_cp_p90 = float(torch.quantile(cp_vals, 0.90).item())
+        except Exception:
+            r_cp_p90 = float(
+                np.quantile(cp_vals.detach().cpu().numpy(), 0.90)
+            )
+        r_cp_max = float(cp_vals.max().item())
+
+        # ---- C0p core selection on CURRENT graph degrees (excl self) ----
+        deg_now = _deg_excl_self(g_now)  # [N], excl self
+
+        core_now, _, _, _ = select_gmm_cores(
+            Z_cur, labels_np, degrees_excl_self=deg_now,
+            alpha=prune_state["alpha"], gamma=prune_state["gamma"],
+            B=Z_cur.size(1),
+        )
+        # core nodes that are also valid CP nodes (non-noise + have intra neighbors)
+        mask_core_now = core_now.bool().to(device) & mask_valid_cp
+
+        if mask_core_now.any():
+            c0p_vals   = radii_cp_all[mask_core_now]
+            r_c0p_mean = float(c0p_vals.mean().item())
+            try:
+                r_c0p_p90 = float(torch.quantile(c0p_vals, 0.90).item())
+            except Exception:
+                r_c0p_p90 = float(
+                    np.quantile(c0p_vals.detach().cpu().numpy(), 0.90)
+                )
+            r_c0p_max = float(c0p_vals.max().item())
+        else:
+            r_c0p_mean = float("nan")
+            r_c0p_p90  = float("nan")
+            r_c0p_max  = float("nan")
+
+        # 3) meta info for this sweep point
+        removed_edges = int(prune_state["removed"])
+        num_cand      = int(max(1, prune_state["num_cand"]))  # avoid /0
+        frac_removed  = removed_edges / float(num_cand)
+        c0p_key = f"radius_c0p_a{prune_state['alpha']:g}_g{prune_state['gamma']:g}"
+
+        # 4) compose row
+        row = {
+            "frac_removed": frac_removed,
+            "removed_edges": removed_edges,
+
+            # CP radius stats (current Z_cur, non-orphan nodes only)
+            "radius_cp_mean":   r_cp_mean,
+            "radius_cp_median": r_cp_med,
+            "radius_cp_p90":    r_cp_p90,
+            "radius_cp_max":    r_cp_max,
+
+            # C0p radius stats (current Z_cur + current degree, non-orphan)
+            c0p_key:            r_c0p_mean,
+            f"{c0p_key}_p90":   r_c0p_p90,
+            f"{c0p_key}_max":   r_c0p_max,
+
+            # metrics at this sweep point
+            "val_roc":   float(val_roc),
+            "val_ap":    float(val_ap),
+            "val_hit1":  float(val_hit[0]),
+            "val_hit3":  float(val_hit[1]),
+            "val_hit10": float(val_hit[2]),
+            "test_roc":   float(test_roc),
+            "test_ap":    float(test_ap),
+            "test_hit1":  float(test_hit[0]),
+            "test_hit3":  float(test_hit[1]),
+            "test_hit10": float(test_hit[2]),
+        }
+
+        prune_state["rows"].append(row)
+        prune_state["last_logged_removed"] = removed_edges
+
+
+
+
     # train model
     neighbors = {}
 
@@ -361,6 +504,72 @@ def train_encoder(
     print(f"[AUG-INIT] N={N} | E0={E0} | aug_ratio(global)={aug_ratio} | aug_bound(per-node)={aug_bound}")
     if frozen_scores is not None and frozen_scores.shape != (N, N):
         raise ValueError(f"frozen_scores shape {tuple(frozen_scores.shape)} != {(N,N)} for current dataset")
+    # -------------------- PRUNE INIT (for ver: prune_*) --------------------
+    prune_state = None
+    if isinstance(ver, str) and ver.startswith("prune_"):
+        print(f"[PRUNE] initializing '{ver}'")
+
+        # Base embedding on ORIGINAL train graph (edge_index) for ranking
+        with torch.no_grad():
+            Z_base = encoder(features, edge_index)
+
+        # Fixed GMM labels and fixed core mask from base Z
+        labels_fixed = gmm_labels(Z_base.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
+        deg_base = _deg_excl_self(adj_label.to_dense())
+        core_mask_fixed, _, _, _ = select_gmm_cores(
+            Z_base, labels_fixed, degrees_excl_self=deg_base,
+            alpha=restrict_alpha, gamma=restrict_gamma, B=Z_base.size(1)
+        )
+        core_t = core_mask_fixed.bool()
+        lbl_t  = torch.from_numpy(labels_fixed.astype(np.int64)).to(core_t.device)
+
+        # Candidates from CURRENT adj_label (with self-loops)
+        g0_dense  = adj_label.to_dense()
+        existing  = (g0_dense > 0)
+        same_cl   = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+        both_core = (core_t[:, None] & core_t[None, :])
+
+        if ver == "prune_cp_all":
+            cand = existing.clone()              # (includes inter; switch to &same_cl for intra-only)
+        elif ver == "prune_c0p_only":
+            cand = existing & same_cl & both_core
+        elif ver == "prune_cp_minus_c0p":
+            cand = existing & same_cl & (~both_core)
+        else:
+            raise ValueError(f"[PRUNE] unknown ver={ver}")
+
+        cand.fill_diagonal_(False)
+        ii, jj = cand.triu(1).nonzero(as_tuple=True)
+        num_cand = int(ii.numel())
+
+        if num_cand == 0:
+            print("[PRUNE] no candidates; disabling prune mode.")
+        else:
+            # Only record how many initial candidates we have; ranking will be done
+            # dynamically using CURRENT Z each time we prune.
+            step_edges = max(1, int(round(prune_step_frac * num_cand)))
+            max_remove = max(1, int(round(prune_max_frac  * num_cand)))
+
+            csv_dir  = os.path.join("logs", "c0p_sweep", dataset_str)
+            os.makedirs(csv_dir, exist_ok=True)
+            csv_path = os.path.join(csv_dir, f"{dataset_str}_{ver}_seed{seed}_idx{run_tag}.csv")
+
+            prune_state = {
+                "removed": 0,
+                "num_cand": num_cand,
+                "step": step_edges,
+                "max_remove": max_remove,
+                "labels": labels_fixed,                        # numpy
+                "core_mask": core_mask_fixed.bool().cpu().numpy(),
+                "alpha": float(restrict_alpha),
+                "gamma": float(restrict_gamma),
+                "rows": [],
+                "csv_dir": csv_dir,
+                "csv_path": csv_path,
+                "last_logged_removed": -1,
+            }
+
+            print(f"[PRUNE] candidates={num_cand} step={step_edges} max={max_remove}")
     
     best_val_roc = -float("inf")
     best_epoch = -1
@@ -913,6 +1122,126 @@ def train_encoder(
                     # optional: maintain `g` mirror like other branches
                     g = _to_dense(adj_label)
 
+            # ===== NEW: online prune family =====
+            elif ver.startswith("prune_"):
+                # measure radius BEFORE pruning this epoch (live radius plot, dropping orphan nodes)
+                try:
+                    if prune_state is not None and "labels" in prune_state:
+                        labels_np = prune_state["labels"]
+                        device_r  = Z.device
+
+                        # per-node radii for current Z
+                        radii_cur, _, _ = per_cluster_stats_diag(
+                            Z.detach(), labels_np, normalize_cosine=True
+                        )
+
+                        # current graph (after previous pruning), with self-loops
+                        g_now = adj_label.to_dense().to(device_r)
+                        g_now = g_now.clone()
+                        g_now.fill_diagonal_(0)   # <-- ignore self-loop
+
+                        lbl_t = torch.from_numpy(labels_np.astype(np.int64)).to(device_r)
+
+                        same = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+                        intra = (g_now > 0) & same
+                        deg_intra = intra.sum(dim=1)
+                        has_intra = (deg_intra > 0)
+
+                        mask_non_noise = (lbl_t != -1)
+                        mask_valid = mask_non_noise & has_intra
+
+                        if mask_valid.any():
+                            r_mean = float(radii_cur[mask_valid].mean().item())
+                        else:
+                            r_mean = float(radii_cur.mean().item())
+
+                        radius_hist.append(r_mean)
+                        radius_epoch_hist.append(epoch)
+                except Exception as e:
+                    print(f"[RADIUS|prune] skip logging due to error: {e}")
+
+
+                if (prune_state is None) or (prune_state["removed"] >= prune_state["max_remove"]):
+                    g = adj_label.to_dense()
+                    modification_ratio = 0.0
+                    added_this_epoch = 0
+                    removed_this_epoch = 0
+                else:
+                    # --- NEW: dynamic pruning using CURRENT Z & CURRENT graph ---
+                    g = adj_label.to_dense()
+                    drop_quota = min(
+                        prune_state["step"],
+                        prune_state["max_remove"] - prune_state["removed"],
+                    )
+
+                    if drop_quota <= 0:
+                        added_this_epoch = 0
+                        removed_this_epoch = 0
+                        modification_ratio = 0.0
+                    else:
+                        # 1) Build candidate mask on CURRENT graph
+                        labels_np = prune_state["labels"]           # fixed clusters
+                        core_np   = prune_state["core_mask"]        # fixed core mask
+                        device_r  = g.device
+
+                        lbl_t  = torch.from_numpy(labels_np.astype(np.int64)).to(device_r)
+                        core_t = torch.from_numpy(core_np.astype(np.bool_)).to(device_r)
+
+                        existing  = (g > 0)
+                        same_cl   = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+                        both_core = (core_t[:, None] & core_t[None, :])
+
+                        if ver == "prune_cp_all":
+                            cand = existing.clone()              # all edges
+                        elif ver == "prune_c0p_only":
+                            cand = existing & same_cl & both_core
+                        elif ver == "prune_cp_minus_c0p":
+                            cand = existing & same_cl & (~both_core)
+                        else:
+                            cand = existing.clone()              # fallback
+
+                        cand.fill_diagonal_(False)
+                        ii, jj = cand.triu(1).nonzero(as_tuple=True)
+
+                        if ii.numel() == 0:
+                            print("[PRUNE] no more candidate edges; stopping prune here.")
+                            added_this_epoch = 0
+                            removed_this_epoch = 0
+                            modification_ratio = 0.0
+                        else:
+                            # 2) Compute per-node radius from CURRENT Z
+                            radii_cur, _, _ = per_cluster_stats_diag(
+                                Z.detach(), labels_np, normalize_cosine=True
+                            )
+                            radii_cur = radii_cur.to(device_r)
+
+                            r_i = radii_cur[ii]
+                            r_j = radii_cur[jj]
+                            edge_score = torch.maximum(r_i, r_j)   # high-radius edges first
+
+                            order = torch.argsort(edge_score, descending=True)
+                            num_to_drop = min(drop_quota, int(order.numel()))
+                            sel = order[:num_to_drop]
+                            sel_i = ii[sel]
+                            sel_j = jj[sel]
+
+                            # 3) Drop those edges
+                            removed_this_epoch = 0
+                            for a, b in zip(sel_i.tolist(), sel_j.tolist()):
+                                if g[a, b] > 0:
+                                    g[a, b] = 0.0
+                                    g[b, a] = 0.0
+                                    removed_this_epoch += 1
+
+                            prune_state["removed"] += int(removed_this_epoch)
+                            added_this_epoch   = 0
+                            modification_ratio = removed_this_epoch / float(max(1, E0))
+
+                            adj_label = g  # reflect into training adjacency
+
+                aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
+                g = adj_label.to_dense()
+
             elif(ver=="no"):
                 g = adj_label.to_dense()
                 modification_ratio = 0
@@ -923,6 +1252,10 @@ def train_encoder(
                 )
                             
             aug_edge_index = g.to_sparse().indices()
+
+            # ★★ 只有 remove_only_* 和 prune_* 才更新 base view graph
+            if (ver.startswith("remove_only_")) or (ver.startswith("prune_")):
+                edge_index = aug_edge_index
             
             # Aron (for minimum node degree)
             # Node degree calculation (ignoring self-loops)
@@ -986,6 +1319,13 @@ def train_encoder(
         # track validation curve instead of test
         roc_history.append(val_roc)              # per-epoch val ROC
         val_hit_history.append([float(h) for h in val_hit])   # per-epoch val Hit@K
+        
+        # --- NEW: sweep-style logging for prune_* ---
+        if isinstance(ver, str) and ver.startswith("prune_") and (prune_state is not None):
+            if epoch % 10 == 0:
+                with torch.no_grad():
+                    if prune_state["last_logged_removed"] != int(prune_state["removed"]):
+                        _append_prune_sweep_row(Z, val_roc, val_ap, val_hit, test_roc, test_ap, test_hit)
 
         # val_acc, test_acc = logist_regressor_classification(device = device, Z = encoder.Z.clone().detach(), labels = labels, idx_train = idx_train, idx_val = idx_val, idx_test = idx_test)
         # print(f'Epoch: {epoch + 1}, train_loss= {loss.item():.4f}, train_acc= {train_acc:.4f}, val_roc= {val_roc:.4f}, val_ap= {val_ap:.4f}, test_roc= {test_roc:.4f}, test_ap= {test_ap:.4f}, time= {time.time() - t:.4f}')
@@ -1045,7 +1385,38 @@ def train_encoder(
                 print(f"[CKPT] Saved best-by-val ROC at epoch {epoch} -> {best_ckpt_path_runtime}")
             except Exception as e:
                 print(f"[CKPT] Warning: failed to save best checkpoint: {e}")
+                
+        # --------- OPTIONAL: offline C0p sweep with fixed encoder & fixed GMM ---------
+    # # side experiment：只在你開 ENABLE_C0P_SWEEP 時啟用
+    # if ENABLE_C0P_SWEEP and is_remove_only and (cluster_method == "gmm"):
+    #     # For offline sweep we don't enforce min-degree; we want to see the full curve
+    #     sweep_degree_floor = 0
+    #     print(f"[CP-SWEEP] start | ver={ver}, degree_floor={sweep_degree_floor} (no floor for sweep)")
 
+    #     _ = run_c0p_sweep_static(
+    #         dataset_str=dataset_str,
+    #         ver=ver,
+    #         seed=seed,
+    #         run_tag=str(run_tag),
+    #         device=device,
+    #         encoder=encoder,
+    #         features=features,
+    #         adj_train=adj_train,
+    #         adj_orig=adj_orig,
+    #         val_edges=val_edges,
+    #         val_edges_false=val_edges_false,
+    #         test_edges=test_edges,
+    #         test_edges_false=test_edges_false,
+    #         gmm_k=gmm_k,
+    #         gmm_tau=gmm_tau,
+    #         alpha_c0p=restrict_alpha,
+    #         gamma_c0p=restrict_gamma,
+    #         degree_floor=sweep_degree_floor,  # = 0 → enforce_floor=False
+    #         step_frac=C0P_SWEEP_STEP_FRAC,
+    #         max_frac=C0P_SWEEP_MAX_FRAC,
+    #         sweep_scope=sweep_scope,    # <-- NEW
+    #         out_dir=None,
+    #     )
 
     # print(f'best classification epoch = {best_classi_epoch+1}, val_acc = {best_acc:.3f}, test_acc = {best_test_acc:.3f}')
     print(f'best link prediction epoch = {best_link_epoch+1}, Val_roc = {best_roc:.3f}, val_ap = {best_ap:.3f}, test_roc = {best_test_roc:.3f}, test_ap = {best_test_ap:.3f}')
@@ -1090,9 +1461,31 @@ def train_encoder(
     print(f"Average minimum node degree {sum(minimum_node_degree_history) / len(minimum_node_degree_history)}")
     print(minimum_node_degree_history)
     
+    # ==================== PRUNE SWEEP CSV FINALIZE (online) ====================
+    try:
+        if isinstance(ver, str) and ver.startswith("prune_") and (prune_state is not None) and len(prune_state["rows"]) > 0:
+            df = pd.DataFrame(prune_state["rows"])
+            c0p_key = f"radius_c0p_a{prune_state['alpha']:g}_g{prune_state['gamma']:g}"
+            cols = [
+                "frac_removed","removed_edges",
+                "radius_cp_mean","radius_cp_median","radius_cp_p90","radius_cp_max",
+                c0p_key, f"{c0p_key}_p90", f"{c0p_key}_max",
+                "val_roc","val_ap","val_hit1","val_hit3","val_hit10",
+                "test_roc","test_ap","test_hit1","test_hit3","test_hit10",
+            ]
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = np.nan
+            df = df[cols]
+            os.makedirs(prune_state["csv_dir"], exist_ok=True)
+            df.to_csv(prune_state["csv_path"], index=False)
+            print(f"[PRUNE|SWEEP] saved online sweep CSV: {prune_state['csv_path']}")
+    except Exception as e:
+        print(f"[PRUNE|SWEEP] finalize failed: {e}")
+    
     # ==================== RADIUS HISTORY FINALIZE ====================
     try:
-        if len(radius_hist) > 0:
+        if (not (isinstance(ver, str) and ver.startswith("prune_"))) and (len(radius_hist) > 0):
             out_dir = os.path.join("logs", "radius")
             os.makedirs(out_dir, exist_ok=True)
 
@@ -1382,3 +1775,32 @@ def _deg_excl_self(adj_dense: torch.Tensor) -> torch.Tensor:
     # (faster & avoids creating a big diag tensor)
     deg = adj_dense.sum(dim=1)
     return (deg - torch.diag(adj_dense)).to(torch.long)
+
+@torch.no_grad()
+def _cosine_radii_to_centroid(Z: torch.Tensor, labels_np: np.ndarray) -> torch.Tensor:
+    """
+    Return per-node radii r[i] = 1 - cos( x_i, c_{label(i)} ), where x_i and the
+    cluster centroid c_k are L2-normalized. Noise nodes (label=-1) get 0 by default.
+    """
+    device = Z.device
+    X = F.normalize(Z, p=2, dim=1)                 # [N,d], unit vectors
+    labels_t = torch.from_numpy(labels_np).to(device=device, dtype=torch.long)
+    N, d = X.shape
+    radii = torch.zeros(N, device=device, dtype=Z.dtype)
+
+    valid = labels_t >= 0
+    if not torch.any(valid):
+        return radii  # all noise → zeros (harmless; caller can ignore via mask)
+
+    # compute normalized centroid per cluster
+    ks = torch.unique(labels_t[valid]).tolist()
+    for k in ks:
+        idx = (labels_t == k)
+        xk = X[idx]
+        if xk.numel() == 0:
+            continue
+        ck = F.normalize(xk.mean(dim=0, keepdim=True), p=2, dim=1)  # [1,d]
+        # cosine similarity to centroid
+        cos = (xk @ ck.t()).squeeze(1)                              # [nk]
+        radii[idx] = 1.0 - cos                                      # [nk]
+    return radii
