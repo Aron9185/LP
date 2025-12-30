@@ -14,6 +14,7 @@ from input_data import load_data
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 from utils import Plot, Visualize, Visualize_with_edge, gaussion_KDE, vMF_KDE
 import os
+import random
 
 parser = argparse.ArgumentParser()
 # parser.add_argument('--model', type=str, default='gcn_vae', help="models used")
@@ -128,6 +129,21 @@ parser.add_argument("--restricted", action="store_true")
 parser.add_argument("--restrict_alpha", type=float, default=0.8)
 parser.add_argument("--restrict_gamma", type=float, default=1.0)
 
+# === NEW: static pre-prune knobs ===
+parser.add_argument(
+    "--pre_prune_frac",
+    type=float,
+    default=0.0,
+    help="Static pre-prune: fraction of candidate edges to drop BEFORE training (0 disables).",
+)
+parser.add_argument(
+    "--pre_prune_scope",
+    type=str,
+    default="cp_all",
+    choices=["cp_all", "c0p_only", "cp_minus_c0p"],
+    help="Scope for static pre-prune (cp_all / c0p_only / cp_minus_c0p).",
+)
+
 parser.add_argument("--run_tag", type=str, default="", help="Optional run identifier tag (used for log naming)")
 parser.add_argument("--sweep_mode", action="store_true",
     help="Do NOT hijack stdout/stderr; print metrics to stdout so external runners can capture. Also disables tqdm.")
@@ -137,13 +153,17 @@ parser.add_argument("--sweep_mode", action="store_true",
 args = parser.parse_args()
 
 
-def set_random_seed(seed):
+def set_random_seed(seed: int):
+    random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(1)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(1)
-        torch.cuda.manual_seed_all(1)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
+    # If you use cudnn anywhere, this helps reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def main():
     print(f"Dataset: {args.dataset}")
@@ -214,13 +234,13 @@ def main():
         cluster_method=args.cluster_method,
         cluster_mode=args.cluster_mode,
         # NEW: restricted augmentation knobs
-        restricted=args.restricted,
-        restrict_alpha=args.restrict_alpha,
         restrict_gamma=args.restrict_gamma,
         c0p_prune_frac=args.c0p_prune_frac,
         sweep_scope=args.sweep_scope,
+        pre_prune_frac=args.pre_prune_frac,       # NEW
+        pre_prune_scope=args.pre_prune_scope,     # NEW
         seed=args.seed,
-    )
+)
 
     # Plot(args.dataset_str, roc_history, modification_ratio_history)
     gaussion_KDE(args.dataset, Z)

@@ -1,0 +1,18 @@
+{
+  "dataset": "cora",
+  "ver": "aron_desc",
+  "seed": 1,
+  "pre_prune_frac": 0.05,
+  "pre_prune_scope": "cp_all",
+  "gmm_k": 16,
+  "gmm_tau": 0.55,
+  "alpha": 0.8,
+  "gamma": 0.8,
+  "stage": "final",
+  "best_epoch": 115,
+  "val_roc": 0.9366623776547297,
+  "val_ap": 0.9502519499531129,
+  "test_hit1": 0.036053130929791274,
+  "test_hit3": 0.5142314990512334,
+  "test_hit10": 0.6944971537001897
+}

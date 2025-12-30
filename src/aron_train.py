@@ -31,13 +31,14 @@ from input_data import CalN2V
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import Optional, Tuple
 
-# # ---- side experiment: offline C0p "remove until done" curve ----
-# # 要跑這個實驗的時候把這個改成 True，就會在 train 結束後多跑一趟 sweep
-# ENABLE_C0P_SWEEP = False
+# ---- side experiment: offline C0p/CP "remove until done" curve ----
+# 要跑這個實驗的時候把這個改成 True，就會在 train 結束後多跑一趟 sweep
+ENABLE_C0P_SWEEP = False
 
-# # 每次評估的步長 & 最大刪除比例（以「intra-cluster C0p 邊的數量」為基準）
-# C0P_SWEEP_STEP_FRAC = 0.001   # 每刪掉 1% 的 intra C0p 邊評一次
-# C0P_SWEEP_MAX_FRAC  = 1.0    # 最多刪到 100% 的 intra C0p 邊
+# 每次評估的步長 & 最大刪除比例（以 candidate 邊的數量為基準）
+# e.g. 0.05 → 每刪掉 5% 的候選邊評一次
+C0P_SWEEP_STEP_FRAC = 0.05    # 你可以改成 0.1 / 0.01 等
+C0P_SWEEP_MAX_FRAC  = 1.0     # 最多刪到 100% 的候選邊
 
 # --- dense helper: works for both sparse and dense tensors
 def _to_dense(A: torch.Tensor) -> torch.Tensor:
@@ -89,11 +90,14 @@ def train_encoder(
     restricted: bool = False,
     restrict_alpha: float = 0.8,
     restrict_gamma: float = 1.0,
-    # c0p pruning (removals that also consume the budget)
+    # c0p pruning (online removals that also consume the budget)
     c0p_prune_frac: float = 0.0,
+    # === NEW: static pre-prune knobs (applied once before training) ===
+    pre_prune_frac: float = 0.0,
+    pre_prune_scope: str = "cp_all",
     # ===== NEW: online prune knobs (scope is encoded in `ver=prune_*`) =====
-    prune_step_frac: float = 0.01, # 0.1% of candidates pruned per epoch
-    prune_max_frac:  float = 1.0,     # up to 100% of candidates in total
+    prune_step_frac: float = 0.01,
+    prune_max_frac:  float = 1.0,
     **kwargs,
 ) -> Tuple[torch.Tensor, list, list, torch.Tensor]:
     """
@@ -356,9 +360,6 @@ def train_encoder(
         prune_state["rows"].append(row)
         prune_state["last_logged_removed"] = removed_edges
 
-
-
-
     # train model
     neighbors = {}
 
@@ -461,6 +462,79 @@ def train_encoder(
                 Z0 = encoder(features, edge_index)
                 frozen_scores = dot_product_decode(Z0).detach()
 
+            # --------------------------------------------------
+            # Build frozen (per-dataset) GMM clusters on Z0
+            # --------------------------------------------------
+            # build frozen clusters on Z0 for this dataset/run
+            try:
+                Z0_det = Z0.detach()
+                labels0 = gmm_labels(
+                    Z0_det, K=gmm_k, tau=gmm_tau, metric="cosine"
+                )
+                deg_base = _deg_excl_self(adj_label.to_dense())
+                core0, _, _, _ = select_gmm_cores(
+                    Z0_det,
+                    labels0,
+                    degrees_excl_self=deg_base,
+                    alpha=restrict_alpha,
+                    gamma=restrict_gamma,
+                    B=Z0_det.size(1),
+                )
+                # store as numpy so TSNE can reuse
+                frozen_gmm_labels = labels0
+                frozen_core_mask  = core0.bool().detach().cpu().numpy()
+                print(f"[GMM-FROZEN] built frozen GMM clusters on Z0 "
+                    f"(K={gmm_k}, tau={gmm_tau})")
+                # ---- TSNE cache: save Z0 + frozen clusters/core for later TSNE ----
+                try:
+                    # radii on Z0 (per-node), non-noise only is handled later in analysis scripts
+                    radii0, _, _ = per_cluster_stats_diag(Z0_det, labels0, normalize_cosine=True)
+
+                    # output dir keyed by dataset/ver/seed/pre_prune_frac
+                    out_dir = os.path.join(
+                        "artifacts", "tsne_cache",
+                        str(dataset_str), str(ver),
+                        f"seed{seed}",
+                        f"preprune_{pre_prune_frac:.2f}",
+                    )
+
+                    y_np = None
+                    try:
+                        # node labels (ground-truth classes)
+                        y_np = labels.detach().cpu().numpy() if hasattr(labels, "detach") else None
+                    except Exception:
+                        y_np = None
+
+                    meta = dict(
+                        dataset=str(dataset_str),
+                        ver=str(ver),
+                        seed=int(seed),
+                        pre_prune_frac=float(pre_prune_frac),
+                        pre_prune_scope=str(pre_prune_scope),
+                        gmm_k=int(gmm_k),
+                        gmm_tau=float(gmm_tau),
+                        alpha=float(restrict_alpha),
+                        gamma=float(restrict_gamma),
+                        stage="Z0_frozen",
+                    )
+
+                    save_tsne_cache(
+                        out_dir,
+                        Z=Z0_det,
+                        gmm_labels=np.asarray(labels0, dtype=np.int64),
+                        core_mask=np.asarray(frozen_core_mask, dtype=bool),
+                        y=y_np,
+                        radii=radii0.detach().cpu().numpy(),
+                        meta=meta,
+                        prefix="Z0",
+                    )
+                except Exception as e:
+                    print(f"[TSNE|CACHE] save Z0 failed: {e}")
+            except Exception as e:
+                print(f"[GMM-FROZEN] failed to build frozen clusters: {e}")
+                frozen_gmm_labels = None
+                frozen_core_mask  = None
+
             if frozen_scores_path:
                 try:
                     torch.save(frozen_scores.cpu(), frozen_scores_path)
@@ -469,7 +543,7 @@ def train_encoder(
                     print(f"[pretrain] Save frozen scores failed: {e}")
             # only enforce shape if needed
             if needs_scores:
-                if frozen_scores is None or frozen_scores.shape != (N, N):
+                if frozen_scores is None or frozen_scores.shape != (num_nodes, num_nodes):
                     print("[WARN] score-based adds disabled (no valid frozen_scores).")
                     frozen_scores = None
             if pretrained_ckpt_path:
@@ -479,6 +553,158 @@ def train_encoder(
                 except Exception as e:
                     print(f"[pretrain] Save encoder checkpoint failed: {e}")
 
+        # --- STATIC PRE-PRUNE (C0p / CP) BEFORE MAIN TRAINING ---
+        if pre_prune_frac > 0.0:
+            print(f"[static-preprune] frac={pre_prune_frac:.2f}, scope={pre_prune_scope}")
+
+            # Base graph: original TRAIN split (no val/test edges)
+            g_np = adj_train.toarray().astype(np.float32)
+            np.fill_diagonal(g_np, 0.0)
+            N = g_np.shape[0]
+
+            # 1) GMM on PRETRAINED embeddings Z0
+            Z0_det = Z0.detach()
+            labels_cluster = gmm_labels(
+                Z0_det, K=gmm_k, tau=gmm_tau, metric="cosine"
+            )
+            uniq, counts = np.unique(labels_cluster[labels_cluster >= 0], return_counts=True)
+            print(f"[static-preprune] GMM clusters (non-noise): {len(uniq)} | sizes={counts.tolist()}")
+
+            # 2) Core mask (C0p) using α,γ gating and base degrees
+            deg_base_np = g_np.sum(axis=1).astype(np.int64)
+            deg_base = torch.from_numpy(deg_base_np).to(Z0_det.device)
+            core_mask, _, _, _ = select_gmm_cores(
+                Z0_det, labels_cluster,
+                degrees_excl_self=deg_base,
+                alpha=restrict_alpha,
+                gamma=restrict_gamma,
+                B=Z0_det.size(1),
+            )
+            core_mask_np = core_mask.bool().detach().cpu().numpy()
+
+            # 3) Candidate edges according to pre_prune_scope
+            g_torch = torch.from_numpy(g_np)
+            lbl_t = torch.from_numpy(labels_cluster.astype(np.int64))
+            same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+            existing = (g_torch > 0)
+            core_t = torch.from_numpy(core_mask_np)
+
+            if pre_prune_scope == "cp_all":
+                cand = existing.clone()
+            elif pre_prune_scope == "c0p_only":
+                both_core = (core_t[:, None] & core_t[None, :])
+                cand = existing & same_cluster & both_core
+            elif pre_prune_scope == "cp_minus_c0p":
+                both_core = (core_t[:, None] & core_t[None, :])
+                cand = existing & same_cluster & (~both_core)
+            else:
+                raise ValueError(f"Unknown pre_prune_scope: {pre_prune_scope}")
+
+            cand.fill_diagonal_(False)
+            idx_i, idx_j = cand.triu(1).nonzero(as_tuple=True)
+            num_cand = int(idx_i.numel())
+            print(f"[static-preprune] candidate edges ({pre_prune_scope}) = {num_cand}")
+
+            if num_cand == 0:
+                print("[static-preprune] no candidates; skip pre-prune.")
+            else:
+                # 4) Rank by BASE cosine similarity (lowest first)
+                X0 = F.normalize(Z0_det, p=2, dim=1)
+                S0 = X0 @ X0.t()                  # [N, N], on GPU if Z0_det is on GPU
+
+                # move indices to same device as S0 for indexing
+                idx_i_dev = idx_i.to(S0.device)
+                idx_j_dev = idx_j.to(S0.device)
+
+                sim = S0[idx_i_dev, idx_j_dev]    # [num_cand]
+                order = torch.argsort(sim, descending=False)   # worst (lowest sim) first
+
+                # bring sorted indices back to CPU / numpy for the pruning loop
+                order_cpu = order.cpu()
+                idx_i_sorted = idx_i[order_cpu].cpu().numpy()
+                idx_j_sorted = idx_j[order_cpu].cpu().numpy()
+                pairs = np.stack([idx_i_sorted, idx_j_sorted], axis=1)
+
+                target_remove = int(round(pre_prune_frac * num_cand))
+                target_remove = max(0, min(target_remove, num_cand))
+                print(f"[static-preprune] target_remove = {target_remove} edges")
+
+                # 5) NO DEGREE FLOOR: just keep a degree array for logging if you want
+                deg = g_np.sum(axis=1).astype(np.int64).reshape(-1)
+
+                removed = 0
+                for i, j in pairs:
+                    if removed >= target_remove:
+                        break
+                    i = int(i); j = int(j)
+                    if g_np[i, j] == 0.0:
+                        continue
+                    # remove undirected edge (no degree_floor constraint)
+                    g_np[i, j] = 0.0
+                    g_np[j, i] = 0.0
+                    deg[i] -= 1
+                    deg[j] -= 1
+                    removed += 1
+
+                print(f"[static-preprune] actually removed {removed} edges "
+                    f"({removed / max(1, num_cand):.3f} of candidates)")
+
+                # 6) Replace TRAIN graph with pruned graph
+                adj_train = sp.csr_matrix(g_np)
+                adj = adj_train
+                
+                # ---- rebuild all training tensors on the pruned train graph ----
+                # 1) train_mask & training_instance_number
+                train_mask = torch.ones(num_nodes * num_nodes, dtype=torch.bool, requires_grad=False).to(device)
+                for r, c in val_edges:
+                    train_mask[num_nodes * r + c] = False
+                for r, c in test_edges:
+                    train_mask[num_nodes * r + c] = False
+                training_instance_number = torch.sum(train_mask).item()
+
+                # 2) APPNP / edge_index on pruned graph
+                edge_index = from_scipy_sparse_matrix(adj)[0].to(device)
+
+                # 3) adj_label & adj_norm from pruned adj_train
+                adj_norm_tuple = preprocess_graph(adj)                        # Laplacian on pruned graph
+                adj_label_sp = adj_train + sp.eye(adj_train.shape[0])
+                adj_label_tuple = sparse_to_tuple(adj_label_sp)
+
+                adj_norm = torch.sparse.FloatTensor(
+                    torch.LongTensor(adj_norm_tuple[0].T),
+                    torch.FloatTensor(adj_norm_tuple[1]),
+                    torch.Size(adj_norm_tuple[2]),
+                ).to(device)
+
+                adj_label = torch.sparse.FloatTensor(
+                    torch.LongTensor(adj_label_tuple[0].T),
+                    torch.FloatTensor(adj_label_tuple[1]),
+                    torch.Size(adj_label_tuple[2]),
+                ).to(device)
+
+                # 4) pos_weight, norm, weight_mask, weight_tensor on pruned graph
+                pos_weight = float(training_instance_number - adj.sum()) / adj.sum()
+                norm = training_instance_number / float((training_instance_number - adj.sum()) * 2)
+
+                weight_mask = adj_label.to_dense().view(-1)[train_mask] == 1
+                weight_tensor = torch.ones(weight_mask.size(0)).to(device)
+                weight_tensor[weight_mask] = pos_weight
+
+                # ---- IMPORTANT ----
+                # Rebuild all training tensors that depend on adj / adj_train.
+                # You ALREADY have this code a few lines above:
+                #   - train_mask, training_instance_number
+                #   - pos_weight, norm
+                #   - adj_label ( = adj_train + I ), sparse_to_tuple(...)
+                #   - adj_norm = preprocess_graph(adj)
+                #   - adj_norm / adj_label / features sparse tensors
+                #   - weight_mask, weight_tensor
+                #   - edge_index = from_scipy_sparse_matrix(adj)[0].to(device)
+                #
+                # Move that block into a small helper or re-run it here
+                # so that from here on, the main training loop uses the
+                # STATICALLY PRUNED train graph.
+        
         # If we loaded only the scores (not weights), that’s fine.
         # If we loaded weights too, great. Either way, re-init optimizer so both DESC/ASC start fresh.
         optimizer = Adam(encoder.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -495,6 +721,10 @@ def train_encoder(
     E0 = int(((g0.sum() - torch.trace(g0)) // 2).item())   # ORIGINAL undirected |E|
     deg0_excl_self = _deg_excl_self(g0)                    # shape [N], ORIGINAL degrees (excl self)
 
+    # GLOBAL (per-run) frozen GMM cluster & core mask.
+    # We will *always* define these based on the pre-trained encoder Z0 on the ORIGINAL graph
+    # and then re-use them for TSNE / analysis, regardless of prune_fraction.
+
     # cumulative trackers (reset for this dataset/run)
     global_used_adds = 0
     global_used_removals = 0             # count removals across all epochs
@@ -504,72 +734,116 @@ def train_encoder(
     print(f"[AUG-INIT] N={N} | E0={E0} | aug_ratio(global)={aug_ratio} | aug_bound(per-node)={aug_bound}")
     if frozen_scores is not None and frozen_scores.shape != (N, N):
         raise ValueError(f"frozen_scores shape {tuple(frozen_scores.shape)} != {(N,N)} for current dataset")
-    # -------------------- PRUNE INIT (for ver: prune_*) --------------------
-    prune_state = None
-    if isinstance(ver, str) and ver.startswith("prune_"):
-        print(f"[PRUNE] initializing '{ver}'")
+    # -------------------- REMOVE-ONLY INIT (for ver: remove_only_*) --------------------
+    remove_state = None
+    if isinstance(ver, str) and ver.startswith("remove_only_"):
+        import re
 
-        # Base embedding on ORIGINAL train graph (edge_index) for ranking
+        # parse keep% from ver: ..._keep100/_keep90/_keep75/_keep50/_keep25
+        m_keep = re.search(r"_keep(\d+)", ver)
+        keep_pct = int(m_keep.group(1)) if m_keep else 100
+        keep_frac = max(0.0, min(1.0, keep_pct / 100.0))
+
+        # parse scope from ver name (use same naming family as your prune_*):
+        # remove_only_cp_all_keepXX
+        # remove_only_c0p_only_keepXX
+        # remove_only_cp_minus_c0p_keepXX
+        if "cp_minus_c0p" in ver:
+            scope_name = "cp_minus_c0p"
+        elif "c0p_only" in ver:
+            scope_name = "c0p_only"
+        else:
+            scope_name = "cp_all"   # default
+
+        print(f"[REMOVE-ONLY-INIT] scope={scope_name} keep={keep_pct}%")
+
+        # base embedding on ORIGINAL train graph for a FIXED scope definition + fixed ranking
         with torch.no_grad():
             Z_base = encoder(features, edge_index)
 
-        # Fixed GMM labels and fixed core mask from base Z
+        # fixed labels + fixed core mask (same as PRUNE INIT logic)
         labels_fixed = gmm_labels(Z_base.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
         deg_base = _deg_excl_self(adj_label.to_dense())
         core_mask_fixed, _, _, _ = select_gmm_cores(
             Z_base, labels_fixed, degrees_excl_self=deg_base,
             alpha=restrict_alpha, gamma=restrict_gamma, B=Z_base.size(1)
         )
+
         core_t = core_mask_fixed.bool()
         lbl_t  = torch.from_numpy(labels_fixed.astype(np.int64)).to(core_t.device)
 
-        # Candidates from CURRENT adj_label (with self-loops)
         g0_dense  = adj_label.to_dense()
         existing  = (g0_dense > 0)
         same_cl   = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
         both_core = (core_t[:, None] & core_t[None, :])
 
-        if ver == "prune_cp_all":
-            cand = existing.clone()              # (includes inter; switch to &same_cl for intra-only)
-        elif ver == "prune_c0p_only":
-            cand = existing & same_cl & both_core
-        elif ver == "prune_cp_minus_c0p":
-            cand = existing & same_cl & (~both_core)
-        else:
-            raise ValueError(f"[PRUNE] unknown ver={ver}")
+        # -----------------------------
+        # FIXED candidates = (scope) ∩ (kind)
+        # -----------------------------
 
+        # parse kind from ver once here so init knows whether we want intra/inter/both
+        m_kind = re.match(r"^remove_only_(intra|inter|both)", ver)
+        kind_init = m_kind.group(1) if m_kind else "both"
+
+        # ---- scope mask ----
+        if scope_name == "cp_all":
+            scope_mask = existing.clone()
+        elif scope_name == "c0p_only":
+            scope_mask = existing & same_cl & both_core
+        elif scope_name == "cp_minus_c0p":
+            scope_mask = existing & same_cl & (~both_core)
+        else:
+            raise ValueError(f"[REMOVE-ONLY-INIT] unknown scope_name={scope_name}")
+
+        # ---- kind mask ----
+        # intra: same cluster label and label != -1
+        intra_mask = same_cl
+        # inter: anything not intra (also treat -1 as inter/noise)
+        inter_mask = existing & (~same_cl)
+
+        if kind_init == "intra":
+            kind_mask = intra_mask
+        elif kind_init == "inter":
+            kind_mask = inter_mask
+        else:
+            kind_mask = existing  # both
+
+        cand = scope_mask & kind_mask
         cand.fill_diagonal_(False)
+
+        # candidate edge list (upper triangle)
         ii, jj = cand.triu(1).nonzero(as_tuple=True)
-        num_cand = int(ii.numel())
-
-        if num_cand == 0:
-            print("[PRUNE] no candidates; disabling prune mode.")
+        E_scope0 = int(ii.numel())
+        
+        if E_scope0 == 0:
+            print("[REMOVE-ONLY-INIT] no scope edges; disabling remove-only mode.")
+            remove_state = {"disabled": True}
         else:
-            # Only record how many initial candidates we have; ranking will be done
-            # dynamically using CURRENT Z each time we prune.
-            step_edges = max(1, int(round(prune_step_frac * num_cand)))
-            max_remove = max(1, int(round(prune_max_frac  * num_cand)))
+            # cosine similarity ranking from base embedding (remove LOW sim first)
+            Zb = torch.nn.functional.normalize(Z_base.detach(), p=2, dim=1)
+            sim = (Zb[ii] * Zb[jj]).sum(dim=1)  # [-1,1]
+            order = torch.argsort(sim, descending=False)  # low-sim first
 
-            csv_dir  = os.path.join("logs", "c0p_sweep", dataset_str)
-            os.makedirs(csv_dir, exist_ok=True)
-            csv_path = os.path.join(csv_dir, f"{dataset_str}_{ver}_seed{seed}_idx{run_tag}.csv")
+            ii = ii[order].to(torch.long)
+            jj = jj[order].to(torch.long)
 
-            prune_state = {
-                "removed": 0,
-                "num_cand": num_cand,
-                "step": step_edges,
-                "max_remove": max_remove,
-                "labels": labels_fixed,                        # numpy
-                "core_mask": core_mask_fixed.bool().cpu().numpy(),
-                "alpha": float(restrict_alpha),
-                "gamma": float(restrict_gamma),
-                "rows": [],
-                "csv_dir": csv_dir,
-                "csv_path": csv_path,
-                "last_logged_removed": -1,
+            target_remove_total = int(round((1.0 - keep_frac) * E_scope0))
+            print(f"[REMOVE-ONLY-INIT] E_scope0={E_scope0} target_remove_total={target_remove_total}")
+
+            remove_state = {
+                "disabled": False,
+                "labels_fixed": labels_fixed,              # numpy
+                "core_mask_fixed": core_mask_fixed,        # torch bool
+                "scope_name": scope_name,
+                "keep_pct": keep_pct,
+                "E_scope0": E_scope0,
+                "target_remove_total": target_remove_total,
+                "ii_rank": ii,                             # torch long
+                "jj_rank": jj,                             # torch long
+                "rank_ptr": 0,
+                "removed_scope_so_far": 0,
             }
 
-            print(f"[PRUNE] candidates={num_cand} step={step_edges} max={max_remove}")
     
     best_val_roc = -float("inf")
     best_epoch = -1
@@ -579,7 +853,7 @@ def train_encoder(
     # optional: a convenient on-disk checkpoint path (safe default)
     ckpt_dir = os.path.join("checkpoints", dataset_str)
     os.makedirs(ckpt_dir, exist_ok=True)
-    best_ckpt_path_runtime = os.path.join(ckpt_dir, f"{ver}_{run_tag or 'run'}_best.pt")
+    best_ckpt_path_runtime = os.path.join(ckpt_dir, f"{ver}_{run_tag or 'run'}_seed{seed}_best.pt")
 
     for epoch in tqdm(range(num_epoch)):
         t = time.time()
@@ -642,11 +916,15 @@ def train_encoder(
                 aug_feat = drop_feature(features.to_dense(), feat_maske_ratio)    
             elif(ver=="v6"):
                 g, modification_ratio = degree_aug_v6(Z.detach(), adj_label.to_dense(),degree, num_nodes, aug_ratio, degree_threshold, epoch)
+                added_this_epoch = 0
+                removed_this_epoch = 0
                 aug_feat = drop_feature(features.to_dense(), feat_maske_ratio)     
             # ***** NEW: frozen-score A/B variants *****
             elif ver in ("aron_desc", "aron_asc"):
                 degree_floor = max(0, int(degree_threshold) - 1)   # align with excl-self
                 order = "desc" if ver == "aron_desc" else "asc"
+                
+                removed_this_epoch = 0 # dummy
 
                 # ---- BEFORE augmentation snapshot ----
                 # _ = degree_deficit_snapshot(
@@ -831,9 +1109,8 @@ def train_encoder(
                 if allow_restricted is not None:             # restrict only in candidate/quantile phase
                     base_block = base_block | (~allow_restricted)
 
-                score_thr = robust_score_quantile_from_scores(
-                    scores_for_rank, base_block, q=late_score_q, max_elems=2_000_000,
-                )
+                score_thr = robust_score_quantile_from_scores(scores_for_rank, base_block, q=late_score_q, max_elems=2_000_000)
+
 
                 # ---- build allow masks for tiers (base) ----
                 allow_A = build_cluster_allow_mask(labels_cluster, mode=base_mode, exclude_noise=True,  device=device)
@@ -976,41 +1253,32 @@ def train_encoder(
                 removed_this_epoch = 0
 
                 # ------------------------------------------------------------
-                # Inline parse from `ver`
-                # Formats:
-                #   remove_only_intra
-                #   remove_only_inter
-                #   remove_only_both
-                #   + optional scope:  _c0p | _noncore | _cp           (for INTRA only)
-                #   + optional frac :  _frac0.05                        (steady per-node fraction hint)
-                # Examples:
-                #   remove_only_intra_c0p
-                #   remove_only_intra_cp_frac0.07
-                #   remove_only_inter_frac0.03
+                # Parse from `ver`
+                # We keep your "kind" parsing: remove_only_(intra|inter|both)
+                # Scope parsing is optional; actual scope is enforced by remove_state init.
+                #
+                # Accept examples like:
+                #   remove_only_intra_c0p_keep90
+                #   remove_only_both_cp_all_keep75
+                #   remove_only_inter_keep50
                 # ------------------------------------------------------------
-                m = re.match(r"^remove_only_(intra|inter|both)(?:_(c0p|noncore|cp))?(?:_frac([0-9]*\.?[0-9]+))?$", ver)
+                m = re.match(r"^remove_only_(intra|inter|both)(?:_([a-zA-Z0-9_]+))?(?:_keep(\d+))?$", ver)
                 if not m:
                     print(f"[REMOVE-ONLY] Unrecognized ver={ver}; skipping this epoch.")
-                    # keep graph & features unchanged this epoch
                     g = _to_dense(adj_label)
                     aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
                 else:
-                    kind  = m.group(1)                  # "intra" | "inter" | "both"
-                    scope = m.group(2) or "c0p"         # default scope for INTRA
-                    frac_hint = float(m.group(3)) if m.group(3) else None
+                    kind = m.group(1)                     # "intra" | "inter" | "both"
+                    scope_tag = m.group(2) or "scope"     # only for printing/debug
+                    keep_pct = int(m.group(3)) if m.group(3) else None
 
-                    # ---- cluster labels ----
-                    if cluster_method == "gmm":
-                        labels_cluster = gmm_labels(Z.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
-                    elif cluster_method == "louvain":
-                        A_np = (_to_dense(adj_label) > 0).detach().cpu().numpy().astype(np.int8)
-                        np.fill_diagonal(A_np, 0)
-                        labels_cluster = louvain_labels(A_np)
+                    # ---- FIXED cluster labels (GMM only) ----
+                    if (remove_state is None) or remove_state.get("disabled", False):
+                        labels_cluster = np.full((num_nodes,), -1, dtype=np.int64)
                     else:
-                        labels_cluster = density_cluster_embeddings(Z.detach(), method="hdbscan")
+                        labels_cluster = remove_state["labels_fixed"]
 
                     # ---- compactness BEFORE ----
-                    # (radius uses Z & labels; it won’t change until the next epoch after updates)
                     radii, _, _ = per_cluster_stats_diag(Z.detach(), labels_cluster, normalize_cosine=True)
                     if (labels_cluster != -1).sum() > 0:
                         mean_radius = float(radii[torch.from_numpy(labels_cluster) != -1].mean().item())
@@ -1020,106 +1288,125 @@ def train_encoder(
                     radius_hist.append(mean_radius)
                     radius_epoch_hist.append(epoch)
 
-                    # ---- epoch quota from GLOBAL pool (adds+removes shared) ----
-                    # E0 is ORIGINAL undirected |E|, computed earlier
-                    def _epoch_target_frac(ep: int, T: int) -> float:
-                        return float(ep + 1) / max(1, T)
+                    # ---- EXACT keep% quota schedule ----
+                    # (linear schedule to reach target_remove_total by final epoch)
+                    if (remove_state is None) or remove_state.get("disabled", False):
+                        epoch_quota_edges = 0
+                        target_total = 0
+                        removed_so_far = 0
+                        E_scope0 = 0
+                    else:
+                        target_total = int(remove_state["target_remove_total"])
+                        removed_so_far = int(remove_state["removed_scope_so_far"])
+                        E_scope0 = int(remove_state["E_scope0"])
 
-                    target_cum_mods = int(round(aug_ratio * E0 * _epoch_target_frac(epoch, num_epoch)))
-                    used_mods_global = int(global_used_adds + global_used_removals)
-                    epoch_quota_edges = max(0, target_cum_mods - used_mods_global)
-                    print(f"[REMOVE-ONLY] epoch_quota_left={epoch_quota_edges} / global_cap={int(round(aug_ratio*E0))}")
+                        target_cum = int(round(target_total * float(epoch + 1) / max(1, num_epoch)))
+                        epoch_quota_edges = max(0, target_cum - removed_so_far)
+
+                    # helpful print
+                    if keep_pct is None and (remove_state is not None) and (not remove_state.get("disabled", False)):
+                        keep_pct = int(remove_state.get("keep_pct", -1))
+                    print(
+                        f"[REMOVE-ONLY] kind={kind} scope_tag={scope_tag} keep={keep_pct}% "
+                        f"| epoch_quota_remove={epoch_quota_edges} "
+                        f"| removed_so_far={removed_so_far}/{target_total} "
+                        f"| E_scope0={E_scope0}"
+                    )
 
                     dropped_intra = 0
                     dropped_inter = 0
 
-                    if epoch_quota_edges > 0:
+                    # ---- Execute removals (exact count if possible) ----
+                    removed_this_epoch = 0
+                    if epoch_quota_edges > 0 and (remove_state is not None) and (not remove_state.get("disabled", False)):
+
                         g_dense = _to_dense(adj_label)
+                        degree_floor = 0
+                        deg_now = _deg_excl_self(g_dense)
+
                         lbl_t = torch.from_numpy(labels_cluster).to(g_dense.device)
+                        # intra if same label and label != -1
+                        def _is_intra(i: int, j: int) -> bool:
+                            li = int(lbl_t[i].item())
+                            lj = int(lbl_t[j].item())
+                            return (li != -1) and (li == lj)
 
-                        same = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
-                        diff = (lbl_t[:, None] != lbl_t[None, :]) | (lbl_t[:, None] == -1) | (lbl_t[None, :] == -1)
+                        ii_rank = remove_state["ii_rank"]
+                        jj_rank = remove_state["jj_rank"]
+                        ptr = int(remove_state["rank_ptr"])
 
-                        # undirected counts
-                        intra_edges = int(((g_dense > 0) & same).sum().item() // 2)
-                        inter_edges = int(((g_dense > 0) & diff).sum().item() // 2)
+                        removed = 0
+                        while removed < epoch_quota_edges and ptr < ii_rank.numel():
+                            i = int(ii_rank[ptr].item())
+                            j = int(jj_rank[ptr].item())
+                            ptr += 1
 
-                        # split quota by kind
-                        if kind == "intra":
-                            q_intra, q_inter = epoch_quota_edges, 0
-                        elif kind == "inter":
-                            q_intra, q_inter = 0, epoch_quota_edges
-                        else:
-                            # both: 50/50, but shift to the other side if one empty
-                            if intra_edges == 0 and inter_edges > 0:
-                                q_intra, q_inter = 0, epoch_quota_edges
-                            elif inter_edges == 0 and intra_edges > 0:
-                                q_intra, q_inter = epoch_quota_edges, 0
+                            # still exists?
+                            if g_dense[i, j].item() <= 0:
+                                continue
+
+                            # kind filter
+                            intra_flag = _is_intra(i, j)
+                            if kind == "intra" and (not intra_flag):
+                                continue
+                            if kind == "inter" and intra_flag:
+                                continue
+
+                            # degree-floor safety
+                            if (deg_now[i].item() - 1) < degree_floor:
+                                continue
+                            if (deg_now[j].item() - 1) < degree_floor:
+                                continue
+
+                            # remove undirected edge
+                            g_dense[i, j] = 0
+                            g_dense[j, i] = 0
+                            deg_now[i] -= 1
+                            deg_now[j] -= 1
+
+                            removed += 1
+                            if intra_flag:
+                                dropped_intra += 1
                             else:
-                                q_intra = epoch_quota_edges // 2
-                                q_inter = epoch_quota_edges - q_intra
+                                dropped_inter += 1
 
-                        # per-node drop fractions (allow steady override via _fracX)
-                        if frac_hint is not None:
-                            drop_intra = max(0.0, min(0.9, float(frac_hint)))
-                            drop_inter = max(0.0, min(0.9, float(frac_hint)))
-                        else:
-                            drop_intra = max(0.0, min(0.6, q_intra / max(1, intra_edges)))
-                            drop_inter = max(0.0, min(0.6, q_inter / max(1, inter_edges)))
+                        # write back
+                        adj_label = g_dense
 
-                        degree_floor = max(0, int(degree_threshold) - 1)
+                        # update remove-only state
+                        remove_state["rank_ptr"] = ptr
+                        remove_state["removed_scope_so_far"] = int(remove_state["removed_scope_so_far"] + removed)
+                        removed_this_epoch = removed
 
-                        # ---- INTRA prune ----
-                        if q_intra > 0 and intra_edges > 0:
-                            new_adj, stats_intra = cp_prune_intra(
-                                Z=Z.detach(),
-                                adj_label=g_dense,
-                                labels=labels_cluster,
-                                scope=scope,                      # "c0p" | "noncore" | "cp"
-                                drop_frac=drop_intra,
-                                prefer_low_sim=True,
-                                min_keep=1,
-                                degree_floor=degree_floor,
-                                metric="cosine",
-                            )
-                            dropped_intra = int(stats_intra["dropped_edges"])
-                            adj_label = new_adj
-                            print(f"[REMOVE-ONLY:INTRA] scope={scope} drop_frac≈{drop_intra:.4f} dropped={dropped_intra}")
+                        # remaining scope edges
+                        E_scope0 = int(remove_state["E_scope0"])
+                        remain = max(0, E_scope0 - int(remove_state["removed_scope_so_far"]))
+                        remain_pct = 100.0 * remain / max(1, E_scope0)
+                        print(
+                            f"[REMOVE-ONLY] removed_this_epoch={removed_this_epoch} "
+                            f"(intra={dropped_intra}, inter={dropped_inter}) | "
+                            f"removed_scope_so_far={remove_state['removed_scope_so_far']}/{remove_state['target_remove_total']} | "
+                            f"remaining_scope={remain} ({remain_pct:.2f}%)"
+                        )
 
-                        # ---- INTER prune ----
-                        if q_inter > 0 and inter_edges > 0:
-                            new_adj, stats_inter = cp_prune_inter(
-                                Z=Z.detach(),
-                                adj_label=adj_label,              # current (may already be dense from INTRA)
-                                labels=labels_cluster,
-                                drop_frac=drop_inter,
-                                prefer_low_sim=True,
-                                min_keep=1,
-                                degree_floor=degree_floor,
-                                metric="cosine",
-                                include_noise=True,
-                            )
-                            dropped_inter = int(stats_inter["dropped_edges"])
-                            adj_label = new_adj
-                            print(f"[REMOVE-ONLY:INTER] drop_frac≈{drop_inter:.4f} dropped={dropped_inter}")
-
-                    # bookkeeping: adds=0 in remove-only
+                    # ---- bookkeeping: adds=0 in remove-only ----
                     added_this_epoch = 0
-                    removed_this_epoch = dropped_intra + dropped_inter
-                    global_used_adds     += added_this_epoch
+                    global_used_adds     += 0
                     global_used_removals += removed_this_epoch
 
                     # per-epoch modification ratio (relative to ORIGINAL undirected |E| = E0)
                     modification_ratio = (added_this_epoch + removed_this_epoch) / float(max(1, E0))
 
-                    print(f"[BUDGET] add/remove this epoch = {added_this_epoch}/{removed_this_epoch} "
+                    print(
+                        f"[BUDGET] add/remove this epoch = {added_this_epoch}/{removed_this_epoch} "
                         f"(intra={dropped_intra}, inter={dropped_inter}) | "
-                        f"global_used adds/removes = {global_used_adds}/{global_used_removals}")
+                        f"global_used adds/removes = {global_used_adds}/{global_used_removals}"
+                    )
 
                     # keep feature aug behavior consistent with others
                     aug_feat = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
 
-                    # optional: maintain `g` mirror like other branches
+                    # maintain `g` mirror like other branches
                     g = _to_dense(adj_label)
 
             # ===== NEW: online prune family =====
@@ -1234,7 +1521,7 @@ def train_encoder(
                                     removed_this_epoch += 1
 
                             prune_state["removed"] += int(removed_this_epoch)
-                            added_this_epoch   = 0
+                            added_this_epoch = 0
                             modification_ratio = removed_this_epoch / float(max(1, E0))
 
                             adj_label = g  # reflect into training adjacency
@@ -1386,37 +1673,37 @@ def train_encoder(
             except Exception as e:
                 print(f"[CKPT] Warning: failed to save best checkpoint: {e}")
                 
-        # --------- OPTIONAL: offline C0p sweep with fixed encoder & fixed GMM ---------
-    # # side experiment：只在你開 ENABLE_C0P_SWEEP 時啟用
-    # if ENABLE_C0P_SWEEP and is_remove_only and (cluster_method == "gmm"):
-    #     # For offline sweep we don't enforce min-degree; we want to see the full curve
-    #     sweep_degree_floor = 0
-    #     print(f"[CP-SWEEP] start | ver={ver}, degree_floor={sweep_degree_floor} (no floor for sweep)")
+        # -------- offline C0p sweep with fixed encoder & fixed GMM ---------
+    # side experiment：只在你開 ENABLE_C0P_SWEEP 時啟用
+    if ENABLE_C0P_SWEEP and is_remove_only and (cluster_method == "gmm"):
+        # For offline sweep we don't enforce min-degree; we want to see the full curve
+        sweep_degree_floor = 0
+        print(f"[CP-SWEEP] start | ver={ver}, degree_floor={sweep_degree_floor} (no floor for sweep)")
 
-    #     _ = run_c0p_sweep_static(
-    #         dataset_str=dataset_str,
-    #         ver=ver,
-    #         seed=seed,
-    #         run_tag=str(run_tag),
-    #         device=device,
-    #         encoder=encoder,
-    #         features=features,
-    #         adj_train=adj_train,
-    #         adj_orig=adj_orig,
-    #         val_edges=val_edges,
-    #         val_edges_false=val_edges_false,
-    #         test_edges=test_edges,
-    #         test_edges_false=test_edges_false,
-    #         gmm_k=gmm_k,
-    #         gmm_tau=gmm_tau,
-    #         alpha_c0p=restrict_alpha,
-    #         gamma_c0p=restrict_gamma,
-    #         degree_floor=sweep_degree_floor,  # = 0 → enforce_floor=False
-    #         step_frac=C0P_SWEEP_STEP_FRAC,
-    #         max_frac=C0P_SWEEP_MAX_FRAC,
-    #         sweep_scope=sweep_scope,    # <-- NEW
-    #         out_dir=None,
-    #     )
+        _ = run_c0p_sweep_static(
+            dataset_str=dataset_str,
+            ver=ver,
+            seed=seed,
+            run_tag=str(run_tag),
+            device=device,
+            encoder=encoder,
+            features=features,
+            adj_train=adj_train,
+            adj_orig=adj_orig,
+            val_edges=val_edges,
+            val_edges_false=val_edges_false,
+            test_edges=test_edges,
+            test_edges_false=test_edges_false,
+            gmm_k=gmm_k,
+            gmm_tau=gmm_tau,
+            alpha_c0p=restrict_alpha,
+            gamma_c0p=restrict_gamma,
+            degree_floor=sweep_degree_floor,  # = 0 → enforce_floor=False
+            step_frac=C0P_SWEEP_STEP_FRAC,
+            max_frac=C0P_SWEEP_MAX_FRAC,
+            sweep_scope=sweep_scope,    # cp_all / c0p_only / cp_minus_c0p
+            out_dir=None,
+        )
 
     # print(f'best classification epoch = {best_classi_epoch+1}, val_acc = {best_acc:.3f}, test_acc = {best_test_acc:.3f}')
     print(f'best link prediction epoch = {best_link_epoch+1}, Val_roc = {best_roc:.3f}, val_ap = {best_ap:.3f}, test_roc = {best_test_roc:.3f}, test_ap = {best_test_ap:.3f}')
@@ -1460,6 +1747,141 @@ def train_encoder(
     print(f"Total training time {time.time() - training_time_start}")
     print(f"Average minimum node degree {sum(minimum_node_degree_history) / len(minimum_node_degree_history)}")
     print(minimum_node_degree_history)
+
+    # GMM clusters on final embedding
+    # 1) cluster labels on final embedding
+    labels_cluster = gmm_labels(Z_best.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
+
+    # 2) degree for alpha-gamma gating
+    adj_dense = adj_label.to_dense()
+    deg_excl_self = adj_dense.sum(dim=1) - torch.diag(adj_dense)
+
+    # 3) core (C0p) mask
+    core_mask, thr_per_node, dmin_hat, radii = select_gmm_cores(
+        Z=Z_best.detach(),
+        labels=labels_cluster,
+        degrees_excl_self=deg_excl_self,
+        alpha=restrict_alpha,
+        gamma=restrict_gamma,
+        B=Z_best.size(1),
+        normalize_cosine=True,
+    )
+
+    # 4) TSNE cluster visualization with scope
+    scope_str = None
+    if pre_prune_scope is not None:
+        scope_str = pre_prune_scope
+
+    if Z_best is not None and (cluster_method in ["gmm", "louvain"]):
+        try:
+            print("[TSNE] plotting latent clusters for final encoder ...")
+            Z_vis = Z_best    # or Z_best, whichever you’re using as “final”
+
+            if frozen_gmm_labels is not None:
+                labels_cluster = frozen_gmm_labels
+                print("[TSNE] using frozen GMM labels from Z0")
+            else:
+                print("[TSNE] WARNING: frozen GMM labels missing, re-fitting GMM on final Z")
+                labels_cluster = gmm_labels(
+                    Z_vis.detach(), K=gmm_k, tau=gmm_tau, metric="cosine"
+                )
+
+            if frozen_core_mask is not None:
+                core_mask = torch.from_numpy(frozen_core_mask).bool()
+            else:
+                deg_final = _deg_excl_self(adj_label.to_dense())
+                core_mask, _, _, _ = select_gmm_cores(
+                    Z_vis,
+                    labels_cluster,
+                    degrees_excl_self=deg_final,
+                    alpha=restrict_alpha,
+                    gamma=restrict_gamma,
+                    B=Z_vis.size(1),
+                )
+            # ---- TSNE cache: save FINAL embedding + the exact labels/core we visualize ----
+            try:
+                out_dir = os.path.join(
+                    "artifacts", "tsne_cache",
+                    str(dataset_str), str(ver),
+                    f"seed{seed}",
+                    f"preprune_{pre_prune_frac:.2f}",
+                )
+
+                # core_mask might be on CPU; ensure numpy
+                core_np = core_mask.detach().cpu().numpy() if hasattr(core_mask, "detach") else np.asarray(core_mask, dtype=bool)
+                lbl_np = np.asarray(labels_cluster, dtype=np.int64)
+
+                # radii on final Z (per-node)
+                radii_f, _, _ = per_cluster_stats_diag(Z_vis.detach(), lbl_np, normalize_cosine=True)
+
+                y_np = None
+                try:
+                    y_np = labels.detach().cpu().numpy() if hasattr(labels, "detach") else None
+                except Exception:
+                    y_np = None
+
+                meta = dict(
+                    dataset=str(dataset_str),
+                    ver=str(ver),
+                    seed=int(seed),
+                    pre_prune_frac=float(pre_prune_frac),
+                    pre_prune_scope=str(pre_prune_scope),
+                    gmm_k=int(gmm_k),
+                    gmm_tau=float(gmm_tau),
+                    alpha=float(restrict_alpha),
+                    gamma=float(restrict_gamma),
+                    stage="final",
+                    best_epoch=int(best_epoch + 1) if "best_epoch" in locals() else None,
+                    val_roc=float(best_val_roc) if "best_val_roc" in locals() else None,
+                    val_ap=float(best_val_ap) if "best_val_ap" in locals() else None,
+                    test_hit1=float(final_test_hit[0]) if "final_test_hit" in locals() else None,
+                    test_hit3=float(final_test_hit[1]) if "final_test_hit" in locals() else None,
+                    test_hit10=float(final_test_hit[2]) if "final_test_hit" in locals() else None,
+                )
+
+                save_tsne_cache(
+                    out_dir,
+                    Z=Z_vis.detach(),
+                    gmm_labels=lbl_np,
+                    core_mask=core_np,
+                    y=y_np,
+                    radii=radii_f.detach().cpu().numpy(),
+                    meta=meta,
+                    prefix="final",
+                )
+            except Exception as e:
+                print(f"[TSNE|CACHE] save final failed: {e}")
+                
+            VisualizeCluster(
+                dataset_str,
+                Z_vis,
+                labels_cluster,
+                core_mask=core_mask,
+                scope=pre_prune_scope if "pre_prune_scope" in locals() else scope,
+                suffix=f"_ver{ver}_{pre_prune_frac:.2f}" if "pre_prune_frac" in locals() else "",
+            )
+        except Exception as e:
+            print(f"[TSNE] skipped due to error: {e}")
+            
+        # ---- print final radius summary at end of run ----
+        try:
+            r = radii_f.detach().cpu().numpy().astype(np.float32)  # per-node radii (final)
+            is_noise = (lbl_np == -1)
+            is_core = core_np & (~is_noise)
+            is_noncore = (~core_np) & (~is_noise)
+
+            def _summ(arr, name):
+                if arr.size == 0:
+                    print(f"[FINAL-RADIUS] {name}: empty")
+                    return
+                print(f"[FINAL-RADIUS] {name}: mean={arr.mean():.6f} std={arr.std():.6f} "
+                    f"p50={np.percentile(arr,50):.6f} p90={np.percentile(arr,90):.6f} max={arr.max():.6f} n={arr.size}")
+
+            _summ(r[~is_noise], "all_non_noise")
+            _summ(r[is_core], "core(c0p)")
+            _summ(r[is_noncore], "noncore")
+        except Exception as e:
+            print(f"[FINAL-RADIUS] print failed: {e}")
     
     # ==================== PRUNE SWEEP CSV FINALIZE (online) ====================
     try:

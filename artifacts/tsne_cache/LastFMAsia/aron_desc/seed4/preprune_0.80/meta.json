@@ -1,0 +1,18 @@
+{
+  "dataset": "LastFMAsia",
+  "ver": "aron_desc",
+  "seed": 4,
+  "pre_prune_frac": 0.8,
+  "pre_prune_scope": "cp_minus_c0p",
+  "gmm_k": 16,
+  "gmm_tau": 0.55,
+  "alpha": 0.8,
+  "gamma": 0.8,
+  "stage": "final",
+  "best_epoch": 314,
+  "val_roc": 0.9655957248589617,
+  "val_ap": 0.9635821636441513,
+  "test_hit1": 0.05431654676258993,
+  "test_hit3": 0.17625899280575538,
+  "test_hit10": 0.34388489208633094
+}

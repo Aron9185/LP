@@ -29,6 +29,8 @@ dataset/
 pretrain/
 checkpoints/
 outputs/
+pic/
+plots/
 *.pt
 *.pth
 *.ckpt

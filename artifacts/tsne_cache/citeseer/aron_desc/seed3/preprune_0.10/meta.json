@@ -1,0 +1,18 @@
+{
+  "dataset": "citeseer",
+  "ver": "aron_desc",
+  "seed": 3,
+  "pre_prune_frac": 0.1,
+  "pre_prune_scope": "cp_all",
+  "gmm_k": 16,
+  "gmm_tau": 0.55,
+  "alpha": 0.8,
+  "gamma": 0.8,
+  "stage": "final",
+  "best_epoch": 258,
+  "val_roc": 0.9583341419394904,
+  "val_ap": 0.9645906745036357,
+  "test_hit1": 0.3516483516483517,
+  "test_hit3": 0.5692307692307692,
+  "test_hit10": 0.7164835164835165
+}

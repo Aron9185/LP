@@ -890,11 +890,11 @@ def cluster_filtered_link_augmentation(
     score_thr = None
     if late_score_q is not None and 0.0 < late_score_q < 1.0:
         # Sampled, memory-safe quantile
-        score_thr = robust_score_quantile_from_scores(
+        thr = robust_score_quantile_from_scores(
             scores=scores,
             forbid_mask=forbid_base,
             q=late_score_q,
-            max_elems=2_000_000,  # tweak if you like
+            max_elems=2_000_000,
         )
 
     # ---------- build base allow masks for tiers ----------
@@ -1068,52 +1068,111 @@ def select_gmm_cores(
     normalize_cosine: bool = True,
 ):
     """
-    Build cores C_p^0 by smallest Mahalanobis radii (size >= alpha*|C_p|)
-    and compute per-cluster threshold thr_p = gamma * sqrt(B / dmin_hat_p).
-    Returns:
-      core_mask: [N] bool
-      thr_per_node: [N] float (per-cluster threshold mapped to nodes)
-      dmin_hat: dict[c] -> int
-      radii: [N] float
+    Build cores C_p^0 by smallest Mahalanobis (or cosine) radii within each
+    cluster, and compute per-cluster threshold thr_p = gamma * sqrt(B / d̂_min_p).
+
+    Returns
+    -------
+    core_mask : [N] bool
+        True if node i is selected as a core node of its cluster.
+    thr_per_node : [N] float
+        For each node i, the cluster-level threshold thr_p of its cluster.
+    dmin_hat : dict[int, int]
+        For each cluster id c, the estimated minimum degree d̂_min_c among core nodes.
+    radii : [N] float
+        Per-node radius (Mahalanobis / cosine distance to its cluster centroid).
     """
     device = Z.device
-    import math
-    if B is None: B = Z.size(1)
-    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
-    X = torch.nn.functional.normalize(Z, p=2, dim=1) if normalize_cosine else Z
 
-    # per-cluster diagonal Mahalanobis radii
+    # ensure degrees are on the same device to avoid CPU/CUDA mismatch
+    degrees_excl_self = degrees_excl_self.to(device)
+
+    if B is None:
+        B = Z.size(1)
+
+    # labels → tensor on correct device
+    lbl = torch.from_numpy(labels.astype(np.int64)).to(device)
+
+    # optionally normalize features for cosine metric
+    if normalize_cosine:
+        X = torch.nn.functional.normalize(Z, p=2, dim=1)
+    else:
+        X = Z
+
+    # ---- compute per-cluster diagonal Mahalanobis radii ----
     radii = torch.zeros(X.size(0), dtype=torch.float32, device=device)
-    uniq = sorted(set(labels.tolist()) - {-1})
+    uniq = sorted(set(labels.tolist()) - {-1})  # ignore noise cluster -1
     mu, var = {}, {}
+
     for c in uniq:
         idx = (lbl == c).nonzero(as_tuple=False).view(-1)
-        Xc = X.index_select(0, idx)
-        mc = Xc.mean(0)
+        if idx.numel() == 0:
+            continue
+        Xc = X.index_select(0, idx)          # [n_c, d]
+        mc = Xc.mean(0)                      # [d]
         vc = Xc.var(0, unbiased=False) + 1e-6
         mu[c], var[c] = mc, vc
-        Rc = torch.sqrt(((Xc - mc) ** 2 / vc).sum(1))
+
+        Rc = torch.sqrt(((Xc - mc) ** 2 / vc).sum(1))  # [n_c]
         radii[idx] = Rc
 
-    core_mask   = torch.zeros_like(radii, dtype=torch.bool)
-    thr_per_node= torch.zeros_like(radii)
-    dmin_hat    = {}
+    # ---- select cores + thresholds ----
+    core_mask    = torch.zeros_like(radii, dtype=torch.bool)
+    thr_per_node = torch.zeros_like(radii)
+    dmin_hat     = {}
 
     for c in uniq:
         idx = (lbl == c).nonzero(as_tuple=False).view(-1)
+        if idx.numel() == 0:
+            continue
+
+        # α-fraction: keep k smallest radii within this cluster
         k = max(1, int(math.ceil(alpha * idx.numel())))
         Rc = radii.index_select(0, idx)
-        sel = torch.topk(Rc, k=k, largest=False).indices      # k *smallest* radii
+        sel = torch.topk(Rc, k=k, largest=False).indices  # indices of k *smallest* radii
         core_idx = idx.index_select(0, sel)
         core_mask[core_idx] = True
 
-        dmin = int(degrees_excl_self.index_select(0, core_idx).min().item()) if core_idx.numel() > 0 else 1
+        # estimated min degree among core nodes
+        if core_idx.numel() > 0:
+            dmin = int(degrees_excl_self.index_select(0, core_idx).min().item())
+        else:
+            dmin = 1
         dmin = max(1, dmin)
         dmin_hat[c] = dmin
+
+        # per-cluster threshold (Jiang et al. style)
         thr = float(gamma * (B ** 0.5) / (dmin ** 0.5))
         thr_per_node[idx] = thr
 
     return core_mask, thr_per_node, dmin_hat, radii
+
+
+
+# --- backward compatible wrapper for old name ---
+@torch.no_grad()
+def build_core_mask_gmm(
+    Z: torch.Tensor,
+    labels: np.ndarray,
+    degrees_excl_self: torch.Tensor,
+    alpha: float,
+    gamma: float,
+    B: int,
+):
+    """
+    Thin wrapper around select_gmm_cores to keep old callsites working.
+    Returns (core_mask, thr_per_node, dmin_hat, radii) with same semantics.
+    """
+    core_mask, thr_per_node, dmin_hat, radii = select_gmm_cores(
+        Z=Z,
+        labels=labels,
+        degrees_excl_self=degrees_excl_self,
+        alpha=alpha,
+        gamma=gamma,
+        B=B,
+    )
+    return core_mask, thr_per_node, dmin_hat, radii
+
 
 @torch.no_grad()
 def build_alpha_gamma_allow_mask_gmm(
@@ -1577,36 +1636,63 @@ def cp_prune_inter(
 ###############################################
 
 @torch.no_grad()
-def robust_score_quantile_from_scores(scores, base_block, q: float, max_elems: int = 2_000_000):
-    """Return a *Python float* score threshold at quantile q for the allowed entries of `scores`.
-
-    - Masks out entries where `base_block` is True.
-    - Uniformly subsamples when there are more than `max_elems` valid entries to avoid
-      GPU kernels that error on very large inputs.
-    - Computes the quantile safely on CPU to side–step CUDA `quantile()` size limits.
-    - Falls back to NumPy if PyTorch quantile still throws.
+def robust_score_quantile_from_scores(
+    scores: torch.Tensor,
+    base_block: Optional[torch.Tensor] = None,
+    forbid_mask: Optional[torch.Tensor] = None,
+    q: float = 0.2,
+    max_elems: int = 2_000_000,
+) -> float:
     """
+    Robustly pick a high-score threshold (top-q) while respecting a forbid mask.
+
+    Supports two call patterns:
+      1) robust_score_quantile_from_scores(scores, base_block, q=..., max_elems=...)
+         - legacy style: base_block is a bool mask of disallowed entries.
+      2) robust_score_quantile_from_scores(scores=scores, forbid_mask=..., q=..., max_elems=...)
+         - new style: forbid_mask is the bool mask.
+
+    We internally merge them and only keep entries where the final mask == False.
+    """
+    scores = scores.float()
+    scores_flat = scores.view(-1)
+
+    if scores_flat.numel() == 0:
+        return -float("inf")
+
+    # Unify the two ways of passing forbids
     if forbid_mask is not None and base_block is None:
         base_block = forbid_mask
-    import numpy as _np, torch as _torch
-    if scores is None:
-        return None
-    q = float(max(0.0, min(1.0, q)))
-    s = scores.masked_fill(base_block, float("-inf"))
-    vals = s[s > float("-inf")]
-    n = vals.numel()
-    if n == 0: return None
-    if n > max_elems:
-        idx = _torch.randint(low=0, high=n, size=(max_elems,), device=vals.device)
-        vals = vals.view(-1).index_select(0, idx)
-    vals_cpu = vals.detach().to(dtype=_torch.float32, device="cpu").contiguous().view(-1)
-    try:
-        thr = _torch.quantile(vals_cpu, q).item()
-    except RuntimeError:
-        thr = float(_np.quantile(vals_cpu.numpy(), q))
-    if not (thr == thr) or thr in (float("inf"), float("-inf")):
-        thr = float(_np.quantile(vals_cpu.numpy(), 0.5))
-    return float(thr)
+
+    if base_block is None:
+        base_block = torch.zeros_like(scores, dtype=torch.bool)
+
+    # reshape mask to match scores
+    mask = base_block.view(-1)
+    if mask.numel() != scores_flat.numel():
+        raise ValueError(
+            f"robust_score_quantile_from_scores: mask.numel()={mask.numel()} "
+            f"!= scores.numel()={scores_flat.numel()}"
+        )
+
+    # keep only allowed entries
+    valid_scores = scores_flat[~mask]
+
+    if valid_scores.numel() == 0:
+        return -float("inf")
+
+    # downsample if too many elements (for robustness / speed)
+    if valid_scores.numel() > max_elems:
+        idx = torch.randperm(valid_scores.numel(), device=valid_scores.device)[:max_elems]
+        valid_scores = valid_scores[idx]
+
+    kth = max(1, int(round(q * valid_scores.numel())))
+    kth = min(kth, valid_scores.numel())
+
+    topk = torch.topk(valid_scores, k=kth, largest=True)
+    thr = float(topk.values.min().item())
+    return thr
+
 
 @torch.no_grad()
 def drop_feature(x: torch.Tensor, drop_prob: float, inplace: bool = False, gen: torch.Generator | None = None):
@@ -1912,6 +1998,199 @@ def Plot(dataset_str, roc_history, modification_ratio_history):
     plt.savefig(f'/home/retro/SECRET/pic/{dataset_str}_modification.png')
     plt.clf()
 
+def VisualizeCluster(
+    dataset_str: str,
+    Z: torch.Tensor,
+    cluster_labels,
+    core_mask: Optional[torch.Tensor] = None,
+    scope: Optional[str] = None,
+    suffix: str = "",
+    out_dir: str = "/home/retro/ARON/pic/cluster",
+):
+    # ---- to numpy ----
+    if torch.is_tensor(Z):
+        Z_np = Z.detach().cpu().numpy()
+    else:
+        Z_np = np.asarray(Z)
+
+    if torch.is_tensor(cluster_labels):
+        lbl = cluster_labels.detach().cpu().numpy()
+    else:
+        lbl = np.asarray(cluster_labels)
+
+    N = Z_np.shape[0]
+    assert lbl.shape[0] == N
+
+    if core_mask is not None:
+        if torch.is_tensor(core_mask):
+            core = core_mask.detach().cpu().numpy().astype(bool)
+        else:
+            core = np.asarray(core_mask).astype(bool)
+        assert core.shape[0] == N
+    else:
+        core = np.zeros(N, dtype=bool)
+
+    # ---- TSNE to 2D (shared for both plots) ----
+    trans = TSNE(
+        n_components=2,
+        learning_rate="auto",
+        init="pca",
+        random_state=0,   # fixed across runs
+    )
+    emb_2d = trans.fit_transform(Z_np)
+
+    df = pd.DataFrame(emb_2d, columns=["x", "y"])
+    df["cluster"] = lbl
+    df["core"] = core
+
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = f"{dataset_str}_cluster_tsne"
+    if scope is not None:
+        base_name += f"_{scope}"
+    if suffix:
+        base_name += f"{suffix}"
+
+    # fixed “zoom” across runs
+    X_MIN, X_MAX = -70, 70
+    Y_MIN, Y_MAX = -70, 70
+
+    # =====================================================
+    # (1) cluster-colored
+    # =====================================================
+    fig, ax = plt.subplots(figsize=(7, 7))
+    uniq_clusters = np.unique(lbl)
+    for c in uniq_clusters:
+        mask = (df["cluster"] == c)
+        label = "noise (cluster = -1)" if c == -1 else f"cluster {int(c)}"
+        ax.scatter(
+            df.loc[mask, "x"],
+            df.loc[mask, "y"],
+            s=8,
+            alpha=0.7,
+            label=label,
+        )
+
+    ax.set_xlim(X_MIN, X_MAX)
+    ax.set_ylim(Y_MIN, Y_MAX)
+    ax.set_aspect("equal", "box")
+    ax.set(xlabel="$X_1$", ylabel="$X_2$")
+
+    title = f"TSNE by GMM clusters for {dataset_str}"
+    if scope is not None:
+        title += f" | scope={scope}"
+    if suffix:
+        title += f" ({suffix})"
+    plt.title(title)
+    plt.legend(markerscale=2, fontsize=8, bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    out_path_cluster = os.path.join(out_dir, base_name + "_bycluster.png")
+    plt.tight_layout()
+    plt.savefig(out_path_cluster, dpi=300)
+    plt.clf()
+    print(f"[VIS] saved cluster-colored TSNE to: {out_path_cluster}")
+
+    # =====================================================
+    # (2) role-colored (noise / C0p core / CP non-core)
+    # =====================================================
+    role = np.zeros(N, dtype=int)
+    noise_mask = (lbl == -1)
+    role[noise_mask] = 0
+    non_noise = ~noise_mask
+    role[non_noise & core] = 1
+    role[non_noise & ~core] = 2
+    df["role"] = role
+
+    role_names = {
+        0: "noise (cluster = -1)",
+        1: "C0p core",
+        2: "CP non-core",
+    }
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for r in [0, 1, 2]:
+        sub = df[df["role"] == r]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["x"],
+            sub["y"],
+            s=8,
+            alpha=0.7,
+            label=role_names[r],
+        )
+
+    ax.set_xlim(X_MIN, X_MAX)
+    ax.set_ylim(Y_MIN, Y_MAX)
+    ax.set_aspect("equal", "box")
+    ax.set(xlabel="$X_1$", ylabel="$X_2$")
+
+    title = f"TSNE by scope-role for {dataset_str}"
+    if scope is not None:
+        title += f" | scope={scope}"
+    if suffix:
+        title += f" ({suffix})"
+    plt.title(title)
+    plt.legend(markerscale=2, fontsize=8, bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    out_path_role = os.path.join(out_dir, base_name + "_byrole.png")
+    plt.tight_layout()
+    plt.savefig(out_path_role, dpi=300)
+    plt.clf()
+    print(f"[VIS] saved role-colored TSNE to: {out_path_role}")
+
+def save_tsne_cache(
+    out_dir: str,
+    *,
+    Z: torch.Tensor,
+    gmm_labels: np.ndarray,
+    core_mask: np.ndarray,
+    y: Optional[np.ndarray] = None,
+    radii: Optional[np.ndarray] = None,
+    meta: Optional[dict] = None,
+    prefix: str = "final",
+) -> None:
+    """Save embeddings + GMM/core annotations for later TSNE and evidence plots."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    Z_cpu = Z.detach().to("cpu")
+    if Z_cpu.dtype != torch.float32:
+        Z_cpu = Z_cpu.float()
+    torch.save(Z_cpu, os.path.join(out_dir, f"{prefix}_Z.pt"))
+
+    np.save(os.path.join(out_dir, f"{prefix}_gmm_labels.npy"), np.asarray(gmm_labels, dtype=np.int64))
+    np.save(os.path.join(out_dir, f"{prefix}_core_mask.npy"), np.asarray(core_mask, dtype=bool))
+
+    if y is not None:
+        np.save(os.path.join(out_dir, f"{prefix}_y.npy"), np.asarray(y))
+    if radii is not None:
+        np.save(os.path.join(out_dir, f"{prefix}_radii.npy"), np.asarray(radii, dtype=np.float32))
+
+    if meta is None:
+        meta = {}
+    meta_path = os.path.join(out_dir, "meta.json")
+
+    # merge meta if exists
+    try:
+        if os.path.exists(meta_path):
+            import json
+            with open(meta_path, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old, dict):
+                old.update(meta)
+                meta = old
+    except Exception:
+        pass
+
+    try:
+        import json
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[TSNE|CACHE] meta.json write failed: {e}")
+
+    print(f"[TSNE|CACHE] saved -> {out_dir} (prefix={prefix})")
+
+
 def Visualize(dataset_str, Z, labels):
     transform = TSNE  # PCA
 
@@ -2000,7 +2279,131 @@ def Visualize_with_edge(dataset_str, Z, labels, edge_index):
                     yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
                     )
     fig.show()
-    
+
+def build_static_pruned_graph_for_frac(
+    *,
+    dataset_str: str,
+    device: torch.device,
+    encoder: torch.nn.Module,
+    features: torch.Tensor,
+    adj_train,                  # scipy.sparse or np.ndarray, train graph (no val/test edges)
+    gmm_k: int,
+    gmm_tau: float,
+    alpha_c0p: float,
+    gamma_c0p: float,
+    degree_floor: int,
+    sweep_scope: str,
+    prune_frac: float,
+):
+    """
+    Construct a SINGLE static pruned training graph for a given prune_frac.
+
+    Steps:
+      1) Use current encoder (already trained on *full* train graph) to get Z0.
+      2) Run GMM to get cluster labels.
+      3) Build candidate edge set according to sweep_scope (cp_all / c0p_only / cp_minus_c0p).
+      4) Rank candidates with the same "worse first" rule as run_c0p_sweep_static.
+      5) Drop top (prune_frac * num_cand) edges subject to degree_floor.
+      6) Return the pruned adjacency as scipy CSR.
+    """
+    # Ensure encoder is in eval mode and tensors on device
+    encoder.eval()
+    features = features.to(device)
+
+    # ---- Base graph as dense numpy ----
+    if hasattr(adj_train, "toarray"):
+        g_np = adj_train.toarray().astype(np.float32)
+    else:
+        g_np = np.array(adj_train, dtype=np.float32)
+    np.fill_diagonal(g_np, 0.0)
+    N = g_np.shape[0]
+
+    # ---- BASE embedding ----
+    adj0 = sp.csr_matrix(g_np)
+    edge_index0 = from_scipy_sparse_matrix(adj0)[0].to(device)
+    with torch.no_grad():
+        Z0 = encoder(features, edge_index0)
+
+    # ---- GMM clusters (same as sweep) ----
+    labels_cluster = gmm_labels(Z0.detach(), K=gmm_k, tau=gmm_tau, metric="cosine")
+    print(f"[STATIC-PRUNE] GMM non-noise clusters = {(labels_cluster >= 0).sum()} / {labels_cluster.shape[0]}")
+
+    # ---- FIXED core mask from BASE (C0p) ----
+    deg_base_np = g_np.sum(axis=1)
+    core_mask_fixed, cstats = build_core_mask_gmm(
+        Z=Z0.detach(),
+        labels=labels_cluster,
+        degrees_excl_self=torch.from_numpy(deg_base_np).to(device),
+        alpha=alpha_c0p,
+        gamma=gamma_c0p,
+        B=Z0.size(1),
+    )
+    core_mask_fixed_np = core_mask_fixed.bool().detach().cpu().numpy()
+    print(f"[STATIC-PRUNE] C0p cores: {int(core_mask_fixed_np.sum())} / {N}")
+
+    # ---- Candidate edges by scope (same as run_c0p_sweep_static) ----
+    g_torch = torch.from_numpy(g_np).to(device)
+    lbl_t = torch.from_numpy(labels_cluster.astype(np.int64)).to(device)
+    same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & (lbl_t[:, None] != -1)
+    existing = (g_torch > 0)
+    core_t = torch.from_numpy(core_mask_fixed_np).to(device)
+
+    if sweep_scope == "cp_all":
+        cand = existing.clone()
+    elif sweep_scope == "c0p_only":
+        both_core = (core_t[:, None] & core_t[None, :])
+        cand = existing & same_cluster & both_core
+    elif sweep_scope == "cp_minus_c0p":
+        both_core = (core_t[:, None] & core_t[None, :])
+        cand = existing & same_cluster & (~both_core)
+    else:
+        raise ValueError(f"Unknown sweep_scope: {sweep_scope}")
+
+    cand.fill_diagonal_(False)
+    idx_i, idx_j = cand.triu(1).nonzero(as_tuple=True)
+    num_cand = int(idx_i.numel())
+    print(f"[STATIC-PRUNE] scope={sweep_scope} candidate edges = {num_cand}")
+    if num_cand == 0 or prune_frac <= 0.0:
+        # nothing to prune
+        return sp.csr_matrix(g_np)
+
+    # ---- Rank candidate edges with same scoring rule as sweep ----
+    pairs = torch.stack([idx_i, idx_j], dim=1)
+    scores = _rank_c0p_pairs_scores(
+        Z0=Z0, g=g_torch, labels_cluster=labels_cluster, pairs=pairs, metric="cosine"
+    )
+    # scores: bigger = "worse" / to prune earlier
+    order = torch.argsort(scores, descending=True)
+    pairs = pairs[order]
+
+    # ---- Decide number of edges to prune ----
+    max_remove = int(round(prune_frac * num_cand))
+    if max_remove <= 0:
+        return sp.csr_matrix(g_np)
+
+    # degree (excl self) for degree_floor enforcement
+    deg = g_np.sum(axis=1).astype(np.int64)
+    enforce_floor = degree_floor > 0
+
+    removed = 0
+    for i_j in pairs:
+        if removed >= max_remove:
+            break
+        i = int(i_j[0].item()); j = int(i_j[1].item())
+        if g_np[i, j] == 0.0:
+            continue
+        if enforce_floor and (deg[i] <= degree_floor or deg[j] <= degree_floor):
+            continue
+        g_np[i, j] = 0.0
+        g_np[j, i] = 0.0
+        deg[i] -= 1
+        deg[j] -= 1
+        removed += 1
+
+    print(f"[STATIC-PRUNE] removed_edges={removed} / {num_cand} (~{removed/float(num_cand):.3f})")
+    return sp.csr_matrix(g_np)
+
+  
 @torch.no_grad()
 def run_c0p_sweep_static(
     *,
