@@ -7,21 +7,21 @@ MAIN=src/aron_main.py
 
 # Datasets to run (edit "other two" here if needed)
 #DATASETS=("cora" "Cora_ML" "citeseer" "LastFMAsia")
-DATASETS=("Cora_ML" "LastFMAsia")
+DATASETS=("cora")
 
 # Scope tokens MUST match your remove_state init parsing
 SCOPES=(cp_all c0p_only cp_minus_c0p)
 
 # Keep % sweep
 #KEEPS=(100 97 94 91 88 85 82 79 76 73 70 50 25 5)
-KEEPS=(100 97 94 91 88 85 82 79 76 73 70 50 25 5)
+KEEPS=(99 98 96 95 93 92)
 
 # Kind: intra/inter/both (you can set just "both" if you want)
 KINDS=(intra)
 
 # Seeds (you can do seed0 only first, then extend)
-SEEDS=({5..30})
-#SEEDS=(0)
+#SEEDS=({5..30})
+SEEDS=(0..49)
 
 # Global run options you typically use (edit as needed)
 COMMON_ARGS=(
