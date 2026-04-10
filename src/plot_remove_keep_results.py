@@ -7,10 +7,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 FLOAT_RE = r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"
-COLOR_CYCLE = ["red", "green", "blue"]
 
 
 def find_logs(log_root: str) -> List[Path]:
@@ -20,8 +20,7 @@ def find_logs(log_root: str) -> List[Path]:
 
 def parse_filename_meta(p: Path) -> Dict[str, Optional[str]]:
     """
-    Tries to parse dataset/scope/keep/seed from filename patterns like:
-      citeseer_remove_only_intra_c0p_only_keep5_seed0.log
+    Tries to parse dataset/kind/scope/keep/seed from filename patterns like:
       cora_remove_only_both_cp_minus_c0p_keep90_seed3.log
     """
     name = p.name
@@ -48,11 +47,13 @@ def parse_one_log(p: Path, hit_k: int, use_best: bool) -> Dict:
     with p.open("r", errors="ignore") as f:
         lines = f.readlines()
 
+    # optional: dataset line inside log
     for line in lines:
         if line.startswith("Dataset:"):
             dataset = line.split("Dataset:", 1)[1].strip()
             break
 
+    # authoritative keep/scope from init line
     for line in lines:
         m = re.search(r"\[REMOVE-ONLY-INIT\]\s*scope=([A-Za-z0-9_\-]+)\s+keep=(\d+)%", line)
         if m:
@@ -71,21 +72,14 @@ def parse_one_log(p: Path, hit_k: int, use_best: bool) -> Dict:
             break
 
     removed_tot_re = re.compile(r"\bremoved_scope_so_far=(\d+)\s*/\s*(\d+)")
-    removed_this_re = re.compile(r"\bremoved_this_epoch=(\d+)")
     removed_total_final = None
     target_total_seen = None
-    removed_this_final = None
-
     for line in lines:
         m = removed_tot_re.search(line)
         if m:
             removed_total_final = int(m.group(1))
             target_total_seen = int(m.group(2))
-        m2 = removed_this_re.search(line)
-        if m2:
-            removed_this_final = int(m2.group(1))
 
-    kept_edges_final = None
     keep_pct_achieved = None
     remove_pct_achieved = None
     if E_scope0 is not None and removed_total_final is not None:
@@ -93,9 +87,9 @@ def parse_one_log(p: Path, hit_k: int, use_best: bool) -> Dict:
         keep_pct_achieved = 100.0 * kept_edges_final / float(max(1, E_scope0))
         remove_pct_achieved = 100.0 * removed_total_final / float(max(1, E_scope0))
 
+    # hit parsing
     best_hit = None
     best_epoch = None
-
     hit_best_re = re.compile(
         rf"best\s+hit@{hit_k}\s+epoch\s*=\s*(\d+),\s*hit@{hit_k}\s*=\s*{FLOAT_RE}"
     )
@@ -121,50 +115,65 @@ def parse_one_log(p: Path, hit_k: int, use_best: bool) -> Dict:
                 if mm:
                     hit_value = float(mm.group(1))
 
+    # radius end (optional)
     rad_re = re.compile(rf"\[RADIUS\]\s*epoch=(\d+)\s*mean={FLOAT_RE}")
-    r_epochs = []
     r_means = []
     for line in lines:
         m = rad_re.search(line)
         if m:
-            r_epochs.append(int(m.group(1)))
             r_means.append(float(m.group(2)))
-
-    if len(r_means) > 0:
-        radius_start = float(r_means[0])
-        radius_end = float(r_means[-1])
-        radius_best = float(np.min(r_means))
-        radius_best_epoch = int(r_epochs[int(np.argmin(r_means))])
-    else:
-        radius_start = radius_end = radius_best = None
-        radius_best_epoch = None
-
-    keep_i = int(keep) if keep is not None else None
-    seed_i = int(seed) if seed is not None else None
+    radius_end = float(r_means[-1]) if r_means else None
 
     return {
         "path": str(p),
         "dataset": dataset,
         "kind": kind,
         "scope": scope,
-        "keep": keep_i,
-        "seed": seed_i,
-        "hit_k": hit_k,
+        "keep": int(keep) if keep is not None else None,
+        "seed": int(seed) if seed is not None else None,
         "hit": hit_value,
-        "best_epoch": best_epoch,
-        "radius_start": radius_start,
         "radius_end": radius_end,
-        "radius_best": radius_best,
-        "radius_best_epoch": radius_best_epoch,
         "E_scope0": E_scope0,
-        "target_remove_total": target_remove_total,
-        "target_total_seen": target_total_seen,
         "removed_total_final": removed_total_final,
-        "removed_this_final": removed_this_final,
-        "kept_edges_final": kept_edges_final,
         "keep_pct_achieved": keep_pct_achieved,
         "remove_pct_achieved": remove_pct_achieved,
+        "target_remove_total": target_remove_total,
+        "target_total_seen": target_total_seen,
     }
+
+
+def add_baseline_and_delta_hit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - hit_base: mean hit at keep=100 for (dataset, kind, seed)
+      - delta_hit: (hit - hit_base) / hit_base
+    """
+    base = (
+        df[(df["keep"] == 100) & df["hit"].notna()]
+        .groupby(["dataset", "kind", "seed"], dropna=False)["hit"]
+        .mean()
+        .reset_index()
+        .rename(columns={"hit": "hit_base"})
+    )
+    df = df.merge(base, on=["dataset", "kind", "seed"], how="left")
+    df["delta_hit"] = (df["hit"] - df["hit_base"]) / df["hit_base"]
+    return df
+
+
+def _compute_x(work: pd.DataFrame, x_mode: str) -> Tuple[pd.DataFrame, str]:
+    w = work.copy()
+    if x_mode == "remove_frac":
+        w["x"] = w["removed_total_final"] / w["E_scope0"].replace(0, np.nan)
+        xlabel = "Removed fraction (achieved)"
+    elif x_mode == "remove_pct":
+        w["x"] = w["remove_pct_achieved"]
+        xlabel = "Removed % (achieved)"
+    elif x_mode == "removed_count":
+        w["x"] = w["removed_total_final"]
+        xlabel = "Removed edges"
+    else:
+        raise ValueError(f"Unknown x_mode={x_mode}")
+    return w, xlabel
 
 
 def _trim_outliers_quantile(
@@ -175,13 +184,6 @@ def _trim_outliers_quantile(
     outlier_side: str,
     min_group_n: int = 4,
 ) -> Tuple[pd.DataFrame, int]:
-    """
-    Quantile-trim outliers within each group.
-      - outlier_side='both' trims outlier_frac total (half low tail + half high tail)
-      - 'high' trims only upper tail
-      - 'low' trims only lower tail
-    Returns (trimmed_df, num_removed).
-    """
     if outlier_frac <= 0:
         return df, 0
     if not (0.0 <= outlier_frac < 0.5):
@@ -195,8 +197,8 @@ def _trim_outliers_quantile(
     work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
 
     keep_mask = pd.Series(True, index=work.index)
-
     g = work.groupby(list(group_cols), dropna=False)
+
     for _, idx in g.groups.items():
         idx = list(idx)
         s = work.loc[idx, value_col].dropna()
@@ -225,187 +227,218 @@ def _trim_outliers_quantile(
     return trimmed, removed
 
 
-def agg_mean_std(
-    df: pd.DataFrame,
-    value_col: str,
-    *,
-    outlier_frac: float = 0.0,
-    outlier_side: str = "both",
-) -> pd.DataFrame:
-    group_cols = ["dataset", "scope", "keep"]
-    df2, removed = _trim_outliers_quantile(df, group_cols, value_col, outlier_frac, outlier_side)
-    if removed > 0:
-        print(
-            f"[OUTLIER] trimmed {removed} rows for value='{value_col}' within groups={group_cols} "
-            f"(frac={outlier_frac}, side={outlier_side})"
-        )
+def _legend_outside_right(fig, ax, ds2c: Dict[str, tuple], sc2m: Dict[str, str]):
+    """
+    Put Dataset and Scope legends OUTSIDE the axes, on the right side.
+    """
+    ds_handles = [
+        Line2D([0], [0], marker="o", linestyle="None", markersize=7,
+               markerfacecolor=ds2c[d], markeredgecolor=ds2c[d])
+        for d in ds2c.keys()
+    ]
+    ds_labels = list(ds2c.keys())
 
-    g = df2.groupby(group_cols, dropna=False)[value_col]
-    out = g.agg(["mean", "std", "count"]).reset_index()
-    out = out.rename(columns={"mean": f"{value_col}_mean", "std": f"{value_col}_std", "count": "n"})
-    return out
+    sc_handles = [
+        Line2D([0], [0], marker=sc2m[s], linestyle="None", markersize=7,
+               markerfacecolor="black", markeredgecolor="black")
+        for s in sc2m.keys()
+    ]
+    sc_labels = list(sc2m.keys())
 
+    leg1 = ax.legend(
+        ds_handles, ds_labels, title="Dataset",
+        loc="upper left", bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0, frameon=True
+    )
+    ax.add_artist(leg1)
 
-def agg_mean_std_by_x(
-    df: pd.DataFrame,
-    x_col: str,
-    value_col: str,
-    *,
-    outlier_frac: float = 0.0,
-    outlier_side: str = "both",
-) -> pd.DataFrame:
-    group_cols = ["dataset", "scope", x_col]
-    df2, removed = _trim_outliers_quantile(df, group_cols, value_col, outlier_frac, outlier_side)
-    if removed > 0:
-        print(
-            f"[OUTLIER] trimmed {removed} rows for value='{value_col}' within groups={group_cols} "
-            f"(frac={outlier_frac}, side={outlier_side})"
-        )
+    ax.legend(
+        sc_handles, sc_labels, title="Scope",
+        loc="upper left", bbox_to_anchor=(1.02, 0.52),
+        borderaxespad=0.0, frameon=True
+    )
 
-    g = df2.groupby(group_cols, dropna=False)[value_col]
-    out = g.agg(["mean", "std", "count"]).reset_index()
-    out = out.rename(columns={"mean": f"{value_col}_mean", "std": f"{value_col}_std", "count": "n"})
-    return out
+    # reserve right margin for legends
+    fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
 
 
-def _plot_line_or_errorbar(x, y, yerr, label: str, show_std: bool, color: str):
-    if show_std and yerr is not None:
-        plt.errorbar(
-            x,
-            y,
-            yerr=yerr,
-            marker="o",
-            color=color,
-            ecolor=color,
-            capsize=3,
-            label=label,
-        )
-    else:
-        plt.plot(
-            x,
-            y,
-            marker="o",
-            color=color,
-            label=label,
-        )
-
-
-def plot_keep_curve(
-    agg: pd.DataFrame,
-    y_mean: str,
-    y_std: str,
-    out_path: Path,
-    title: str,
-    ylabel: str,
-    show_std: bool,
-):
-    for dataset, sub in agg.groupby("dataset"):
-        plt.figure()
-        for i, (scope, ss) in enumerate(sub.groupby("scope")):
-            color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
-            ss = ss.sort_values("keep")
-            x = ss["keep"].to_numpy()
-            y = ss[y_mean].to_numpy()
-            e = ss[y_std].to_numpy() if (show_std and y_std in ss.columns) else None
-            _plot_line_or_errorbar(x, y, e, label=str(scope), show_std=show_std, color=color)
-        plt.gca().invert_xaxis()
-        plt.xlabel("Keep % (nominal; from ver)")
-        plt.ylabel(ylabel)
-        plt.title(f"{title} | {dataset}")
-        plt.legend()
-        plt.tight_layout()
-        fp = out_path.parent / f"{out_path.stem}_{dataset}{out_path.suffix}"
-        plt.savefig(fp, dpi=200)
-        plt.close()
-
-
-def plot_x_curve(
-    agg: pd.DataFrame,
-    x_col: str,
-    y_mean: str,
-    y_std: str,
-    out_path: Path,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    show_std: bool,
-    invert_x: bool = False,
-):
-    for dataset, sub in agg.groupby("dataset"):
-        plt.figure()
-        for i, (scope, ss) in enumerate(sub.groupby("scope")):
-            color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
-            ss = ss.sort_values(x_col)
-            x = ss[x_col].to_numpy()
-            y = ss[y_mean].to_numpy()
-            e = ss[y_std].to_numpy() if (show_std and y_std in ss.columns) else None
-            _plot_line_or_errorbar(x, y, e, label=str(scope), show_std=show_std, color=color)
-        if invert_x:
-            plt.gca().invert_xaxis()
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.title(f"{title} | {dataset}")
-        plt.legend()
-        plt.tight_layout()
-        fp = out_path.parent / f"{out_path.stem}_{dataset}{out_path.suffix}"
-        plt.savefig(fp, dpi=200)
-        plt.close()
-
-
-def plot_scatter_removed_vs_hit(
+def plot_scatter(
     df: pd.DataFrame,
     out_path: Path,
-    title: str,
     hit_k: int,
+    x_mode: str,
+    y_col: str,      # "hit" or "delta_hit"
+    title: str,
+    outlier_frac: float = 0.0,
+    outlier_side: str = "both",
+):
+    work, xlabel = _compute_x(df, x_mode)
+
+    if y_col == "hit":
+        ylabel = f"Hit@{hit_k} (absolute)"
+    elif y_col == "delta_hit":
+        ylabel = f"ΔHit@{hit_k} vs keep=100 (relative)"
+    else:
+        raise ValueError(f"Unknown y_col={y_col}")
+
+    sub = work.dropna(subset=["dataset", "scope", "x", y_col]).copy()
+    if len(sub) == 0:
+        print(f"[WARN] no rows for {out_path.name}; skipping.")
+        return
+
+    # outlier trim (on y)
+    if outlier_frac > 0:
+        if x_mode in ("remove_frac", "removed_count"):
+            group_cols = ["dataset", "scope", "removed_total_final"]
+        else:
+            group_cols = ["dataset", "scope", "remove_pct_achieved"]
+
+        sub2, removed = _trim_outliers_quantile(
+            sub,
+            group_cols=group_cols,
+            value_col=y_col,
+            outlier_frac=outlier_frac,
+            outlier_side=outlier_side,
+            min_group_n=4,
+        )
+        if removed > 0:
+            print(
+                f"[OUTLIER] trimmed {removed} rows for scatter value='{y_col}' within groups={group_cols} "
+                f"(frac={outlier_frac}, side={outlier_side})"
+            )
+        sub = sub2
+
+    if len(sub) == 0:
+        print(f"[WARN] no rows after outlier trim for {out_path.name}; skipping.")
+        return
+
+    # wider figure because legends sit outside on the right
+    fig, ax = plt.subplots(figsize=(10.8, 5))
+    cmap = plt.get_cmap("tab10")
+
+    datasets = sorted(sub["dataset"].unique())
+    scopes = sorted(sub["scope"].unique())
+
+    ds2c = {d: cmap(i % 10) for i, d in enumerate(datasets)}
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+    sc2m = {s: markers[i % len(markers)] for i, s in enumerate(scopes)}
+
+    for (d, s), g in sub.groupby(["dataset", "scope"], dropna=False):
+        ax.scatter(
+            g["x"],
+            g[y_col],
+            c=[ds2c.get(d, "gray")],
+            marker=sc2m.get(s, "o"),
+            alpha=0.8,
+            edgecolors="none",
+        )
+
+    if y_col == "delta_hit":
+        ax.axhline(0.0, linestyle="--", linewidth=1.0, color="black", alpha=0.35)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+
+    _legend_outside_right(fig, ax, ds2c, sc2m)
+
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"[OK] wrote {out_path}")
+
+
+def _plot_suite(
+    df: pd.DataFrame,
+    out_dir: Path,
+    hit_k: int,
+    x_mode: str,
+    use_best: bool,
+    outlier_frac: float,
+    outlier_side: str,
+    keep_window: Optional[Tuple[int, int]],
+    prefix: str,
+    title_suffix: str,
 ):
     """
-    Raw scatter: each point is one run (one log/seed).
-    x = removed_total_final, y = hit
+    Generates:
+      - full abs
+      - full delta
+      - (optional) keep-window abs
+      - (optional) keep-window delta
+    Filenames are prefixed with `prefix`.
     """
-    for dataset, sub in df.groupby("dataset"):
-        plt.figure()
-        for i, (scope, ss) in enumerate(sub.groupby("scope")):
-            color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
-            plt.scatter(
-                ss["removed_total_final"].to_numpy(),
-                ss["hit"].to_numpy(),
-                color=color,
-                label=str(scope),
-                alpha=0.8,
-            )
-        plt.xlabel("Removed edges in scope (achieved, final)")
-        plt.ylabel(f"Hit@{hit_k}")
-        plt.title(f"{title} | {dataset}")
-        plt.legend()
-        plt.tight_layout()
-        fp = out_path.parent / f"{out_path.stem}_{dataset}{out_path.suffix}"
-        plt.savefig(fp, dpi=200)
-        plt.close()
+    plot_scatter(
+        df=df,
+        out_path=out_dir / f"{prefix}scatter_hit_full_abs.png",
+        hit_k=hit_k,
+        x_mode=x_mode,
+        y_col="hit",
+        title=f"Hit vs Removal (all keeps, absolute){title_suffix}",
+        outlier_frac=outlier_frac,
+        outlier_side=outlier_side,
+    )
+    plot_scatter(
+        df=df,
+        out_path=out_dir / f"{prefix}scatter_hit_full_delta.png",
+        hit_k=hit_k,
+        x_mode=x_mode,
+        y_col="delta_hit",
+        title=f"Hit vs Removal (all keeps, relative to keep=100){title_suffix}",
+        outlier_frac=outlier_frac,
+        outlier_side=outlier_side,
+    )
+
+    if keep_window is not None:
+        lo, hi = keep_window
+        dfw = df[(df["keep"] >= lo) & (df["keep"] <= hi)].copy()
+
+        plot_scatter(
+            df=dfw,
+            out_path=out_dir / f"{prefix}scatter_hit_keep{hi}_{lo}_abs.png",
+            hit_k=hit_k,
+            x_mode=x_mode,
+            y_col="hit",
+            title=f"Hit vs Removal (keep {hi}–{lo}, absolute){title_suffix}",
+            outlier_frac=outlier_frac,
+            outlier_side=outlier_side,
+        )
+        plot_scatter(
+            df=dfw,
+            out_path=out_dir / f"{prefix}scatter_hit_keep{hi}_{lo}_delta.png",
+            hit_k=hit_k,
+            x_mode=x_mode,
+            y_col="delta_hit",
+            title=f"Hit vs Removal (keep {hi}–{lo}, relative to keep=100){title_suffix}",
+            outlier_frac=outlier_frac,
+            outlier_side=outlier_side,
+        )
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--log_root", type=str, required=True)
-    ap.add_argument("--out_dir", type=str, required=True)
+    ap.add_argument("--log_root", required=True)
+    ap.add_argument("--out_dir", required=True)
     ap.add_argument("--hit_k", type=int, default=10)
-    ap.add_argument("--use_best", action="store_true", help="use 'best hit@K' lines instead of final test line")
-    ap.add_argument("--show_std", action="store_true", help="show std-dev errorbars (otherwise plot mean only)")
+    ap.add_argument("--x_mode", default="remove_frac", choices=["remove_frac", "remove_pct", "removed_count"])
+
+    ap.add_argument("--use_best", action="store_true", help="Use 'best hit@K' line instead of [FINAL TEST].")
+
+    # keep-window plots (e.g., keep 100~80)
+    ap.add_argument("--also_plot_keep_window", action="store_true")
+    ap.add_argument("--keep_min", type=int, default=80)
+    ap.add_argument("--keep_max", type=int, default=100)
 
     # outlier trimming
+    ap.add_argument("--outlier_frac", type=float, default=0.0)
+    ap.add_argument("--outlier_side", type=str, default="both", choices=["both", "high", "low"])
+
+    # NEW: per-dataset / per-scope / per-(dataset,scope) suites
+    ap.add_argument("--plot_per_dataset", action="store_true", help="Also plot a full suite for each dataset (1 at a time).")
+    ap.add_argument("--plot_per_scope", action="store_true", help="Also plot a full suite for each scope (1 at a time).")
     ap.add_argument(
-        "--outlier_frac",
-        type=float,
-        default=0.0,
-        help="portion to trim as outliers within each group BEFORE mean/std. "
-        "If side=both, trims half from low tail and half from high tail. "
-        "Example: 0.1 => drop 5% lowest + 5% highest. (range: [0, 0.5))",
-    )
-    ap.add_argument(
-        "--outlier_side",
-        type=str,
-        default="both",
-        choices=["both", "high", "low"],
-        help="which tail(s) to trim when --outlier_frac > 0",
+        "--plot_per_dataset_scope",
+        action="store_true",
+        help="Also plot a full suite for each (dataset, scope) pair (1 at a time).",
     )
 
     args = ap.parse_args()
@@ -413,132 +446,104 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logs = find_logs(args.log_root)
-    if not logs:
-        print(f"[ERROR] No .log files found under: {args.log_root}")
-        return
-
     rows = []
-    for p in logs:
+    for p in find_logs(args.log_root):
         try:
-            rows.append(parse_one_log(p, hit_k=args.hit_k, use_best=args.use_best))
+            rows.append(parse_one_log(p, args.hit_k, use_best=args.use_best))
         except Exception as e:
             print(f"[WARN] failed parsing {p}: {e}")
 
-    df = pd.DataFrame(rows)
-    df = df.dropna(subset=["dataset", "scope", "keep"])
+    df = pd.DataFrame(rows).dropna(subset=["dataset", "scope", "keep"])
+    df = add_baseline_and_delta_hit(df)
+    df.to_csv(out_dir / "parsed.csv", index=False)
+    print(f"[OK] wrote {out_dir / 'parsed.csv'}")
 
-    csv_path = out_dir / "remove_keep_parsed.csv"
-    df.to_csv(csv_path, index=False)
-    print(f"[OK] wrote {csv_path}")
+    keep_window = None
+    if args.also_plot_keep_window:
+        lo, hi = sorted([args.keep_min, args.keep_max])
+        keep_window = (lo, hi)
 
-    # nominal keep%
-    hit_agg = agg_mean_std(
-        df.dropna(subset=["hit"]),
-        "hit",
-        outlier_frac=args.outlier_frac,
-        outlier_side=args.outlier_side,
-    )
-    rad_agg = agg_mean_std(
-        df.dropna(subset=["radius_end"]),
-        "radius_end",
-        outlier_frac=args.outlier_frac,
-        outlier_side=args.outlier_side,
-    )
-
-    hit_agg.to_csv(out_dir / "remove_keep_hit_agg.csv", index=False)
-    rad_agg.to_csv(out_dir / "remove_keep_radius_agg.csv", index=False)
-
-    plot_keep_curve(
-        hit_agg,
-        y_mean="hit_mean",
-        y_std="hit_std",
-        out_path=out_dir / f"keep_vs_hit@{args.hit_k}.png",
-        title=f"Nominal Keep% vs Hit@{args.hit_k}" + (" (best)" if args.use_best else " (final)"),
-        ylabel=f"Hit@{args.hit_k}",
-        show_std=args.show_std,
-    )
-
-    plot_keep_curve(
-        rad_agg,
-        y_mean="radius_end_mean",
-        y_std="radius_end_std",
-        out_path=out_dir / "keep_vs_radius_end.png",
-        title="Nominal Keep% vs Radius (end of training)",
-        ylabel="Radius (cosine-normalized)",
-        show_std=args.show_std,
-    )
-
-    # achieved removals (count): keep only rows that have all needed fields
-    df_rm = df.dropna(subset=["removed_total_final", "hit", "radius_end"])
-
-    # aggregate curves (mean/std) against removed_total_final
-    hit_agg_rm = agg_mean_std_by_x(
-        df_rm,
-        "removed_total_final",
-        "hit",
-        outlier_frac=args.outlier_frac,
-        outlier_side=args.outlier_side,
-    )
-    rad_agg_rm = agg_mean_std_by_x(
-        df_rm,
-        "removed_total_final",
-        "radius_end",
-        outlier_frac=args.outlier_frac,
-        outlier_side=args.outlier_side,
-    )
-
-    hit_agg_rm.to_csv(out_dir / "removed_count_hit_agg.csv", index=False)
-    rad_agg_rm.to_csv(out_dir / "removed_count_radius_agg.csv", index=False)
-
-    plot_x_curve(
-        hit_agg_rm,
-        x_col="removed_total_final",
-        y_mean="hit_mean",
-        y_std="hit_std",
-        out_path=out_dir / f"removed_count_vs_hit@{args.hit_k}.png",
-        title=f"Achieved Removed(scope) count vs Hit@{args.hit_k}" + (" (best)" if args.use_best else " (final)"),
-        xlabel="Removed edges in scope (achieved, final)",
-        ylabel=f"Hit@{args.hit_k}",
-        show_std=args.show_std,
-        invert_x=False,
-    )
-
-    plot_x_curve(
-        rad_agg_rm,
-        x_col="removed_total_final",
-        y_mean="radius_end_mean",
-        y_std="radius_end_std",
-        out_path=out_dir / "removed_count_vs_radius_end.png",
-        title="Achieved Removed(scope) count vs Radius (end of training)",
-        xlabel="Removed edges in scope (achieved, final)",
-        ylabel="Radius (cosine-normalized)",
-        show_std=args.show_std,
-        invert_x=False,
-    )
-
-    # NEW: raw scatter of hit vs removed edge count (each point = one run)
-    df_rm_scatter, removed_sc = _trim_outliers_quantile(
-        df_rm,
-        group_cols=["dataset", "scope", "removed_total_final"],
-        value_col="hit",
-        outlier_frac=args.outlier_frac,
-        outlier_side=args.outlier_side,
-    )
-    if removed_sc > 0:
-        print(
-            "[OUTLIER] trimmed "
-            f"{removed_sc} rows for RAW scatter value='hit' within "
-            "groups=['dataset','scope','removed_total_final'] "
-            f"(frac={args.outlier_frac}, side={args.outlier_side})"
-        )
-
-    plot_scatter_removed_vs_hit(
-        df_rm_scatter,
-        out_path=out_dir / f"removed_count_vs_hit@{args.hit_k}_scatter.png",
-        title=f"RAW: Removed(scope) count vs Hit@{args.hit_k}" + (" (best)" if args.use_best else " (final)"),
+    # -----------------------
+    # GLOBAL suite (all data together)
+    # -----------------------
+    _plot_suite(
+        df=df,
+        out_dir=out_dir,
         hit_k=args.hit_k,
+        x_mode=args.x_mode,
+        use_best=args.use_best,
+        outlier_frac=args.outlier_frac,
+        outlier_side=args.outlier_side,
+        keep_window=keep_window,
+        prefix="",
+        title_suffix="",
     )
+
+    # -----------------------
+    # Per-dataset suites (one dataset at a time)
+    # -----------------------
+    if args.plot_per_dataset:
+        for ds in sorted(df["dataset"].dropna().unique()):
+            sub = df[df["dataset"] == ds].copy()
+            prefix = f"ds_{ds}__"
+            title_suffix = f" | dataset={ds}"
+            _plot_suite(
+                df=sub,
+                out_dir=out_dir,
+                hit_k=args.hit_k,
+                x_mode=args.x_mode,
+                use_best=args.use_best,
+                outlier_frac=args.outlier_frac,
+                outlier_side=args.outlier_side,
+                keep_window=keep_window,
+                prefix=prefix,
+                title_suffix=title_suffix,
+            )
+
+    # -----------------------
+    # Per-scope suites (one scope at a time)
+    # -----------------------
+    if args.plot_per_scope:
+        for sc in sorted(df["scope"].dropna().unique()):
+            sub = df[df["scope"] == sc].copy()
+            prefix = f"sc_{sc}__"
+            title_suffix = f" | scope={sc}"
+            _plot_suite(
+                df=sub,
+                out_dir=out_dir,
+                hit_k=args.hit_k,
+                x_mode=args.x_mode,
+                use_best=args.use_best,
+                outlier_frac=args.outlier_frac,
+                outlier_side=args.outlier_side,
+                keep_window=keep_window,
+                prefix=prefix,
+                title_suffix=title_suffix,
+            )
+
+    # -----------------------
+    # Per-(dataset, scope) suites (one pair at a time)
+    # -----------------------
+    if args.plot_per_dataset_scope:
+        pairs = df[["dataset", "scope"]].dropna().drop_duplicates()
+        for _, row in pairs.iterrows():
+            ds = row["dataset"]
+            sc = row["scope"]
+            sub = df[(df["dataset"] == ds) & (df["scope"] == sc)].copy()
+            prefix = f"ds_{ds}__sc_{sc}__"
+            title_suffix = f" | dataset={ds}, scope={sc}"
+            _plot_suite(
+                df=sub,
+                out_dir=out_dir,
+                hit_k=args.hit_k,
+                x_mode=args.x_mode,
+                use_best=args.use_best,
+                outlier_frac=args.outlier_frac,
+                outlier_side=args.outlier_side,
+                keep_window=keep_window,
+                prefix=prefix,
+                title_suffix=title_suffix,
+            )
 
     print("[DONE] plots saved under:", out_dir)
 

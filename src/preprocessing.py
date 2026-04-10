@@ -70,7 +70,7 @@ def mask_test_edges(adj, dataset_str):
     val_edges = edges[val_edge_idx]
     train_edges = np.delete(edges, np.hstack([test_edge_idx, val_edge_idx]), axis=0)
 
-    filename = f'/home/retro/SECRET/mask_edge/{dataset_str}_mask_edge.pkl'
+    filename = f'/home/retro/ARON/mask_edge_heart/{dataset_str}_mask_edge.pkl'
     if os.path.exists(filename):
         adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = load_data(filename)
         return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false

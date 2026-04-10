@@ -9,12 +9,11 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 import torch
-from aron_train import logist_regressor_classification, train_classifier, train_encoder
+from aron_train_edit_decoder import logist_regressor_classification, train_classifier, train_encoder
 from input_data import load_data
 from torch_geometric.utils.convert import from_scipy_sparse_matrix
 from utils import Plot, Visualize, Visualize_with_edge, gaussion_KDE, vMF_KDE
 import os
-import random
 
 parser = argparse.ArgumentParser()
 # parser.add_argument('--model', type=str, default='gcn_vae', help="models used")
@@ -148,28 +147,87 @@ parser.add_argument("--run_tag", type=str, default="", help="Optional run identi
 parser.add_argument("--sweep_mode", action="store_true",
     help="Do NOT hijack stdout/stderr; print metrics to stdout so external runners can capture. Also disables tqdm.")
 
+# Edited decoder / decoded-graph augmentation
+parser.add_argument("--use_edited_decoder", action="store_true", help="Enable the edited decoder branch.")
+parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear"])
+parser.add_argument("--decoder_recon_weight", type=float, default=1.0)
+parser.add_argument("--compactness_weight", type=float, default=0.2)
+parser.add_argument("--preserve_weight", type=float, default=0.0)
+parser.add_argument("--separate_edit_training", action="store_true", help="Use two-stage training: task learning before edit_start_epoch, then edit-only optimization afterward.")
+parser.add_argument("--edit_phase_retain_recon_weight", type=float, default=0.0, help="Optional reconstruction-retention weight during phase-2 edit training.")
+parser.add_argument("--edit_phase_retain_cl_weight", type=float, default=0.0, help="Optional contrastive-retention weight during phase-2 edit training.")
+parser.add_argument(
+    "--phase2_task_main_loss",
+    action="store_true",
+    help="In phase 2, keep the full task loss as the main objective and treat edit loss as a regularizer.",
+)
+parser.add_argument(
+    "--edit_phase_edit_weight",
+    type=float,
+    default=0.10,
+    help="Weight of edit_total_loss when --phase2_task_main_loss is enabled.",
+)
+parser.add_argument("--editor_pull_strength", type=float, default=0.10)
+parser.add_argument("--editor_edit_scale", type=float, default=0.0)
+parser.add_argument("--edit_start_epoch", type=int, default=10)
+parser.add_argument("--eval_log_every", type=int, default=5)
+parser.add_argument("--freeze_c0p_at_edit_start", dest="freeze_c0p_at_edit_start", action="store_true", help="Freeze GMM/C0p targets once editing starts.")
+parser.add_argument("--dynamic_c0p_targets", dest="freeze_c0p_at_edit_start", action="store_false", help="Recompute GMM/C0p targets every time instead of freezing them.")
+parser.add_argument("--use_decoded_graph_augment", action="store_true", help="Decode the pulled latent into a rewritten graph, then re-encode on that graph.")
+parser.add_argument("--decoded_add_ratio", type=float, default=0.02, help="Per-epoch add budget for decoded graph rewrite, measured as a fraction of E0.")
+parser.add_argument("--decoded_remove_ratio", type=float, default=0.00, help="Per-epoch remove budget for decoded graph rewrite, measured as a fraction of E0.")
+parser.add_argument("--decoded_add_threshold", type=float, default=None, help="Add decoded edges with score >= this threshold. Overrides add_ratio when set.")
+parser.add_argument("--decoded_remove_threshold", type=float, default=None, help="Remove decoded edges with score <= this threshold. Overrides remove_ratio when set.")
+parser.add_argument("--decoded_add_quantile", type=float, default=None, help="Add decoded edges from the top-q valid non-edge scores. Example 0.002 keeps the top 0.2%.")
+parser.add_argument("--decoded_remove_quantile", type=float, default=None, help="Remove decoded edges from the bottom-q valid existing-edge scores. Example 0.001 keeps the lowest 0.1%.")
+parser.add_argument("--decoded_max_add_per_round", type=int, default=None, help="Hard cap on decoded edge additions per rewrite round.")
+parser.add_argument("--decoded_max_remove_per_round", type=int, default=None, help="Hard cap on decoded edge removals per rewrite round.")
+parser.add_argument("--decoded_graph_aug_bound", type=float, default=-1.0, help="Per-node cap fraction for decoded graph additions. Set <= 0 to disable the cap entirely.")
+parser.add_argument("--decoded_degree_floor", type=int, default=None, help="Minimum degree floor (excluding self-loops) when removing decoded edges. Defaults to the run's degree threshold floor.")
+parser.add_argument("--decoded_allow_cross_cluster", dest="decoded_same_cluster_only", action="store_false", help="Allow decoded rewrites across clusters.")
+parser.add_argument("--decoded_same_cluster_only", dest="decoded_same_cluster_only", action="store_true", help="Restrict decoded rewrites to same-cluster pairs only.")
+parser.add_argument("--decoded_require_c0p_endpoint", dest="decoded_require_c0p_endpoint", action="store_true", help="Require at least one endpoint of a rewritten edge to be in C0p.")
+parser.add_argument("--decoded_no_c0p_endpoint", dest="decoded_require_c0p_endpoint", action="store_false", help="Do not require C0p membership for rewritten edges.")
+parser.add_argument("--decoded_accumulate_into_base", dest="decoded_accumulate_into_base", action="store_true", help="Persist decoded graph rewrites into the base training graph across epochs.")
+parser.add_argument("--decoded_temporary_view_only", dest="decoded_accumulate_into_base", action="store_false", help="Use the decoded rewritten graph only for the current augmented view; do not persist it into the base graph.")
+parser.add_argument("--decoded_require_both_c0p", action="store_true", help="Require both endpoints of a rewritten edge to be in C0p.")
+parser.add_argument("--phase2_freeze_encoder", dest="phase2_freeze_encoder", action="store_true", help="Freeze the encoder and train only the edited decoder in phase 2.")
+parser.add_argument("--phase2_tune_encoder", dest="phase2_freeze_encoder", action="store_false", help="Keep updating the encoder in phase 2 instead of freezing it.")
+parser.add_argument("--edit_phase_encoder_lr_scale", type=float, default=0.0, help="Relative encoder LR used in phase 2 when the encoder is not frozen. 0 disables encoder updates.")
+parser.add_argument("--decoded_edit_end_epoch", type=int, default=-1, help="Stop decoded rewrites after this epoch. -1 keeps rewrites active through the end.")
+parser.add_argument("--decoder_warmup_in_phase1", dest="decoder_warmup_in_phase1", action="store_true", help="Warm up the decoder during phase 1 before using decoded rewrites.")
+parser.add_argument("--no_decoder_warmup_in_phase1", dest="decoder_warmup_in_phase1", action="store_false", help="Disable decoder warm-up during phase 1.")
+parser.add_argument("--decoder_warmup_recon_weight", type=float, default=1.0, help="Reconstruction weight used for decoder warm-up during phase 1.")
+parser.add_argument("--decoder_warmup_use_pulled_latent", action="store_true", help="Use pulled latent instead of base latent during decoder warm-up.")
+parser.add_argument("--phase2_decoder_inference_only", dest="phase2_decoder_inference_only", action="store_true", help="In phase 2, freeze decoder training and use it only to infer decoded rewrites.")
+parser.add_argument("--no_phase2_decoder_inference_only", dest="phase2_decoder_inference_only", action="store_false", help="Allow decoder training losses to remain active in phase 2.")
+parser.set_defaults(
+    freeze_c0p_at_edit_start=True,
+    decoded_same_cluster_only=False,
+    decoded_require_c0p_endpoint=False,
+    decoded_accumulate_into_base=True,
+    phase2_freeze_encoder=True,
+    decoder_warmup_in_phase1=True,
+    phase2_decoder_inference_only=True,
+)
+
 # also use: --ver aron_desc or --ver aron_asc
 
 args = parser.parse_args()
 
 
-def set_random_seed(seed: int):
-    random.seed(seed)
+def set_random_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    # If you use cudnn anywhere, this helps reproducibility
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 def main():
     print(f"Dataset: {args.dataset}")
 
-    # device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # if args.dataset_str == 'pubmed':
     #     device = torch.device('cpu')
 
@@ -233,13 +291,54 @@ def main():
         # NEW cluster controls
         cluster_method=args.cluster_method,
         cluster_mode=args.cluster_mode,
+        gmm_k=args.gmm_k,
+        gmm_tau=args.gmm_tau,
         # NEW: restricted augmentation knobs
+        restricted=args.restricted,
+        restrict_alpha=args.restrict_alpha,
         restrict_gamma=args.restrict_gamma,
         c0p_prune_frac=args.c0p_prune_frac,
         sweep_scope=args.sweep_scope,
         pre_prune_frac=args.pre_prune_frac,       # NEW
         pre_prune_scope=args.pre_prune_scope,     # NEW
         seed=args.seed,
+        use_edited_decoder=args.use_edited_decoder,
+        decoder_type=args.decoder_type,
+        decoder_recon_weight=args.decoder_recon_weight,
+        compactness_weight=args.compactness_weight,
+        preserve_weight=args.preserve_weight,
+        separate_edit_training=args.separate_edit_training,
+        edit_phase_retain_recon_weight=args.edit_phase_retain_recon_weight,
+        edit_phase_retain_cl_weight=args.edit_phase_retain_cl_weight,
+        phase2_task_main_loss=args.phase2_task_main_loss,
+        edit_phase_edit_weight=args.edit_phase_edit_weight,
+        editor_pull_strength=args.editor_pull_strength,
+        editor_edit_scale=args.editor_edit_scale,
+        edit_start_epoch=args.edit_start_epoch,
+        eval_log_every=args.eval_log_every,
+        freeze_c0p_at_edit_start=args.freeze_c0p_at_edit_start,
+        use_decoded_graph_augment=args.use_decoded_graph_augment,
+        decoded_add_ratio=args.decoded_add_ratio,
+        decoded_remove_ratio=args.decoded_remove_ratio,
+        decoded_add_threshold=args.decoded_add_threshold,
+        decoded_remove_threshold=args.decoded_remove_threshold,
+        decoded_add_quantile=args.decoded_add_quantile,
+        decoded_remove_quantile=args.decoded_remove_quantile,
+        decoded_max_add_per_round=args.decoded_max_add_per_round,
+        decoded_max_remove_per_round=args.decoded_max_remove_per_round,
+        decoded_same_cluster_only=args.decoded_same_cluster_only,
+        decoded_require_c0p_endpoint=args.decoded_require_c0p_endpoint,
+        decoded_require_both_c0p=args.decoded_require_both_c0p,
+        decoded_graph_aug_bound=args.decoded_graph_aug_bound,
+        decoded_degree_floor=args.decoded_degree_floor,
+        decoded_accumulate_into_base=args.decoded_accumulate_into_base,
+        decoded_edit_end_epoch=args.decoded_edit_end_epoch,
+        phase2_freeze_encoder=args.phase2_freeze_encoder,
+        edit_phase_encoder_lr_scale=args.edit_phase_encoder_lr_scale,
+        decoder_warmup_in_phase1=args.decoder_warmup_in_phase1,
+        decoder_warmup_recon_weight=args.decoder_warmup_recon_weight,
+        decoder_warmup_use_pulled_latent=args.decoder_warmup_use_pulled_latent,
+        phase2_decoder_inference_only=args.phase2_decoder_inference_only,
 )
 
     # Plot(args.dataset_str, roc_history, modification_ratio_history)
@@ -306,27 +405,88 @@ if __name__ == "__main__":
         log_dir = Path(LOG_ROOT) / str(args.date)
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        a_str   = f"{float(args.restrict_alpha):.2f}"
-        g_str   = f"{float(args.restrict_gamma):.2f}"
-        c0p_str = f"{float(args.c0p_prune_frac):.2f}"
+        def _fmt_num(x):
+            if x is None:
+                return "na"
+            if isinstance(x, bool):
+                return "1" if x else "0"
+            if isinstance(x, int):
+                return str(x)
+            try:
+                xf = float(x)
+                if xf.is_integer():
+                    return str(int(xf))
+                return f"{xf:g}".replace("-", "m")
+            except Exception:
+                return str(x)
 
-        # keep your existing r/fmr/d and suffix tags
-        r_str   = f"{float(args.aug_ratio):.1f}"
-        fmr_str = f"{float(args.aug_bound):.1f}"
-        d_str   = f"{float(args.degree_threshold):.1f}"
+        def _clean_token(s: str) -> str:
+            return (
+                str(s)
+                .replace("/", "-")
+                .replace(" ", "")
+                .replace(".", "p")
+                .replace("__", "_")
+            )
 
-        cm = getattr(args, "cluster_method", "none")
-        cm_suffix = f"_{cm}" if cm and cm != "none" else ""
-        loss_tag  = f"_loss_{args.loss_ver}" if getattr(args, "loss_ver", "") else ""
-        tag_suffix = f"_tag{args.run_tag}" if args.run_tag else ""
+        phase_tag = "2stage" if args.separate_edit_training else "joint"
+        edit_tag = f"edit-{args.decoder_type}" if args.use_edited_decoder else "base"
+        target_tag = "freezeC0p" if args.freeze_c0p_at_edit_start else "dynC0p"
+        cluster_tag = f"{args.cluster_method}-{args.cluster_mode}" if getattr(args, "cluster_method", None) else "cluster-na"
+        loss_tag = f"task-{args.loss_ver}" if getattr(args, "loss_ver", "") else "task-na"
+        weight_tag = f"dr{_fmt_num(args.decoder_recon_weight)}_cp{_fmt_num(args.compactness_weight)}_pv{_fmt_num(args.preserve_weight)}"
+        stage_tag = f"es{_fmt_num(args.edit_start_epoch)}"
 
-        # NEW filename (core pattern first, extras after)
-        fname = (
-            f"{args.dataset}_{args.ver}"
-            f"_a{a_str}_g{g_str}_c0p{c0p_str}_seed{args.seed}"            # <-- collector-critical part
-            f"_r{r_str}_fmr{fmr_str}_d{d_str}"                            # your original fields
-            f"{cm_suffix}_idx{args.idx}{tag_suffix}{loss_tag}.log"
-        )
+        extra_tags = []
+        if args.separate_edit_training:
+            extra_tags.append(f"rr{_fmt_num(args.edit_phase_retain_recon_weight)}")
+            extra_tags.append(f"rc{_fmt_num(args.edit_phase_retain_cl_weight)}")
+
+        if args.use_decoded_graph_augment:
+            rewrite_mode = "accum" if args.decoded_accumulate_into_base else "temp"
+            cluster_scope = "samecl" if args.decoded_same_cluster_only else "crosscl"
+            endpoint_scope = "bothc0p" if args.decoded_require_both_c0p else ("onec0p" if args.decoded_require_c0p_endpoint else "noc0p")
+            add_tag = (
+                f"aq{_fmt_num(args.decoded_add_quantile)}" if args.decoded_add_quantile is not None else
+                f"at{_fmt_num(args.decoded_add_threshold)}" if args.decoded_add_threshold is not None else
+                f"ar{_fmt_num(args.decoded_add_ratio)}"
+            )
+            remove_tag = (
+                f"rq{_fmt_num(args.decoded_remove_quantile)}" if args.decoded_remove_quantile is not None else
+                f"rt{_fmt_num(args.decoded_remove_threshold)}" if args.decoded_remove_threshold is not None else
+                f"rrm{_fmt_num(args.decoded_remove_ratio)}"
+            )
+            extra_tags.extend([
+                "rewrite",
+                rewrite_mode,
+                cluster_scope,
+                endpoint_scope,
+                add_tag,
+                remove_tag,
+            ])
+        else:
+            extra_tags.append("norewrite")
+
+        extra_tags.extend([
+            f"ver-{args.ver}",
+            f"seed{args.seed}",
+            f"idx{args.idx}",
+        ])
+        if args.run_tag:
+            extra_tags.append(f"tag-{args.run_tag}")
+
+        fname_parts = [
+            args.dataset,
+            phase_tag,
+            edit_tag,
+            stage_tag,
+            target_tag,
+            cluster_tag,
+            loss_tag,
+            weight_tag,
+            *extra_tags,
+        ]
+        fname = "_".join(_clean_token(p) for p in fname_parts if p) + ".log"
         log_path = log_dir / fname
 
         log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
@@ -349,6 +509,13 @@ if __name__ == "__main__":
             print(f"restricted=1 alpha={args.restrict_alpha} gamma={args.restrict_gamma}")
         else:
             print("restricted=0")
+        print(f"edited_decoder={int(args.use_edited_decoder)} decoded_graph_augment={int(args.use_decoded_graph_augment)} freeze_c0p={int(args.freeze_c0p_at_edit_start)} accumulate_base={int(args.decoded_accumulate_into_base)} separate_edit_training={int(args.separate_edit_training)}")
+        print(f"edit_phase_retain_recon_weight={args.edit_phase_retain_recon_weight} edit_phase_retain_cl_weight={args.edit_phase_retain_cl_weight}")
+        print(f"phase2_task_main_loss={int(args.phase2_task_main_loss)} edit_phase_edit_weight={args.edit_phase_edit_weight}")
+        print(f"phase2_freeze_encoder={int(args.phase2_freeze_encoder)} edit_phase_encoder_lr_scale={args.edit_phase_encoder_lr_scale}")
+        print(f"decoded_edit_end_epoch={args.decoded_edit_end_epoch} decoder_warmup_in_phase1={int(args.decoder_warmup_in_phase1)} decoder_warmup_recon_weight={args.decoder_warmup_recon_weight} decoder_warmup_use_pulled_latent={int(args.decoder_warmup_use_pulled_latent)} phase2_decoder_inference_only={int(args.phase2_decoder_inference_only)}")
+        print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} add_thr={args.decoded_add_threshold} remove_thr={args.decoded_remove_threshold} add_q={args.decoded_add_quantile} remove_q={args.decoded_remove_quantile} max_add={args.decoded_max_add_per_round} max_remove={args.decoded_max_remove_per_round}")
+        print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} per_node_cap={args.decoded_graph_aug_bound}")
         print("====================")
 
         try:

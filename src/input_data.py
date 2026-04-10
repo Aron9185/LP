@@ -57,14 +57,14 @@ def load_data(dataset):
         names = ['x', 'y', 'tx', 'ty', 'allx', 'ally', 'graph']
         objects = []
         for i in range(len(names)):
-            with open("/home/retro/SECRET/data/citation/ind.{}.{}".format(dataset, names[i]), 'rb') as f:
+            with open("/home/retro/ARON/data/citation/ind.{}.{}".format(dataset, names[i]), 'rb') as f:
                 if sys.version_info > (3, 0):
                     objects.append(pkl.load(f, encoding='latin1'))
                 else:
                     objects.append(pkl.load(f))
         x, y, tx, ty, allx, ally, graph = tuple(objects)
         
-        test_idx_reorder = parse_index_file("/home/retro/SECRET/data/citation/ind.{}.test.index".format(dataset))
+        test_idx_reorder = parse_index_file("/home/retro/ARON/data/citation/ind.{}.test.index".format(dataset))
         test_idx_range = np.sort(test_idx_reorder)
 
         if dataset == 'citeseer':
