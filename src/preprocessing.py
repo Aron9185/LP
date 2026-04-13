@@ -46,6 +46,7 @@ def load_data(filename):
     with open(filename, 'rb') as f:
         return pickle.load(f)
 
+
 def mask_test_edges(adj, dataset_str):
     # Function to build test set with 10% positive links
 
@@ -70,7 +71,7 @@ def mask_test_edges(adj, dataset_str):
     val_edges = edges[val_edge_idx]
     train_edges = np.delete(edges, np.hstack([test_edge_idx, val_edge_idx]), axis=0)
 
-    filename = f'/home/retro/ARON/mask_edge_heart/{dataset_str}_mask_edge.pkl'
+    filename = f'/home/retro/ARON/mask_edge/{dataset_str}_mask_edge.pkl'
     if os.path.exists(filename):
         adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = load_data(filename)
         return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false
@@ -224,40 +225,83 @@ def mask_test_edges_ogbl(adj, dataset_str, idx_train=None, idx_val=None, idx_tes
 
     return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false
 
+def _read_heart_pos_edges(path):
+    edges = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                parts = line.split()
+            if len(parts) != 2:
+                raise ValueError(f"Bad edge line in {path}: {line}")
+            u, v = int(parts[0]), int(parts[1])
+            if u == v:
+                continue
+            edges.append([u, v])
+    return np.asarray(edges, dtype=np.int64)
 
-"""def mask_test_edges_ogbl(adj, dataset_str, idx_train, idx_val, idx_test):
-    # Function to build test set with 10% positive links
 
+def _resolve_heart_neg_files(dataset_dir, filename="samples.npy"):
+    valid_path = os.path.join(dataset_dir, f"heart_valid_{filename}")
+    test_path = os.path.join(dataset_dir, f"heart_test_{filename}")
+
+    if os.path.exists(valid_path) and os.path.exists(test_path):
+        return valid_path, test_path
+
+    valid_path = os.path.join(dataset_dir, "heart_valid_samples.npy")
+    test_path = os.path.join(dataset_dir, "heart_test_samples.npy")
+
+    if os.path.exists(valid_path) and os.path.exists(test_path):
+        return valid_path, test_path
+
+    raise FileNotFoundError(
+        f"Cannot find HeaRT negative files in {dataset_dir}. "
+        f"Tried heart_valid_{filename}, heart_test_{filename}, "
+        f"heart_valid_samples.npy, heart_test_samples.npy"
+    )
+
+
+def mask_test_edges_heart(adj, dataset_str, heart_root="dataset", filename="samples.npy"):
     # Remove diagonal elements
     adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
     adj.eliminate_zeros()
-    # Check that diag is zero:
-    assert np.diag(adj.todense()).sum() == 0
 
-    adj_triu = sp.triu(adj)
-    adj_tuple = sparse_to_tuple(adj_triu)
-    edges = adj_tuple[0]
-    edges_all = sparse_to_tuple(adj)[0]
+    dataset_dir = os.path.join(heart_root, dataset_str)
+    if not os.path.isdir(dataset_dir):
+        raise FileNotFoundError(f"HeaRT dataset directory not found: {dataset_dir}")
 
-    train_edges = idx_train['edge'].cpu().detach().numpy()
-    val_edges = idx_val['edge'].cpu().detach().numpy()
-    val_edges_false = idx_val['edge_neg'].cpu().detach().tolist()
-    test_edges = idx_test['edge'].cpu().detach().numpy()
-    test_edges_false = idx_test['edge_neg'].cpu().detach().tolist()
-    
-    all_edge_idx = list(range(edges.shape[0]))
-    
-    
-    def ismember(a, b, tol=5):
-        rows_close = np.all(np.round(a - b[:, None], tol) == 0, axis=-1)
-        return np.any(rows_close)
-    
+    train_pos_path = os.path.join(dataset_dir, "train_pos.txt")
+    valid_pos_path = os.path.join(dataset_dir, "valid_pos.txt")
+    test_pos_path = os.path.join(dataset_dir, "test_pos.txt")
 
-    # data = np.ones(len(train_edges))
+    train_edges = _read_heart_pos_edges(train_pos_path)
+    val_edges = _read_heart_pos_edges(valid_pos_path)
+    test_edges = _read_heart_pos_edges(test_pos_path)
 
-    # Re-build adj matrix
-    # adj_train = sp.csr_matrix((data, (train_edges[:, 0], train_edges[:, 1])), shape=adj.shape)
-    # adj_train = adj_train + adj_train.T
-    adj_train = to_scipy_sparse_matrix(torch.tensor(train_edges).t())
-    # NOTE: these edge lists only contain single direction of edge!
-    return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false"""
+    valid_neg_path, test_neg_path = _resolve_heart_neg_files(dataset_dir, filename=filename)
+    val_edges_false = np.load(valid_neg_path)
+    test_edges_false = np.load(test_neg_path)
+
+    if val_edges_false.ndim != 3 or val_edges_false.shape[-1] != 2:
+        raise ValueError(f"Expected val_edges_false shape [num_val, K, 2], got {val_edges_false.shape}")
+    if test_edges_false.ndim != 3 or test_edges_false.shape[-1] != 2:
+        raise ValueError(f"Expected test_edges_false shape [num_test, K, 2], got {test_edges_false.shape}")
+
+    if len(val_edges) != val_edges_false.shape[0]:
+        raise ValueError(
+            f"Mismatch: len(val_edges)={len(val_edges)} but val_edges_false.shape[0]={val_edges_false.shape[0]}"
+        )
+    if len(test_edges) != test_edges_false.shape[0]:
+        raise ValueError(
+            f"Mismatch: len(test_edges)={len(test_edges)} but test_edges_false.shape[0]={test_edges_false.shape[0]}"
+        )
+
+    data = np.ones(train_edges.shape[0], dtype=np.float32)
+    adj_train = sp.csr_matrix((data, (train_edges[:, 0], train_edges[:, 1])), shape=adj.shape)
+    adj_train = adj_train + adj_train.T
+    adj_train.eliminate_zeros()
+
+    return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false

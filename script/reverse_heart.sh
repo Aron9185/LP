@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =========================================================
-# Sweep for:
+# HeaRT sweep for:
 #   1) Reverse-GNN setting: ver=no + edited decoder / decoded rewrite
 #   2) CoEBA-style setting: ver=v6 without reverse-GNN branch
 #
-# Uses NORMAL random split (not HeaRT).
+# Both use the same HeaRT split loader.
 # =========================================================
 
 PYTHON_BIN=${PYTHON_BIN:-python}
@@ -14,17 +14,20 @@ ENTRY=${ENTRY:-src/aron_main.py}
 
 # -------------------- global knobs --------------------
 EPOCHS=${EPOCHS:-1000}
-SEEDS=(${SEEDS:-$(seq 0 49)})
-DATASETS=(${DATASETS:-cora citeseer Cora_ML LastFMAsia})
+#SEEDS=(${SEEDS:-0 1 2 3 4 5 6 7 8 9})
+SEEDS=(${SEEDS:-0 1 2 3 4 5 6 7 8 9})
+#DATASETS=(${DATASETS:-cora citeseer Cora_ML LastFMAsia})
+DATASETS=(${DATASETS:-cora citeseer})
 
 # Which experiment families to run:
 #   revgnn_no  = Reverse-GNN setting with ver=no
 #   coeba_v6   = plain CoEBA-style setting with ver=v6
-#EXPERIMENTS=(${EXPERIMENTS:-revgnn_no coeba_v6})
-EXPERIMENTS=(${EXPERIMENTS:-coeba_v6})
+EXPERIMENTS=(${EXPERIMENTS:-revgnn_no coeba_v6})
 
-# -------------------- split mode --------------------
-SPLIT_MODE=${SPLIT_MODE:-random}
+# -------------------- HeaRT loader knobs --------------------
+SPLIT_MODE=${SPLIT_MODE:-heart}
+HEART_DATA_DIR=${HEART_DATA_DIR:-dataset}
+HEART_FILENAME=${HEART_FILENAME:-samples.npy}
 
 # -------------------- per-dataset degree threshold --------------------
 declare -A DEG_THR
@@ -51,7 +54,7 @@ GMM_TAU=${GMM_TAU:-0.55}
 EVAL_LOG_EVERY=${EVAL_LOG_EVERY:-5}
 
 DATESTR=${DATESTR:-$(date +%m%d)}
-LOGROOT=${LOGROOT:-logs/${DATESTR}/sweep_revgnn_and_coeba_randomsplit}
+LOGROOT=${LOGROOT:-logs/${DATESTR}/heart_sweep_revgnn_and_coeba}
 mkdir -p "${LOGROOT}"
 
 # =========================================================
@@ -178,6 +181,8 @@ run_one () {
     --gmm_tau "${GMM_TAU}"
     --eval_log_every "${EVAL_LOG_EVERY}"
     --split_mode "${SPLIT_MODE}"
+    --heart_data_dir "${HEART_DATA_DIR}"
+    --heart_filename "${HEART_FILENAME}"
     --sweep_mode
     --date "${DATESTR}"
   )
@@ -201,14 +206,14 @@ run_one () {
     local phase2_freeze_encoder="${PHASE2_FREEZE_ENCODER_MAP[$ds]}"
     local phase2_decoder_infer_only="${PHASE2_DECODER_INFER_ONLY_MAP[$ds]}"
 
-    tag="revgnn_no_es${edit_start}_add${decoded_add_ratio}_rm${decoded_remove_ratio}_cp${compactness_weight}_pv${preserve_weight}_rr${retain_recon_weight}_rc${retain_cl_weight}_frz${phase2_freeze_encoder}_lrp2${phase2_encoder_lr_scale}_k${GMM_K}_tau${GMM_TAU}"
+    tag="heart_revgnn_no_es${edit_start}_add${decoded_add_ratio}_rm${decoded_remove_ratio}_cp${compactness_weight}_pv${preserve_weight}_rr${retain_recon_weight}_rc${retain_cl_weight}_frz${phase2_freeze_encoder}_lrp2${phase2_encoder_lr_scale}_k${GMM_K}_tau${GMM_TAU}"
     logfile="${base_logdir}/${ds}_${tag}_seed${seed}_idx${idx}.log"
 
     echo "===================================================="
     echo "RUN exp=${exp} dataset=${ds} seed=${seed} idx=${idx}"
     echo "log=${logfile}"
     echo "----------------------------------------------------"
-    echo "split_mode=${SPLIT_MODE}"
+    echo "split_mode=${SPLIT_MODE} heart_data_dir=${HEART_DATA_DIR} heart_filename=${HEART_FILENAME}"
     echo "ver=no"
     echo "use_edited_decoder=1"
     echo "edit_start_epoch=${edit_start}"
@@ -271,17 +276,17 @@ run_one () {
     fi
 
   elif [[ "${exp}" == "coeba_v6" ]]; then
-    tag="coeba_v6_k${GMM_K}_tau${GMM_TAU}"
+    tag="heart_coeba_v6_k${GMM_K}_tau${GMM_TAU}"
     logfile="${base_logdir}/${ds}_${tag}_seed${seed}_idx${idx}.log"
 
     echo "===================================================="
     echo "RUN exp=${exp} dataset=${ds} seed=${seed} idx=${idx}"
     echo "log=${logfile}"
     echo "----------------------------------------------------"
-    echo "split_mode=${SPLIT_MODE}"
+    echo "split_mode=${SPLIT_MODE} heart_data_dir=${HEART_DATA_DIR} heart_filename=${HEART_FILENAME}"
     echo "ver=v6"
     echo "use_edited_decoder=0"
-    echo "plain CoEBA-style path"
+    echo "plain CoEBA-style path on HeaRT"
 
     cmd+=(
       --ver v6
