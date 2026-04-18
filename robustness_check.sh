@@ -2,7 +2,7 @@
 source /home/retro/anaconda3/etc/profile.d/conda.sh
 conda activate pyg
 
-EXPERIMENT_ROOT="${ARON_EXPERIMENT_ROOT:-/home/retro/.gemini/antigravity/experiments/ARON/reversegnn-compactness}"
+EXPERIMENT_ROOT="${ARON_EXPERIMENT_ROOT:-/home/retro/ARON/experiments/reversegnn-compactness}"
 LOG_DIR="${EXPERIMENT_ROOT}/sweep_logs"
 mkdir -p "${LOG_DIR}"
 

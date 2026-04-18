@@ -39,3 +39,5 @@ artifacts/
 *.npz
 *.npy
 *.gz
+
+/experiments/

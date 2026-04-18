@@ -4,11 +4,8 @@ from pathlib import Path
 
 EXPERIMENT_ROOT_ENV = "ARON_EXPERIMENT_ROOT"
 DEFAULT_EXPERIMENT_ROOT = (
-    Path.home()
-    / ".gemini"
-    / "antigravity"
+    Path(__file__).resolve().parent
     / "experiments"
-    / "ARON"
     / "reversegnn-compactness"
 )
 
