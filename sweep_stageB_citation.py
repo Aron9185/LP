@@ -1,6 +1,8 @@
 import subprocess
 import os
 
+from experiment_paths import sweep_log_dir
+
 # --- Configurations ---
 DATASETS = ["cora", "citeseer", "Cora_ML"]
 ANCHORS = {
@@ -13,8 +15,7 @@ SEEDS   = [0, 1, 2, 3, 4]
 MAX_WORKERS = 4
 PYTHON_EXE = "/home/retro/anaconda3/envs/pyg/bin/python3"
 
-log_dir = "sweep_logs"
-os.makedirs(log_dir, exist_ok=True)
+log_dir = sweep_log_dir()
 
 def run_cmd(args):
     cmd, out_path = args
@@ -28,7 +29,7 @@ for ds in DATASETS:
     a = ANCHORS[ds]["add"]
     for r in REMOVES:
         for s in SEEDS:
-            out_file = f"{log_dir}/finalB_{ds}_s{s}_p{p}_a{a}_r{r}.txt"
+            out_file = log_dir / f"finalB_{ds}_s{s}_p{p}_a{a}_r{r}.txt"
             if os.path.exists(out_file): continue
             cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", ds, "--seed", str(s), "--editor_pull_strength", str(p), "--decoded_add_ratio", str(a), "--decoded_remove_ratio", str(r), "--decoded_graph_aug_bound", "-1.0"]
             commands.append((cmd, out_file))

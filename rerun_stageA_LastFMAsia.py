@@ -15,6 +15,8 @@ import itertools
 import concurrent.futures
 import pandas as pd
 
+from experiment_paths import artifact_path, sweep_log_dir
+
 DATASET      = "LastFMAsia"
 PULL_STRENGTHS = [0.0, 0.1, 0.2, 0.4, 0.6]
 ADD_RATIOS   = [0.005, 0.01, 0.02, 0.05]
@@ -23,6 +25,8 @@ AUG_BOUND    = -1.0
 SEEDS        = [0, 1, 2]
 EPOCHS       = 700
 MAX_WORKERS  = 1   # serial — full GPU per run to avoid OOM
+LOG_DIR = sweep_log_dir()
+RESULTS_CSV = artifact_path("stageA_LastFMAsia_results.csv")
 
 BASE_ARGS = [
     "python", "src/aron_main.py",
@@ -43,7 +47,7 @@ BASE_ARGS = [
 
 def log_path(seed, pull, add):
     tag = f"{DATASET}_s{seed}_p{pull}_r{add}"
-    return os.path.join("sweep_logs", f"stageA_{tag}.txt")
+    return LOG_DIR / f"stageA_{tag}.txt"
 
 def extract_metrics(path):
     try:
@@ -72,7 +76,7 @@ def run(args):
     if os.path.exists(out):
         content = open(out).read()
         if '[SANITY SUMMARY]' in content:
-            print(f"  [skip] {os.path.basename(out)}  (already succeeded)")
+            print(f"  [skip] {out.name}  (already succeeded)")
             metrics = extract_metrics(out)
             metrics.update({"dataset": DATASET, "seed": seed,
                             "pull_strength": pull, "add_ratio": add})
@@ -88,7 +92,7 @@ def run(args):
         "source /home/retro/anaconda3/etc/profile.d/conda.sh && "
         "conda activate pyg && " + " ".join(cmd)
     )
-    print(f"  [run ] {os.path.basename(out)}")
+    print(f"  [run ] {out.name}")
     with open(out, "w") as f:
         subprocess.run(["bash", "-c", bash], stdout=f, stderr=subprocess.STDOUT)
     metrics = extract_metrics(out)
@@ -105,8 +109,6 @@ def run(args):
     return metrics
 
 if __name__ == "__main__":
-    os.makedirs("sweep_logs", exist_ok=True)
-
     grid = list(itertools.product(SEEDS, PULL_STRENGTHS, ADD_RATIOS))
     total = len(grid)
     print(f"LastFMAsia Stage A rerun: {total} runs  (MAX_WORKERS={MAX_WORKERS})\n")
@@ -118,7 +120,7 @@ if __name__ == "__main__":
             print(f"  Progress: {i}/{total}")
 
     df = pd.DataFrame(results)
-    df.to_csv("stageA_LastFMAsia_results.csv", index=False)
+    df.to_csv(RESULTS_CSV, index=False)
 
     print("\n=== LastFMAsia Stage A Summary (mean over seeds) ===")
     summary = (
@@ -128,5 +130,5 @@ if __name__ == "__main__":
           .round(4)
     )
     print(summary.to_string())
-    print("\nSaved to stageA_LastFMAsia_results.csv")
+    print(f"\nSaved to {RESULTS_CSV}")
     print("Now run: python rebuild_stageA_csv.py  to merge into stageA_results.csv")

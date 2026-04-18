@@ -10,9 +10,11 @@ import pandas as pd
 import sys
 import os
 
-old_csv      = "stageA_results.csv"
-lastfm_csv   = "stageA_LastFMAsia_results.csv"
-out_csv      = "stageA_results.csv"
+from experiment_paths import artifact_path
+
+old_csv = artifact_path("stageA_results.csv")
+lastfm_csv = artifact_path("stageA_LastFMAsia_results.csv")
+out_csv = artifact_path("stageA_results.csv")
 
 if not os.path.exists(lastfm_csv):
     print(f"ERROR: {lastfm_csv} not found. Run rerun_stageA_LastFMAsia.py first.")

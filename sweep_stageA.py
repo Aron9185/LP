@@ -28,6 +28,8 @@ import itertools
 import concurrent.futures
 import pandas as pd
 
+from experiment_paths import artifact_path, sweep_log_dir
+
 # ── Grid ────────────────────────────────────────────────────────────────────
 DATASETS     = ["cora", "citeseer", "Cora_ML", "LastFMAsia"]
 PULL_STRENGTHS = [0.0, 0.1, 0.2, 0.4, 0.6]
@@ -37,6 +39,8 @@ AUG_BOUND    = -1.0
 SEEDS        = [0, 1, 2]
 EPOCHS       = 700
 MAX_WORKERS  = 4          # concurrent runs; tune to your CPU
+LOG_DIR = sweep_log_dir()
+RESULTS_CSV = artifact_path("stageA_results.csv")
 
 # ── Fixed base args ──────────────────────────────────────────────────────────
 BASE_ARGS = [
@@ -59,7 +63,7 @@ BASE_ARGS = [
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def log_path(dataset, seed, pull, add):
     tag = f"{dataset}_s{seed}_p{pull}_r{add}"
-    return os.path.join("sweep_logs", f"stageA_{tag}.txt")
+    return LOG_DIR / f"stageA_{tag}.txt"
 
 def extract_metrics(path):
     try:
@@ -93,7 +97,7 @@ def run(args):
 
     # skip if already done
     if os.path.exists(out) and os.path.getsize(out) > 1000:
-        print(f"  [skip] {os.path.basename(out)}")
+        print(f"  [skip] {out.name}")
         metrics = extract_metrics(out)
     else:
         cmd = BASE_ARGS + [
@@ -107,7 +111,7 @@ def run(args):
             "conda activate pyg && " +
             " ".join(cmd)
         )
-        print(f"  [run ] {os.path.basename(out)}")
+        print(f"  [run ] {out.name}")
         with open(out, "w") as f:
             subprocess.run(["bash", "-c", bash], stdout=f, stderr=subprocess.STDOUT)
         metrics = extract_metrics(out)
@@ -123,8 +127,6 @@ def run(args):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    os.makedirs("sweep_logs", exist_ok=True)
-
     grid = list(itertools.product(DATASETS, SEEDS, PULL_STRENGTHS, ADD_RATIOS))
     print(f"Stage A: {len(grid)} runs  (workers={MAX_WORKERS})\n")
 
@@ -134,7 +136,7 @@ if __name__ == "__main__":
             results.append(res)
 
     df = pd.DataFrame(results)
-    df.to_csv("stageA_results.csv", index=False)
+    df.to_csv(RESULTS_CSV, index=False)
 
     print("\n=== Stage A Summary (mean over seeds) ===")
     summary = (
@@ -144,4 +146,4 @@ if __name__ == "__main__":
           .round(4)
     )
     print(summary.to_string())
-    print("\nFull results saved to stageA_results.csv")
+    print(f"\nFull results saved to {RESULTS_CSV}")

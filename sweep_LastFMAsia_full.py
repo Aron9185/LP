@@ -2,14 +2,15 @@ import subprocess
 import os
 import re
 
+from experiment_paths import sweep_log_dir
+
 # --- STAGE A GRID ---
 PULLS = [0.0, 0.4, 1.0]
 ADDS  = [0.01, 0.02, 0.1, 0.5, 1.0]
 SEEDS = [0, 1, 2, 3, 4]
 MAX_WORKERS = 4
 PYTHON_EXE = "/home/retro/anaconda3/envs/pyg/bin/python3"
-log_dir = "sweep_logs"
-os.makedirs(log_dir, exist_ok=True)
+log_dir = sweep_log_dir()
 
 def run_cmd(args):
     cmd, out_path = args
@@ -24,7 +25,7 @@ cmds_a = []
 for p in PULLS:
     for a in ADDS:
         for s in SEEDS:
-            out_file = f"{log_dir}/finalA_LastFMAsia_s{s}_p{p}_r{a}.txt"
+            out_file = log_dir / f"finalA_LastFMAsia_s{s}_p{p}_r{a}.txt"
             if os.path.exists(out_file): continue
             cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", "LastFMAsia", "--seed", str(s), "--editor_pull_strength", str(p), "--decoded_add_ratio", str(a)]
             cmds_a.append((cmd, out_file))
@@ -38,7 +39,7 @@ records = []
 for s in SEEDS:
     for p in PULLS:
         for a in ADDS:
-            log_path = f"{log_dir}/finalA_LastFMAsia_s{s}_p{p}_r{a}.txt"
+            log_path = log_dir / f"finalA_LastFMAsia_s{s}_p{p}_r{a}.txt"
             try:
                 with open(log_path, 'r') as f:
                     content = f.read()
@@ -63,7 +64,7 @@ REMOVES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 cmds_b = []
 for r in REMOVES:
     for s in SEEDS:
-        out_file = f"{log_dir}/finalB_LastFMAsia_s{s}_p{best_p}_a{best_a}_r{r}.txt"
+        out_file = log_dir / f"finalB_LastFMAsia_s{s}_p{best_p}_a{best_a}_r{r}.txt"
         if os.path.exists(out_file): continue
         cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", "LastFMAsia", "--seed", str(s), "--editor_pull_strength", str(best_p), "--decoded_add_ratio", str(best_a), "--decoded_remove_ratio", str(r)]
         cmds_b.append((cmd, out_file))

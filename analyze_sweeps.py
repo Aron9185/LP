@@ -2,9 +2,12 @@ import pandas as pd
 import numpy as np
 import os
 
+from experiment_paths import artifact_path
+
 def analyze():
-    a_path = "stageA_results.csv"
-    b_path = "stageB_results.csv"
+    a_path = artifact_path("stageA_results.csv")
+    b_path = artifact_path("stageB_results.csv")
+    summary_path = artifact_path("sweeps_summary.md")
 
     if not os.path.exists(a_path) or not os.path.exists(b_path):
         print("ERROR: Result CSVs not found.")
@@ -39,7 +42,7 @@ def analyze():
             print(f"  - {ds:11}: {corr: .4f}")
 
     # 3. Create Markdown Report
-    with open("sweeps_summary.md", "w") as f:
+    with open(summary_path, "w") as f:
         f.write("# ARON Sweep Analysis Results\n\n")
         f.write("## Overview\n")
         f.write(f"Analyzed {len(df)} total runs across {df['dataset'].nunique()} datasets.\n\n")
@@ -64,7 +67,7 @@ def analyze():
                 verdict = "❌ Inverse Correlation"
             f.write(f"| **{ds}** | {corr:.4f} | {verdict} |\n")
 
-    print("\nFull report saved to sweeps_summary.md")
+    print(f"\nFull report saved to {summary_path}")
 
 if __name__ == "__main__":
     analyze()

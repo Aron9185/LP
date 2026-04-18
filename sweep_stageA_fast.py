@@ -12,15 +12,18 @@ import subprocess
 import itertools
 import concurrent.futures
 
+from experiment_paths import sweep_log_dir
+
 DATASETS_STD  = ["cora", "citeseer", "Cora_ML"]
 PULLS         = [0.0, 0.4, 1.0]  # Reduced for speed
 ADDS          = [0.1, 0.5, 1.0]  # Large ratios focus
 EPOCHS        = 700
 COMPACT_WEIGHT = 0.2
+LOG_DIR = sweep_log_dir()
 
 def run_job(ds, pull, add, seed):
     tag = f"finalA_{ds}_s{seed}_p{pull}_r{add}"
-    logfile = os.path.join("sweep_logs", f"{tag}.txt")
+    logfile = LOG_DIR / f"{tag}.txt"
     
     if os.path.exists(logfile) and os.path.getsize(logfile) > 1000:
         return
@@ -57,8 +60,6 @@ def run_job(ds, pull, add, seed):
     print(f"  [done] {tag}")
 
 if __name__ == "__main__":
-    os.makedirs("sweep_logs", exist_ok=True)
-    
     # Standard Datasets (5 seeds)
     std_grid = list(itertools.product(DATASETS_STD, PULLS, ADDS, range(5)))
     print(f"Launching Emergency Deadline Grid: {len(std_grid)} jobs (4 threads)...")

@@ -4,12 +4,16 @@ import itertools
 import pandas as pd
 import re
 
+from experiment_paths import artifact_path, sweep_log_dir
+
 SEEDS = [0, 1, 2]
 PULL_STRENGTHS = [0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
 
 # Adjust this if full 700 epochs is too slow; typically pilot runs can use fewer epochs, but we use default 700 unless changed.
 EPOCHS = 700 
 DATASET = "cora"
+LOG_DIR = sweep_log_dir()
+RESULTS_CSV = artifact_path("stage2_pull_sweep_results.csv")
 
 base_cmd = [
     "python", "src/aron_main.py",
@@ -74,7 +78,7 @@ import concurrent.futures
 def run_experiment(arg_tuple):
     seed, pull = arg_tuple
     print(f"Running Seed {seed}, Pull {pull}...")
-    log_file = f"sweep_logs/cora_s{seed}_p{pull}.txt"
+    log_file = LOG_DIR / f"cora_s{seed}_p{pull}.txt"
     
     cmd = base_cmd + ["--seed", str(seed), "--editor_pull_strength", str(pull)]
     bash_str = "source /home/retro/anaconda3/etc/profile.d/conda.sh && conda activate pyg && " + " ".join(cmd)
@@ -90,7 +94,6 @@ def run_experiment(arg_tuple):
     return metrics
 
 if __name__ == "__main__":
-    os.makedirs("sweep_logs", exist_ok=True)
     print("Starting Stage 2 Sweep...")
     
     args = list(itertools.product(SEEDS, PULL_STRENGTHS))
@@ -100,6 +103,6 @@ if __name__ == "__main__":
             results.append(res)
 
     df = pd.DataFrame(results)
-    df.to_csv("stage2_pull_sweep_results.csv", index=False)
-    print("\nSweep Complete! Results saved to stage2_pull_sweep_results.csv")
+    df.to_csv(RESULTS_CSV, index=False)
+    print(f"\nSweep Complete! Results saved to {RESULTS_CSV}")
     print(df.groupby('pull_strength')[['test_hit10', 'val_roc', 'radius_after']].mean())

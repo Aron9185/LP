@@ -5,11 +5,15 @@ import pandas as pd
 import re
 import concurrent.futures
 
+from experiment_paths import artifact_path, sweep_log_dir
+
 SEEDS = [0, 1, 2]
 ADD_RATIOS = [0.005, 0.01, 0.02, 0.05]
 PULL_STRENGTH = 0.2
 EPOCHS = 700 
 DATASET = "cora"
+LOG_DIR = sweep_log_dir()
+RESULTS_CSV = artifact_path("stage3a_addratio_sweep.csv")
 
 base_cmd = [
     "python", "src/aron_main.py",
@@ -58,7 +62,7 @@ def extract_metric(filepath):
 def run_experiment(arg_tuple):
     seed, ratio = arg_tuple
     print(f"Running Seed {seed}, Add Ratio {ratio}...")
-    log_file = f"sweep_logs/cora_s{seed}_r{ratio}.txt"
+    log_file = LOG_DIR / f"cora_s{seed}_r{ratio}.txt"
     
     cmd = base_cmd + ["--seed", str(seed), "--decoded_add_ratio", str(ratio)]
     bash_str = "source /home/retro/anaconda3/etc/profile.d/conda.sh && conda activate pyg && " + " ".join(cmd)
@@ -74,7 +78,6 @@ def run_experiment(arg_tuple):
     return metrics
 
 if __name__ == "__main__":
-    os.makedirs("sweep_logs", exist_ok=True)
     print("Starting Stage 3A Sweep (Add Ratio)...")
     
     args = list(itertools.product(SEEDS, ADD_RATIOS))
@@ -84,6 +87,6 @@ if __name__ == "__main__":
             results.append(res)
 
     df = pd.DataFrame(results)
-    df.to_csv("stage3a_addratio_sweep.csv", index=False)
-    print("\nSweep Complete! Results saved to stage3a_addratio_sweep.csv")
+    df.to_csv(RESULTS_CSV, index=False)
+    print(f"\nSweep Complete! Results saved to {RESULTS_CSV}")
     print(df.groupby('add_ratio')[['added_edges', 'radius_after', 'val_roc', 'test_hit10']].mean())
