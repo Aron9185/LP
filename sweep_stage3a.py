@@ -1,0 +1,89 @@
+import os
+import subprocess
+import itertools
+import pandas as pd
+import re
+import concurrent.futures
+
+SEEDS = [0, 1, 2]
+ADD_RATIOS = [0.005, 0.01, 0.02, 0.05]
+PULL_STRENGTH = 0.2
+EPOCHS = 700 
+DATASET = "cora"
+
+base_cmd = [
+    "python", "src/aron_main.py",
+    "--dataset", DATASET,
+    "--epochs", str(EPOCHS),
+    "--use_edited_decoder",
+    "--use_decoded_graph_augment",
+    "--pull_mask_scope", "cp",
+    "--compactness_mask_scope", "cp",
+    "--rewrite_endpoint_scope", "c0p",
+    "--decoded_same_cluster_only",
+    "--decoded_require_c0p_endpoint",
+    "--decoded_temporary_view_only",
+    "--freeze_c0p_at_edit_start",
+    "--decoded_graph_aug_bound", "0.1",
+    "--editor_pull_strength", str(PULL_STRENGTH),
+    "--ver", "no"
+]
+
+def extract_metric(filepath):
+    with open(filepath, 'r') as f:
+        content = f.read()
+    
+    sanity_summary = re.search(r'\[SANITY SUMMARY\] best_val_epoch=(\d+) val_roc=([0-9.]+) radius_before=([0-9.-]+) radius_after=([0-9.-]+).*?edit_compact=([0-9.-]+)', content)
+    test_hit_matches = re.findall(r'test_hit10=([0-9.]+)', content)
+    test_hit10 = test_hit_matches[-1] if test_hit_matches else float('nan')
+    final_radius_core = re.search(r'\[FINAL-RADIUS\] core.*?mean=([0-9.]+).*?max=([0-9.]+)', content)
+    
+    add_match = re.search(r'\[EDIT-GRAPH\]\[.*?\] .*?add=(\d+)', content)
+    added_edges = float(add_match.group(1)) if add_match else 0.0
+    
+    ret = {}
+    if sanity_summary:
+        ret['best_val_epoch'] = sanity_summary.group(1)
+        ret['val_roc'] = float(sanity_summary.group(2))
+        ret['radius_before'] = float(sanity_summary.group(3))
+        ret['radius_after'] = float(sanity_summary.group(4))
+    else:
+        ret['val_roc'] = float('nan')
+        ret['radius_after'] = float('nan')
+        
+    ret['test_hit10'] = float(test_hit10)
+    ret['added_edges'] = added_edges
+    return ret
+
+def run_experiment(arg_tuple):
+    seed, ratio = arg_tuple
+    print(f"Running Seed {seed}, Add Ratio {ratio}...")
+    log_file = f"sweep_logs/cora_s{seed}_r{ratio}.txt"
+    
+    cmd = base_cmd + ["--seed", str(seed), "--decoded_add_ratio", str(ratio)]
+    bash_str = "source /home/retro/anaconda3/etc/profile.d/conda.sh && conda activate pyg && " + " ".join(cmd)
+    
+    with open(log_file, "w") as out:
+        subprocess.run(["bash", "-c", bash_str], stdout=out, stderr=subprocess.STDOUT)
+        
+    metrics = extract_metric(log_file)
+    metrics['seed'] = seed
+    metrics['add_ratio'] = ratio
+    
+    print(f"  Finished S{seed} Ratio {ratio} -> Val ROC: {metrics.get('val_roc')}, Test Hit@10: {metrics.get('test_hit10')}, CP Radius: {metrics.get('radius_after')}, Added: {metrics.get('added_edges')}")
+    return metrics
+
+if __name__ == "__main__":
+    os.makedirs("sweep_logs", exist_ok=True)
+    print("Starting Stage 3A Sweep (Add Ratio)...")
+    
+    args = list(itertools.product(SEEDS, ADD_RATIOS))
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        for res in executor.map(run_experiment, args):
+            results.append(res)
+
+    df = pd.DataFrame(results)
+    df.to_csv("stage3a_addratio_sweep.csv", index=False)
+    print("\nSweep Complete! Results saved to stage3a_addratio_sweep.csv")
+    print(df.groupby('add_ratio')[['added_edges', 'radius_after', 'val_roc', 'test_hit10']].mean())

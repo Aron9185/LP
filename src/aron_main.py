@@ -170,7 +170,7 @@ parser.add_argument("--sweep_mode", action="store_true",
 parser.add_argument("--use_edited_decoder", action="store_true", help="Enable the edited decoder branch.")
 parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear"])
 parser.add_argument("--decoder_recon_weight", type=float, default=1.0)
-parser.add_argument("--compactness_weight", type=float, default=0.2)
+parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--preserve_weight", type=float, default=0.0)
 parser.add_argument("--separate_edit_training", action="store_true", help="Use two-stage training: task learning before edit_start_epoch, then edit-only optimization afterward.")
 parser.add_argument("--edit_phase_retain_recon_weight", type=float, default=0.0, help="Optional reconstruction-retention weight during phase-2 edit training.")
@@ -186,7 +186,7 @@ parser.add_argument(
     default=0.10,
     help="Weight of edit_total_loss when --phase2_task_main_loss is enabled.",
 )
-parser.add_argument("--editor_pull_strength", type=float, default=0.10)
+parser.add_argument("--editor_pull_strength", type=float, default=0.10, help="Direct latent pulling strength (the augmentation trigger).")
 parser.add_argument("--editor_edit_scale", type=float, default=0.0)
 parser.add_argument("--edit_start_epoch", type=int, default=10)
 parser.add_argument("--eval_log_every", type=int, default=5)
@@ -210,6 +210,9 @@ parser.add_argument("--decoded_no_c0p_endpoint", dest="decoded_require_c0p_endpo
 parser.add_argument("--decoded_accumulate_into_base", dest="decoded_accumulate_into_base", action="store_true", help="Persist decoded graph rewrites into the base training graph across epochs.")
 parser.add_argument("--decoded_temporary_view_only", dest="decoded_accumulate_into_base", action="store_false", help="Use the decoded rewritten graph only for the current augmented view; do not persist it into the base graph.")
 parser.add_argument("--decoded_require_both_c0p", action="store_true", help="Require both endpoints of a rewritten edge to be in C0p.")
+parser.add_argument("--pull_mask_scope", type=str, default="cp", choices=["cp", "c0p"], help="Scope for latent pulling.")
+parser.add_argument("--compactness_mask_scope", type=str, default="cp", choices=["cp", "c0p"], help="Scope for compactness mask computation.")
+parser.add_argument("--rewrite_endpoint_scope", type=str, default="c0p", choices=["cp", "c0p"], help="Scope for the rewriting endpoint restriction.")
 parser.add_argument("--phase2_freeze_encoder", dest="phase2_freeze_encoder", action="store_true", help="Freeze the encoder and train only the edited decoder in phase 2.")
 parser.add_argument("--phase2_tune_encoder", dest="phase2_freeze_encoder", action="store_false", help="Keep updating the encoder in phase 2 instead of freezing it.")
 parser.add_argument("--edit_phase_encoder_lr_scale", type=float, default=0.0, help="Relative encoder LR used in phase 2 when the encoder is not frozen. 0 disables encoder updates.")
@@ -361,6 +364,9 @@ def main():
         decoder_warmup_recon_weight=args.decoder_warmup_recon_weight,
         decoder_warmup_use_pulled_latent=args.decoder_warmup_use_pulled_latent,
         phase2_decoder_inference_only=args.phase2_decoder_inference_only,
+        pull_mask_scope=args.pull_mask_scope,
+        compactness_mask_scope=args.compactness_mask_scope,
+        rewrite_endpoint_scope=args.rewrite_endpoint_scope,
 )
 
     # Plot(args.dataset_str, roc_history, modification_ratio_history)

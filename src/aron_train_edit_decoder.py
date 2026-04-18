@@ -505,6 +505,9 @@ def train_encoder(
     decoder_warmup_in_phase1 = bool(kwargs.get("decoder_warmup_in_phase1", True))
     decoder_warmup_recon_weight = float(kwargs.get("decoder_warmup_recon_weight", 1.0))
     decoder_warmup_use_pulled_latent = bool(kwargs.get("decoder_warmup_use_pulled_latent", False))
+    pull_mask_scope = str(kwargs.get("pull_mask_scope", "cp"))
+    compactness_mask_scope = str(kwargs.get("compactness_mask_scope", "cp"))
+    rewrite_endpoint_scope = str(kwargs.get("rewrite_endpoint_scope", "c0p"))
 
 
     # ------------------------------------------------------------
@@ -703,7 +706,9 @@ def train_encoder(
             f"compactness_weight={compactness_weight} | preserve_weight={preserve_weight} | "
             f"phase2_freeze_encoder={phase2_freeze_encoder} | edit_phase_encoder_lr_scale={edit_phase_encoder_lr_scale} | "
             f"decoder_warmup_in_phase1={decoder_warmup_in_phase1} | decoder_warmup_recon_weight={decoder_warmup_recon_weight} | "
-            f"decoder_warmup_use_pulled_latent={decoder_warmup_use_pulled_latent}"
+            f"decoder_warmup_use_pulled_latent={decoder_warmup_use_pulled_latent} | "
+            f"pull_strength={editor_pull_strength} | compactness_weight={compactness_weight} | "
+            f"pull_scope={pull_mask_scope} | compactness_scope={compactness_mask_scope} | rewrite_scope={rewrite_endpoint_scope}"
         )
     else:
         print("[PATH] baseline dot-product path active")
@@ -762,6 +767,10 @@ def train_encoder(
     edit_preserve_hist = []
     radius_before_hist = []
     radius_after_hist = []
+    c0p_radius_before_hist = []
+    c0p_radius_after_hist = []
+    cp_radius_before_hist = []
+    cp_radius_after_hist = []
     radius_anchor_hist = []
     delta_from_anchor_hist = []
     delta_from_prev_rewrite_hist = []
@@ -2304,10 +2313,12 @@ def train_encoder(
                         restrict_alpha=restrict_alpha,
                         restrict_gamma=restrict_gamma,
                     )
+                    warm_cp_mask = torch.tensor((warm_labels != -1), dtype=torch.bool, device=Z.device) if warm_labels is not None else None
+                    warm_pull_mask = warm_c0p_mask if pull_mask_scope == "c0p" else warm_cp_mask
                     warm_seed = direct_pull_latent_per_cluster(
                         warm_seed,
                         warm_labels,
-                        warm_mask,
+                        warm_pull_mask,
                         pull_strength=editor_pull_strength,
                     ).detach()
                 warm_pred = graph_decoder(warm_seed)
@@ -2323,6 +2334,7 @@ def train_encoder(
                 edit_seed = Z if (separate_edit_training and in_edit_phase) else bias_Z
                 if use_decoded_graph_augment and decoded_labels_epoch is not None and decoded_mask_epoch is not None:
                     edit_labels_epoch, c0p_mask_epoch = decoded_labels_epoch, decoded_mask_epoch
+                    cp_mask_epoch = torch.tensor((edit_labels_epoch != -1), dtype=torch.bool, device=Z.device) if edit_labels_epoch is not None else None
                 else:
                     edit_labels_epoch, c0p_mask_epoch = resolve_edit_targets(
                         edit_seed,
@@ -2335,19 +2347,24 @@ def train_encoder(
                         restrict_alpha=restrict_alpha,
                         restrict_gamma=restrict_gamma,
                     )
+                    cp_mask_epoch = torch.tensor((edit_labels_epoch != -1), dtype=torch.bool, device=Z.device) if edit_labels_epoch is not None else None
+
+                pull_mask = c0p_mask_epoch if pull_mask_scope == "c0p" else cp_mask_epoch
+                compactness_mask = c0p_mask_epoch if compactness_mask_scope == "c0p" else cp_mask_epoch
+
                 z_edit = direct_pull_latent_per_cluster(
                     edit_seed,
                     edit_labels_epoch,
-                    c0p_mask_epoch,
+                    pull_mask,
                     pull_strength=editor_pull_strength,
                 )
                 A_edit_pred = graph_decoder(z_edit)
                 edit_recon_loss = reconstruction_bce_loss(A_edit_pred, adj_label, norm, weight_tensor, train_mask)
-                edit_compact_loss = cluster_compactness_loss(z_edit, edit_labels_epoch, c0p_mask_epoch)
+                edit_compact_loss = cluster_compactness_loss(z_edit, edit_labels_epoch, compactness_mask)
                 edit_preserve_loss = non_target_preservation_loss(
                     z_edit,
                     preserve_anchor,
-                    c0p_mask_epoch,
+                    pull_mask,
                 )
                 edit_total_loss = (
                     decoder_recon_weight * edit_recon_loss
@@ -2419,9 +2436,13 @@ def train_encoder(
             A_pred = dot_product_decode(Z)
             radius_before = Z.new_tensor(0.0)
             radius_after = Z.new_tensor(0.0)
+            c0p_radius_before = Z.new_tensor(0.0)
+            c0p_radius_after = Z.new_tensor(0.0)
+            cp_radius_before = Z.new_tensor(0.0)
+            cp_radius_after = Z.new_tensor(0.0)
             if use_edited_decoder and (graph_decoder is not None) and _decoded_edit_active(epoch):
                 try:
-                    eval_labels, eval_mask = resolve_edit_targets(
+                    eval_labels, eval_c0p_mask = resolve_edit_targets(
                         Z,
                         _to_dense(adj_label),
                         freeze_targets=freeze_c0p_at_edit_start,
@@ -2432,17 +2453,34 @@ def train_encoder(
                         restrict_alpha=restrict_alpha,
                         restrict_gamma=restrict_gamma,
                     )
-                    radius_before = cluster_compactness_loss(Z, eval_labels, eval_mask)
+                    eval_cp_mask = torch.tensor((eval_labels != -1), dtype=torch.bool, device=Z.device) if eval_labels is not None else None
+                    eval_pull_mask = eval_c0p_mask if pull_mask_scope == "c0p" else eval_cp_mask
+                    eval_compactness_mask = eval_c0p_mask if compactness_mask_scope == "c0p" else eval_cp_mask
+                    eval_rewrite_mask = eval_c0p_mask if rewrite_endpoint_scope == "c0p" else eval_cp_mask
+
+                    radius_before = cluster_compactness_loss(Z, eval_labels, eval_compactness_mask)
+                    c0p_radius_before = cluster_compactness_loss(Z, eval_labels, eval_c0p_mask)
+                    cp_radius_before = cluster_compactness_loss(Z, eval_labels, eval_cp_mask)
+
                     if use_decoded_graph_augment:
                         if decoded_accumulate_into_base:
                             if decoded_rewrite_applied_this_epoch and decoded_pre_graph_dense_epoch is not None:
                                 metric_labels = decoded_metric_labels_epoch if decoded_metric_labels_epoch is not None else eval_labels
-                                metric_mask = decoded_metric_mask_epoch if decoded_metric_mask_epoch is not None else eval_mask
+                                metric_c0p_mask = decoded_metric_mask_epoch if decoded_metric_mask_epoch is not None else eval_c0p_mask
+                                metric_cp_mask = torch.tensor((metric_labels != -1), dtype=torch.bool, device=Z.device) if metric_labels is not None else None
+                                metric_compactness_mask = metric_c0p_mask if compactness_mask_scope == "c0p" else metric_cp_mask
+
                                 Z_before_graph = encoder(features, decoded_pre_graph_dense_epoch.to_sparse().indices())
-                                radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_mask)
-                                radius_after = cluster_compactness_loss(Z, metric_labels, metric_mask)
+                                radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_compactness_mask)
+                                radius_after = cluster_compactness_loss(Z, metric_labels, metric_compactness_mask)
+                                c0p_radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_c0p_mask)
+                                c0p_radius_after = cluster_compactness_loss(Z, metric_labels, metric_c0p_mask)
+                                cp_radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_cp_mask)
+                                cp_radius_after = cluster_compactness_loss(Z, metric_labels, metric_cp_mask)
                             else:
                                 radius_after = radius_before
+                                c0p_radius_after = c0p_radius_before
+                                cp_radius_after = cp_radius_before
                         else:
                             if decoded_static_view_enabled and static_decoded_aug_edge_index is not None:
                                 Z_eval = encoder(features, static_decoded_aug_edge_index)
@@ -2450,7 +2488,7 @@ def train_encoder(
                                 Z_pull_eval = direct_pull_latent_per_cluster(
                                     Z,
                                     eval_labels,
-                                    eval_mask,
+                                    eval_pull_mask,
                                     pull_strength=editor_pull_strength,
                                 )
                                 decoded_scores_eval = graph_decoder(Z_pull_eval)
@@ -2460,7 +2498,7 @@ def train_encoder(
                                     decoded_scores_eval,
                                     _to_dense(adj_label),
                                     eval_labels,
-                                    eval_mask,
+                                    eval_rewrite_mask,
                                     E0=E0,
                                     add_ratio=decoded_add_ratio,
                                     remove_ratio=decoded_remove_ratio,
@@ -2478,15 +2516,19 @@ def train_encoder(
                                     require_both_c0p=decoded_require_both_c0p,
                                 )
                                 Z_eval = encoder(features, g_eval.to_sparse().indices())
-                            radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_mask)
+                            radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask)
+                            c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask)
+                            cp_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_cp_mask)
                     else:
                         Z_eval = direct_pull_latent_per_cluster(
                             Z,
                             eval_labels,
-                            eval_mask,
+                            eval_pull_mask,
                             pull_strength=editor_pull_strength,
                         )
-                        radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_mask)
+                        radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask)
+                        c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask)
+                        cp_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_cp_mask)
                 except Exception as e:
                     print(f"[EDIT][EVAL] edited eval failed at epoch {epoch}: {e}")
         
@@ -2562,6 +2604,11 @@ def train_encoder(
         radius_before_val = float(radius_before.detach().cpu())
         radius_after_val = float(radius_after.detach().cpu())
         radius_delta_val = radius_after_val - radius_before_val
+
+        c0p_radius_before_val = float(c0p_radius_before.detach().cpu())
+        c0p_radius_after_val = float(c0p_radius_after.detach().cpu())
+        cp_radius_before_val = float(cp_radius_before.detach().cpu())
+        cp_radius_after_val = float(cp_radius_after.detach().cpu())
         rewrite_applied_now = bool(use_edited_decoder and epoch >= edit_start_epoch and decoded_rewrite_applied_this_epoch)
         if use_edited_decoder and _decoded_edit_active(epoch):
             if radius_anchor_value is None and np.isfinite(radius_before_val):
@@ -2573,6 +2620,10 @@ def train_encoder(
             # they had "no radius history" even though radius_before/radius_after were being computed correctly.
             radius_hist.append(radius_after_val)
             radius_epoch_hist.append(epoch)
+            c0p_radius_before_hist.append(c0p_radius_before_val)
+            c0p_radius_after_hist.append(c0p_radius_after_val)
+            cp_radius_before_hist.append(cp_radius_before_val)
+            cp_radius_after_hist.append(cp_radius_after_val)
 
             if rewrite_applied_now:
                 if prev_rewrite_radius_after_value is None:
@@ -3152,6 +3203,10 @@ def train_encoder(
             df_dict = {
                 "epoch": epochs,
                 "radius_mean": radius_vals,
+                "c0p_radius_before": [c0p_radius_before_hist[radius_epoch_hist.index(e)] if e in radius_epoch_hist else float("nan") for e in epochs],
+                "c0p_radius_after": [c0p_radius_after_hist[radius_epoch_hist.index(e)] if e in radius_epoch_hist else float("nan") for e in epochs],
+                "cp_radius_before": [cp_radius_before_hist[radius_epoch_hist.index(e)] if e in radius_epoch_hist else float("nan") for e in epochs],
+                "cp_radius_after": [cp_radius_after_hist[radius_epoch_hist.index(e)] if e in radius_epoch_hist else float("nan") for e in epochs],
                 "val_hit@1": val_hit1,
                 "val_hit@3": val_hit3,
                 "val_hit@10": val_hit10,
