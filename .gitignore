@@ -40,4 +40,4 @@ artifacts/
 *.npy
 *.gz
 
-/experiments/
+/experiments/*/results/

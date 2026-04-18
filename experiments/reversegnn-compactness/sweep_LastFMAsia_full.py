@@ -2,7 +2,7 @@ import subprocess
 import os
 import re
 
-from experiment_paths import sweep_log_dir
+from experiment_paths import repo_root, sweep_log_dir
 
 # --- STAGE A GRID ---
 PULLS = [0.0, 0.4, 1.0]
@@ -10,12 +10,13 @@ ADDS  = [0.01, 0.02, 0.1, 0.5, 1.0]
 SEEDS = [0, 1, 2, 3, 4]
 MAX_WORKERS = 4
 PYTHON_EXE = "/home/retro/anaconda3/envs/pyg/bin/python3"
+REPO_ROOT = repo_root()
 log_dir = sweep_log_dir()
 
 def run_cmd(args):
     cmd, out_path = args
     with open(out_path, "w") as f:
-        subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+        subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
     return out_path
 
 # 1. Run COMPLETE Addition Sweep for LastFMAsia

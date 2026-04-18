@@ -4,7 +4,7 @@ import itertools
 import pandas as pd
 import re
 
-from experiment_paths import artifact_path, sweep_log_dir
+from experiment_paths import artifact_path, repo_root, sweep_log_dir
 
 SEEDS = [0, 1, 2]
 PULL_STRENGTHS = [0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
@@ -12,6 +12,7 @@ PULL_STRENGTHS = [0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
 # Adjust this if full 700 epochs is too slow; typically pilot runs can use fewer epochs, but we use default 700 unless changed.
 EPOCHS = 700 
 DATASET = "cora"
+REPO_ROOT = repo_root()
 LOG_DIR = sweep_log_dir()
 RESULTS_CSV = artifact_path("stage2_pull_sweep_results.csv")
 
@@ -81,7 +82,7 @@ def run_experiment(arg_tuple):
     log_file = LOG_DIR / f"cora_s{seed}_p{pull}.txt"
     
     cmd = base_cmd + ["--seed", str(seed), "--editor_pull_strength", str(pull)]
-    bash_str = "source /home/retro/anaconda3/etc/profile.d/conda.sh && conda activate pyg && " + " ".join(cmd)
+    bash_str = f'cd "{REPO_ROOT}" && source /home/retro/anaconda3/etc/profile.d/conda.sh && conda activate pyg && ' + " ".join(cmd)
     
     with open(log_file, "w") as out:
         subprocess.run(["bash", "-c", bash_str], stdout=out, stderr=subprocess.STDOUT)

@@ -17,7 +17,7 @@ import itertools
 import concurrent.futures
 import pandas as pd
 
-from experiment_paths import artifact_path, sweep_log_dir
+from experiment_paths import artifact_path, repo_root, sweep_log_dir
 
 REMOVE_RATIOS = [0.0, 0.002, 0.005, 0.01]
 AUG_BOUND    = -1.0
@@ -25,6 +25,7 @@ SEEDS        = [0, 1, 2]
 EPOCHS       = 700
 MAX_WORKERS  = 2
 TOP_K        = 2   # top-2 pulls and top-2 add_ratios per dataset
+REPO_ROOT = repo_root()
 LOG_DIR = sweep_log_dir()
 STAGE_A_RESULTS_CSV = artifact_path("stageA_results.csv")
 STAGE_B_RESULTS_CSV = artifact_path("stageB_results.csv")
@@ -86,6 +87,7 @@ def run(args):
             "--decoded_remove_ratio", str(remove),
         ]
         bash = (
+            f'cd "{REPO_ROOT}" && '
             "source /home/retro/anaconda3/etc/profile.d/conda.sh && "
             "conda activate pyg && " + " ".join(cmd)
         )

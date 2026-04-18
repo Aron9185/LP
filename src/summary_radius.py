@@ -7,6 +7,14 @@ from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
+DEFAULT_ROOT_LEGACY_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "experiments"
+    / "reversegnn-compactness"
+    / "results"
+    / "root-legacy"
+)
+
 # ---------- optional: p-values if scipy available ----------
 try:
     from scipy.stats import pearsonr
@@ -331,10 +339,10 @@ def main():
     ap.add_argument("--log-dirs", nargs="+", required=True, help="directories containing *.log")
     ap.add_argument("--glob", type=str, default="*.log")
     ap.add_argument("--radius-summary", type=str, required=True, help="remove_only_summary.tsv (tab-separated)")
-    ap.add_argument("--dump-merged", type=str, default="remove_only_merged_per_run.csv")
-    ap.add_argument("--corr_by_dataset", type=str, default="remove_only_corr_by_dataset.tsv")
-    ap.add_argument("--corr_by_dataset_scope", type=str, default="remove_only_corr_by_dataset_scope.tsv")
-    ap.add_argument("--perf_by_dataset_scope", type=str, default="remove_only_perf_by_dataset_scope.tsv")
+    ap.add_argument("--dump-merged", type=str, default=str(DEFAULT_ROOT_LEGACY_DIR / "remove_only_merged_per_run.csv"))
+    ap.add_argument("--corr_by_dataset", type=str, default=str(DEFAULT_ROOT_LEGACY_DIR / "remove_only_corr_by_dataset.tsv"))
+    ap.add_argument("--corr_by_dataset_scope", type=str, default=str(DEFAULT_ROOT_LEGACY_DIR / "remove_only_corr_by_dataset_scope.tsv"))
+    ap.add_argument("--perf_by_dataset_scope", type=str, default=str(DEFAULT_ROOT_LEGACY_DIR / "remove_only_perf_by_dataset_scope.tsv"))
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

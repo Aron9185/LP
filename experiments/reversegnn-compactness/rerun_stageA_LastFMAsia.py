@@ -15,7 +15,7 @@ import itertools
 import concurrent.futures
 import pandas as pd
 
-from experiment_paths import artifact_path, sweep_log_dir
+from experiment_paths import artifact_path, repo_root, sweep_log_dir
 
 DATASET      = "LastFMAsia"
 PULL_STRENGTHS = [0.0, 0.1, 0.2, 0.4, 0.6]
@@ -25,6 +25,7 @@ AUG_BOUND    = -1.0
 SEEDS        = [0, 1, 2]
 EPOCHS       = 700
 MAX_WORKERS  = 1   # serial — full GPU per run to avoid OOM
+REPO_ROOT = repo_root()
 LOG_DIR = sweep_log_dir()
 RESULTS_CSV = artifact_path("stageA_LastFMAsia_results.csv")
 
@@ -89,6 +90,7 @@ def run(args):
         "--decoded_add_ratio",    str(add),
     ]
     bash = (
+        f'cd "{REPO_ROOT}" && '
         "source /home/retro/anaconda3/etc/profile.d/conda.sh && "
         "conda activate pyg && " + " ".join(cmd)
     )

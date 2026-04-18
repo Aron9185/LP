@@ -1,7 +1,7 @@
 import subprocess
 import os
 
-from experiment_paths import sweep_log_dir
+from experiment_paths import repo_root, sweep_log_dir
 
 # --- Configurations ---
 DATASETS = ["cora", "citeseer", "Cora_ML"]
@@ -14,13 +14,14 @@ REMOVES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 SEEDS   = [0, 1, 2, 3, 4]
 MAX_WORKERS = 4
 PYTHON_EXE = "/home/retro/anaconda3/envs/pyg/bin/python3"
+REPO_ROOT = repo_root()
 
 log_dir = sweep_log_dir()
 
 def run_cmd(args):
     cmd, out_path = args
     with open(out_path, "w") as f:
-        subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+        subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=REPO_ROOT)
     return out_path
 
 commands = []

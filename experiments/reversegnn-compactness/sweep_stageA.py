@@ -28,7 +28,7 @@ import itertools
 import concurrent.futures
 import pandas as pd
 
-from experiment_paths import artifact_path, sweep_log_dir
+from experiment_paths import artifact_path, repo_root, sweep_log_dir
 
 # ── Grid ────────────────────────────────────────────────────────────────────
 DATASETS     = ["cora", "citeseer", "Cora_ML", "LastFMAsia"]
@@ -39,6 +39,7 @@ AUG_BOUND    = -1.0
 SEEDS        = [0, 1, 2]
 EPOCHS       = 700
 MAX_WORKERS  = 4          # concurrent runs; tune to your CPU
+REPO_ROOT = repo_root()
 LOG_DIR = sweep_log_dir()
 RESULTS_CSV = artifact_path("stageA_results.csv")
 
@@ -107,6 +108,7 @@ def run(args):
             "--decoded_add_ratio",    str(add),
         ]
         bash = (
+            f'cd "{REPO_ROOT}" && '
             "source /home/retro/anaconda3/etc/profile.d/conda.sh && "
             "conda activate pyg && " +
             " ".join(cmd)

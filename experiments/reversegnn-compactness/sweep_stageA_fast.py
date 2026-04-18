@@ -12,13 +12,14 @@ import subprocess
 import itertools
 import concurrent.futures
 
-from experiment_paths import sweep_log_dir
+from experiment_paths import repo_root, sweep_log_dir
 
 DATASETS_STD  = ["cora", "citeseer", "Cora_ML"]
 PULLS         = [0.0, 0.4, 1.0]  # Reduced for speed
 ADDS          = [0.1, 0.5, 1.0]  # Large ratios focus
 EPOCHS        = 700
 COMPACT_WEIGHT = 0.2
+REPO_ROOT = repo_root()
 LOG_DIR = sweep_log_dir()
 
 def run_job(ds, pull, add, seed):
@@ -50,6 +51,7 @@ def run_job(ds, pull, add, seed):
     ]
     
     bash_cmd = (
+        f'cd "{REPO_ROOT}" && '
         "source /home/retro/anaconda3/etc/profile.d/conda.sh && "
         "conda activate pyg && " +
         " ".join(cmd)
