@@ -91,6 +91,25 @@ parser.add_argument(
     default="samples.npy",
     help="HeaRT filename suffix. samples.npy -> heart_valid_samples.npy / heart_test_samples.npy",
 )
+parser.add_argument(
+    "--heart_eval_every",
+    type=int,
+    default=None,
+    help="Override HeaRT validation interval. Default keeps the training-code policy.",
+)
+parser.add_argument(
+    "--heart_val_frac",
+    type=float,
+    default=None,
+    help="Override HeaRT validation fraction used during training. Use 1.0 for full validation.",
+)
+parser.add_argument(
+    "--heart_checkpoint_metric",
+    type=str,
+    default="roc",
+    choices=["roc", "ap", "hit1", "hit3", "hit10", "hit20", "hit50", "hit100"],
+    help="Validation metric used to select HeaRT checkpoints.",
+)
 
 # Aron
 parser.add_argument(
@@ -168,9 +187,35 @@ parser.add_argument("--sweep_mode", action="store_true",
 
 # Edited decoder / decoded-graph augmentation
 parser.add_argument("--use_edited_decoder", action="store_true", help="Enable the edited decoder branch.")
-parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear"])
+parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear", "mlp_pair"])
+parser.add_argument("--mlp_pair_max_rows", type=int, default=16, help="Row chunk size for the mlp_pair decoder to control GPU memory.")
+parser.add_argument("--decoder_objective", type=str, default="hybrid", choices=["recon", "hybrid"], help="Decoder edit objective.")
 parser.add_argument("--decoder_recon_weight", type=float, default=1.0)
+parser.add_argument("--decoder_keep_weight", type=float, default=1.0, help="Weight for structure-preserving BCE outside rewrite scope.")
+parser.add_argument("--decoder_add_rank_weight", type=float, default=1.0, help="Weight for ranking valid add candidates above bad additions.")
+parser.add_argument("--decoder_remove_rank_weight", type=float, default=1.0, help="Weight for ranking valid kept edges above removable edges.")
+parser.add_argument("--decoder_rank_margin", type=float, default=0.2, help="Margin used for decoder ranking losses.")
+parser.add_argument(
+    "--decoder_rank_strategy",
+    type=str,
+    default="easy",
+    choices=["easy", "heart_like"],
+    help="Mining strategy for decoder ranking negatives. heart_like uses hard boundary negatives with shared-endpoint fallback.",
+)
+parser.add_argument(
+    "--decoder_rank_neg_k",
+    type=int,
+    default=8,
+    help="Number of hard negatives per positive anchor for decoder heart-like ranking.",
+)
+parser.add_argument(
+    "--decoder_rank_pool_factor",
+    type=int,
+    default=4,
+    help="Boundary-pool multiplier for heart-like decoder ranking mining.",
+)
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
+parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
 parser.add_argument("--preserve_weight", type=float, default=0.0)
 parser.add_argument("--separate_edit_training", action="store_true", help="Use two-stage training: task learning before edit_start_epoch, then edit-only optimization afterward.")
 parser.add_argument("--edit_phase_retain_recon_weight", type=float, default=0.0, help="Optional reconstruction-retention weight during phase-2 edit training.")
@@ -223,6 +268,7 @@ parser.add_argument("--decoder_warmup_recon_weight", type=float, default=1.0, he
 parser.add_argument("--decoder_warmup_use_pulled_latent", action="store_true", help="Use pulled latent instead of base latent during decoder warm-up.")
 parser.add_argument("--phase2_decoder_inference_only", dest="phase2_decoder_inference_only", action="store_true", help="In phase 2, freeze decoder training and use it only to infer decoded rewrites.")
 parser.add_argument("--no_phase2_decoder_inference_only", dest="phase2_decoder_inference_only", action="store_false", help="Allow decoder training losses to remain active in phase 2.")
+parser.add_argument("--skip_oom_epoch", action="store_true", help="If a CUDA OOM occurs during backward/step, clear cache and skip that epoch instead of aborting the run.")
 parser.set_defaults(
     freeze_c0p_at_edit_start=True,
     decoded_same_cluster_only=False,
@@ -306,6 +352,9 @@ def main():
         split_mode=args.split_mode,
         heart_data_dir=args.heart_data_dir,
         heart_filename=args.heart_filename,
+        heart_eval_every=args.heart_eval_every,
+        heart_val_frac=args.heart_val_frac,
+        heart_checkpoint_metric=args.heart_checkpoint_metric,
         # NEW
         dbscan_eps=args.dbscan_eps,
         dbscan_min_samples=args.dbscan_min_samples,
@@ -329,8 +378,18 @@ def main():
         seed=args.seed,
         use_edited_decoder=args.use_edited_decoder,
         decoder_type=args.decoder_type,
+        mlp_pair_max_rows=args.mlp_pair_max_rows,
+        decoder_objective=args.decoder_objective,
         decoder_recon_weight=args.decoder_recon_weight,
+        decoder_keep_weight=args.decoder_keep_weight,
+        decoder_add_rank_weight=args.decoder_add_rank_weight,
+        decoder_remove_rank_weight=args.decoder_remove_rank_weight,
+        decoder_rank_margin=args.decoder_rank_margin,
+        decoder_rank_strategy=args.decoder_rank_strategy,
+        decoder_rank_neg_k=args.decoder_rank_neg_k,
+        decoder_rank_pool_factor=args.decoder_rank_pool_factor,
         compactness_weight=args.compactness_weight,
+        compactness_objective=args.compactness_objective,
         preserve_weight=args.preserve_weight,
         separate_edit_training=args.separate_edit_training,
         edit_phase_retain_recon_weight=args.edit_phase_retain_recon_weight,
@@ -364,6 +423,7 @@ def main():
         decoder_warmup_recon_weight=args.decoder_warmup_recon_weight,
         decoder_warmup_use_pulled_latent=args.decoder_warmup_use_pulled_latent,
         phase2_decoder_inference_only=args.phase2_decoder_inference_only,
+        skip_oom_epoch=args.skip_oom_epoch,
         pull_mask_scope=args.pull_mask_scope,
         compactness_mask_scope=args.compactness_mask_scope,
         rewrite_endpoint_scope=args.rewrite_endpoint_scope,
@@ -464,6 +524,7 @@ if __name__ == "__main__":
         loss_tag = f"task-{args.loss_ver}" if getattr(args, "loss_ver", "") else "task-na"
         weight_tag = f"dr{_fmt_num(args.decoder_recon_weight)}_cp{_fmt_num(args.compactness_weight)}_pv{_fmt_num(args.preserve_weight)}"
         stage_tag = f"es{_fmt_num(args.edit_start_epoch)}"
+        objective_tag = f"dobj-{args.decoder_objective}_cobj-{args.compactness_objective}"
 
         extra_tags = []
         if args.separate_edit_training:
@@ -511,6 +572,7 @@ if __name__ == "__main__":
             target_tag,
             cluster_tag,
             loss_tag,
+            objective_tag,
             weight_tag,
             *extra_tags,
         ]

@@ -38,6 +38,8 @@ def run_job(ds, pull, add, seed):
         "--compactness_weight", str(COMPACT_WEIGHT),
         "--decoded_add_ratio", str(add),
         "--use_edited_decoder",
+        "--decoder_objective", "recon",
+        "--compactness_objective", "radius",
         "--use_decoded_graph_augment",
         "--pull_mask_scope", "cp",
         "--compactness_mask_scope", "cp",

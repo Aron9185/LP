@@ -166,7 +166,11 @@ def train_encoder(
         print(f"{type(adj_train)}, {type(train_edges)}, {type(val_edges)}, {type(val_edges_false)}, {type(test_edges)}, {type(test_edges_false)}")
         print(len(train_edges), len(val_edges_false), len(test_edges))
     else:
-        adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges(adj,dataset_str)
+        adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges(
+            adj,
+            dataset_str,
+            split_seed=seed,
+        )
         print(f"{type(adj_train)}, {type(train_edges)}, {type(val_edges)}, {type(val_edges_false)}, {type(test_edges)}, {type(test_edges_false)}")
          
     adj = adj_train

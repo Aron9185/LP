@@ -28,7 +28,7 @@ for p in PULLS:
         for s in SEEDS:
             out_file = log_dir / f"finalA_LastFMAsia_s{s}_p{p}_r{a}.txt"
             if os.path.exists(out_file): continue
-            cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", "LastFMAsia", "--seed", str(s), "--editor_pull_strength", str(p), "--decoded_add_ratio", str(a)]
+            cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", "LastFMAsia", "--seed", str(s), "--use_edited_decoder", "--decoder_objective", "recon", "--compactness_objective", "radius", "--editor_pull_strength", str(p), "--decoded_add_ratio", str(a)]
             cmds_a.append((cmd, out_file))
 
 if cmds_a:
@@ -67,7 +67,7 @@ for r in REMOVES:
     for s in SEEDS:
         out_file = log_dir / f"finalB_LastFMAsia_s{s}_p{best_p}_a{best_a}_r{r}.txt"
         if os.path.exists(out_file): continue
-        cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", "LastFMAsia", "--seed", str(s), "--editor_pull_strength", str(best_p), "--decoded_add_ratio", str(best_a), "--decoded_remove_ratio", str(r)]
+        cmd = [PYTHON_EXE, "src/aron_main.py", "--dataset", "LastFMAsia", "--seed", str(s), "--use_edited_decoder", "--decoder_objective", "recon", "--compactness_objective", "radius", "--editor_pull_strength", str(best_p), "--decoded_add_ratio", str(best_a), "--decoded_remove_ratio", str(r)]
         cmds_b.append((cmd, out_file))
 
 if cmds_b:

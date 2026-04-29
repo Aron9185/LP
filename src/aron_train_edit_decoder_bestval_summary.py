@@ -541,8 +541,12 @@ def train_encoder(
             print(f"[SPLIT] HeaRT | root={heart_data_dir} | filename={heart_filename}")
             adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false =  mask_test_edges_heart(adj, dataset_str, heart_root=heart_data_dir, filename=heart_filename)
         else:
-            print("[SPLIT] random old mask_test_edges")
-            adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges(adj, dataset_str)
+            print(f"[SPLIT] random old mask_test_edges | split_seed={seed}")
+            adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges(
+                adj,
+                dataset_str,
+                split_seed=seed,
+            )
 
     print(
         f"[SPLIT] types: {type(adj_train)}, {type(train_edges)}, {type(val_edges)}, "

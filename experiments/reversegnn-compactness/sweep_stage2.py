@@ -21,6 +21,8 @@ base_cmd = [
     "--dataset", DATASET,
     "--epochs", str(EPOCHS),
     "--use_edited_decoder",
+    "--decoder_objective", "recon",
+    "--compactness_objective", "radius",
     "--use_decoded_graph_augment",
     "--pull_mask_scope", "cp",
     "--compactness_mask_scope", "cp",

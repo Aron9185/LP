@@ -47,8 +47,9 @@ def load_data(filename):
         return pickle.load(f)
 
 
-def mask_test_edges(adj, dataset_str):
+def mask_test_edges(adj, dataset_str, split_seed=None):
     # Function to build test set with 10% positive links
+    rng = np.random.RandomState(0 if split_seed is None else int(split_seed))
 
     # Remove diagonal elements
     adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
@@ -64,14 +65,17 @@ def mask_test_edges(adj, dataset_str):
     num_val = int(np.floor(edges.shape[0] / 20.))
 
     all_edge_idx = list(range(edges.shape[0]))
-    np.random.shuffle(all_edge_idx)
+    rng.shuffle(all_edge_idx)
     val_edge_idx = all_edge_idx[:num_val]
     test_edge_idx = all_edge_idx[num_val:(num_val + num_test)]
     test_edges = edges[test_edge_idx]
     val_edges = edges[val_edge_idx]
     train_edges = np.delete(edges, np.hstack([test_edge_idx, val_edge_idx]), axis=0)
 
-    filename = f'/home/retro/ARON/mask_edge/{dataset_str}_mask_edge.pkl'
+    if split_seed is None:
+        filename = f'/home/retro/ARON/mask_edge/{dataset_str}_mask_edge.pkl'
+    else:
+        filename = f'/home/retro/ARON/mask_edge/{dataset_str}_splitseed{int(split_seed)}_mask_edge.pkl'
     if os.path.exists(filename):
         adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = load_data(filename)
         return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false
@@ -82,8 +86,8 @@ def mask_test_edges(adj, dataset_str):
 
     test_edges_false = []
     while len(test_edges_false) < len(test_edges):
-        idx_i = np.random.randint(0, adj.shape[0])
-        idx_j = np.random.randint(0, adj.shape[0])
+        idx_i = rng.randint(0, adj.shape[0])
+        idx_j = rng.randint(0, adj.shape[0])
         if idx_i == idx_j:
             continue
         if ismember([idx_i, idx_j], edges_all):
@@ -97,8 +101,8 @@ def mask_test_edges(adj, dataset_str):
 
     val_edges_false = []
     while len(val_edges_false) < len(val_edges):
-        idx_i = np.random.randint(0, adj.shape[0])
-        idx_j = np.random.randint(0, adj.shape[0])
+        idx_i = rng.randint(0, adj.shape[0])
+        idx_j = rng.randint(0, adj.shape[0])
         if idx_i == idx_j:
             continue
         if ismember([idx_i, idx_j], train_edges):
@@ -129,6 +133,7 @@ def mask_test_edges(adj, dataset_str):
     adj_train = adj_train + adj_train.T
 
     # NOTE: these edge lists only contain single direction of edge!
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     save_data(filename, (adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false))
     return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false
 

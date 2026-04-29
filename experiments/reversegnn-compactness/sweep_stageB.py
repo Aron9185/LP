@@ -34,6 +34,8 @@ BASE_ARGS = [
     "python", "src/aron_main.py",
     "--epochs",                   str(EPOCHS),
     "--use_edited_decoder",
+    "--decoder_objective",        "recon",
+    "--compactness_objective",    "radius",
     "--use_decoded_graph_augment",
     "--pull_mask_scope",          "cp",
     "--compactness_mask_scope",   "cp",
