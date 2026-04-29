@@ -87,6 +87,23 @@ class BilinearGraphDecoder(nn.Module):
         probs.fill_diagonal_(1.0)
         return probs
 
+    def score_pairs(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        xu = X.index_select(0, src)
+        xv = X.index_select(0, dst)
+        logits_uv = ((xu @ self.weight) * xv).sum(dim=1) + self.bias
+        logits_vu = ((xv @ self.weight) * xu).sum(dim=1) + self.bias
+        probs = 0.5 * (torch.sigmoid(logits_uv) + torch.sigmoid(logits_vu))
+        return torch.where(src == dst, torch.ones_like(probs), probs)
+
 
 class MLPPairGraphDecoder(nn.Module):
     """Chunked MLP scorer over pair features [zi, zj, |zi-zj|, zi*zj]."""
@@ -123,6 +140,45 @@ class MLPPairGraphDecoder(nn.Module):
         probs = 0.5 * (probs + probs.t())
         probs.fill_diagonal_(1.0)
         return probs
+
+    def _score_pairs_one_way(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        if src.numel() == 0:
+            return Z.new_empty((0,))
+        step = max(1, int(batch_size or 32768))
+        outs = []
+        for start in range(0, src.numel(), step):
+            end = min(src.numel(), start + step)
+            u = src[start:end]
+            v = dst[start:end]
+            zi = X.index_select(0, u)
+            zj = X.index_select(0, v)
+            pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj], dim=-1)
+            outs.append(torch.sigmoid(self.net(pair_feats).view(-1)))
+        return torch.cat(outs, dim=0)
+
+    def score_pairs(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        probs = 0.5 * (
+            self._score_pairs_one_way(Z, src, dst, batch_size=batch_size)
+            + self._score_pairs_one_way(Z, dst, src, batch_size=batch_size)
+        )
+        return torch.where(src == dst, torch.ones_like(probs), probs)
 
 
 def _adjacency_to_binary_csr(adj_like) -> sp.csr_matrix:
@@ -338,6 +394,94 @@ class StructuralPairGraphDecoder(nn.Module):
         probs.fill_diagonal_(1.0)
         return probs
 
+    def _score_pairs_one_way(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        X_cos = F.normalize(Z, p=2, dim=1)
+        n_nodes = X.size(0)
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        if src.numel() == 0:
+            return Z.new_empty((0,))
+
+        deg = self._node_vector(self.node_degree_feat, n_nodes, X.dtype, X.device)
+        cn = self._pair_matrix(self.cn_feat, n_nodes, X.dtype, X.device)
+        ra = self._pair_matrix(self.ra_feat, n_nodes, X.dtype, X.device)
+        aa = self._pair_matrix(self.aa_feat, n_nodes, X.dtype, X.device)
+        if self.label_ids.numel() == n_nodes:
+            labels = self.label_ids.to(device=X.device)
+            non_noise = labels != -1
+        else:
+            labels = torch.full((n_nodes,), -1, dtype=torch.long, device=X.device)
+            non_noise = torch.zeros((n_nodes,), dtype=torch.bool, device=X.device)
+        core = self.core_mask.to(device=X.device).bool() if self.core_mask.numel() == n_nodes else torch.zeros((n_nodes,), dtype=torch.bool, device=X.device)
+        proto_dist = self._prototype_distances(X_cos)
+
+        step = max(1, int(batch_size or 32768))
+        outs = []
+        for start in range(0, src.numel(), step):
+            end = min(src.numel(), start + step)
+            u = src[start:end]
+            v = dst[start:end]
+            zi = X.index_select(0, u)
+            zj = X.index_select(0, v)
+            raw_dot = (Z.index_select(0, u) * Z.index_select(0, v)).sum(dim=1, keepdim=True)
+            cosine = (X_cos.index_select(0, u) * X_cos.index_select(0, v)).sum(dim=1, keepdim=True)
+            deg_u = deg.index_select(0, u).view(-1, 1)
+            deg_v = deg.index_select(0, v).view(-1, 1)
+            label_u = labels.index_select(0, u)
+            label_v = labels.index_select(0, v)
+            same_cluster = ((label_u == label_v) & non_noise.index_select(0, u) & non_noise.index_select(0, v)).to(X.dtype).view(-1, 1)
+            core_u = core.index_select(0, u).to(X.dtype).view(-1, 1)
+            core_v = core.index_select(0, v).to(X.dtype).view(-1, 1)
+            cp_u = non_noise.index_select(0, u).to(X.dtype).view(-1, 1)
+            cp_v = non_noise.index_select(0, v).to(X.dtype).view(-1, 1)
+            proto_u = proto_dist.index_select(0, u).view(-1, 1)
+            proto_v = proto_dist.index_select(0, v).view(-1, 1)
+            scalar_feats = torch.cat(
+                [
+                    raw_dot,
+                    cosine,
+                    deg_u,
+                    deg_v,
+                    torch.abs(deg_u - deg_v),
+                    cn[u, v].view(-1, 1),
+                    ra[u, v].view(-1, 1),
+                    aa[u, v].view(-1, 1),
+                    same_cluster,
+                    core_u,
+                    core_v,
+                    cp_u,
+                    cp_v,
+                    proto_u,
+                    proto_v,
+                ],
+                dim=-1,
+            )
+            pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
+            outs.append(torch.sigmoid(self.net(pair_feats).view(-1)))
+        return torch.cat(outs, dim=0)
+
+    def score_pairs(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        probs = 0.5 * (
+            self._score_pairs_one_way(Z, src, dst, batch_size=batch_size)
+            + self._score_pairs_one_way(Z, dst, src, batch_size=batch_size)
+        )
+        return torch.where(src == dst, torch.ones_like(probs), probs)
+
 
 def reconstruction_bce_loss(
     adj_pred: torch.Tensor,
@@ -362,6 +506,431 @@ def reconstruction_bce_loss(
         return adj_pred.new_tensor(0.0)
     return norm * F.binary_cross_entropy(pred, target, weight=weights)
 
+
+
+
+def _decoder_score_pairs(
+    graph_decoder: nn.Module,
+    Z: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    batch_size: int | None = None,
+) -> torch.Tensor:
+    src = src.to(device=Z.device, dtype=torch.long).view(-1)
+    dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+    if src.numel() == 0:
+        return Z.new_empty((0,))
+    if hasattr(graph_decoder, "score_pairs"):
+        return graph_decoder.score_pairs(Z, src, dst, batch_size=batch_size)
+    scores = graph_decoder(Z)
+    return scores[src, dst]
+
+
+def _sample_pairs_from_mask(pair_mask: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    device = pair_mask.device
+    if count <= 0:
+        empty = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty
+    ii, jj = pair_mask.triu(1).nonzero(as_tuple=True)
+    if ii.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.long, device=device)
+        return empty, empty
+    take = torch.randint(0, ii.numel(), (int(count),), device=device)
+    return ii.index_select(0, take), jj.index_select(0, take)
+
+
+def _sampled_pair_bce_loss(
+    graph_decoder: nn.Module,
+    Z: torch.Tensor,
+    pos_u: torch.Tensor,
+    pos_v: torch.Tensor,
+    neg_u: torch.Tensor,
+    neg_v: torch.Tensor,
+) -> torch.Tensor:
+    scores = []
+    labels = []
+    if pos_u.numel() > 0:
+        scores.append(_decoder_score_pairs(graph_decoder, Z, pos_u, pos_v))
+        labels.append(torch.ones((pos_u.numel(),), dtype=Z.dtype, device=Z.device))
+    if neg_u.numel() > 0:
+        scores.append(_decoder_score_pairs(graph_decoder, Z, neg_u, neg_v))
+        labels.append(torch.zeros((neg_u.numel(),), dtype=Z.dtype, device=Z.device))
+    if not scores:
+        return Z.sum() * 0.0
+    return F.binary_cross_entropy(torch.cat(scores, dim=0), torch.cat(labels, dim=0))
+
+
+def sampled_decoder_reconstruction_loss(
+    graph_decoder: nn.Module,
+    Z: torch.Tensor,
+    train_edges_t: torch.Tensor,
+    forbidden_mask: torch.Tensor,
+    *,
+    num_neg_per_pos: int = 1,
+    max_pos_edges: int = 8192,
+) -> torch.Tensor:
+    if train_edges_t.numel() == 0:
+        return Z.sum() * 0.0
+    edges = train_edges_t.to(device=Z.device, dtype=torch.long)
+    valid = (edges[:, 0] >= 0) & (edges[:, 1] >= 0) & (edges[:, 0] < Z.size(0)) & (edges[:, 1] < Z.size(0)) & (edges[:, 0] != edges[:, 1])
+    edges = edges[valid]
+    if edges.numel() == 0:
+        return Z.sum() * 0.0
+    if edges.size(0) > int(max_pos_edges):
+        order = torch.randperm(edges.size(0), device=Z.device)[: int(max_pos_edges)]
+        edges = edges.index_select(0, order)
+    neg_count = int(edges.size(0) * max(1, int(num_neg_per_pos)))
+    allowed_neg = (~forbidden_mask.to(device=Z.device).bool()).clone()
+    allowed_neg.fill_diagonal_(False)
+    neg_u, neg_v = _sample_pairs_from_mask(allowed_neg, neg_count)
+    return _sampled_pair_bce_loss(graph_decoder, Z, edges[:, 0], edges[:, 1], neg_u, neg_v)
+
+
+def heart_train_margin_ranking_loss_pairs(
+    graph_decoder: nn.Module,
+    Z: torch.Tensor,
+    train_edges_t: torch.Tensor,
+    forbidden_mask: torch.Tensor,
+    *,
+    num_neg_per_pos: int,
+    pool_factor: int,
+    margin: float,
+    max_pos_edges: int = 8192,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    debug = {
+        "heart_rank_pairs": 0,
+        "heart_rank_pos": 0,
+        "heart_rank_neg_pool": 0,
+        "heart_rank_pos_mean": float("nan"),
+        "heart_rank_neg_mean": float("nan"),
+    }
+    if train_edges_t.numel() == 0 or num_neg_per_pos <= 0:
+        return Z.sum() * 0.0, debug
+
+    edges = train_edges_t.to(device=Z.device, dtype=torch.long)
+    valid = (edges[:, 0] >= 0) & (edges[:, 1] >= 0) & (edges[:, 0] < Z.size(0)) & (edges[:, 1] < Z.size(0)) & (edges[:, 0] != edges[:, 1])
+    edges = edges[valid]
+    if edges.numel() == 0:
+        return Z.sum() * 0.0, debug
+    if edges.size(0) > int(max_pos_edges):
+        order = torch.randperm(edges.size(0), device=Z.device)[: int(max_pos_edges)]
+        edges = edges.index_select(0, order)
+
+    forbidden = forbidden_mask.to(device=Z.device).bool()
+    n_nodes = Z.size(0)
+    pool_k = max(int(num_neg_per_pos), int(pool_factor) * max(1, int(num_neg_per_pos)))
+    pos_u = []
+    pos_v = []
+    neg_u = []
+    neg_v = []
+    for u_t, v_t in edges:
+        u = int(u_t.item())
+        v = int(v_t.item())
+        cand_u = (~forbidden[u]).nonzero(as_tuple=True)[0]
+        cand_v = (~forbidden[v]).nonzero(as_tuple=True)[0]
+        if cand_u.numel() == 0 and cand_v.numel() == 0:
+            continue
+        cur_u = []
+        cur_v = []
+        need = int(pool_k)
+        if cand_u.numel() > 0:
+            take = max(1, need // 2)
+            idx = torch.randint(0, cand_u.numel(), (take,), device=Z.device)
+            cur_u.append(torch.full((take,), u, dtype=torch.long, device=Z.device))
+            cur_v.append(cand_u.index_select(0, idx))
+        if cand_v.numel() > 0:
+            take = need - sum(x.numel() for x in cur_u)
+            take = max(1, take)
+            idx = torch.randint(0, cand_v.numel(), (take,), device=Z.device)
+            cur_u.append(torch.full((take,), v, dtype=torch.long, device=Z.device))
+            cur_v.append(cand_v.index_select(0, idx))
+        cu = torch.cat(cur_u, dim=0)[:need]
+        cv = torch.cat(cur_v, dim=0)[:need]
+        if cu.numel() < need:
+            pad = need - cu.numel()
+            cu = torch.cat([cu, cu[:1].expand(pad)], dim=0)
+            cv = torch.cat([cv, cv[:1].expand(pad)], dim=0)
+        pos_u.append(u_t.view(1))
+        pos_v.append(v_t.view(1))
+        neg_u.append(cu)
+        neg_v.append(cv)
+
+    if not pos_u:
+        return Z.sum() * 0.0, debug
+
+    pos_u_t = torch.cat(pos_u, dim=0)
+    pos_v_t = torch.cat(pos_v, dim=0)
+    neg_u_t = torch.cat(neg_u, dim=0)
+    neg_v_t = torch.cat(neg_v, dim=0)
+    valid_pos_count = pos_u_t.numel()
+    neg_scores = _decoder_score_pairs(graph_decoder, Z, neg_u_t, neg_v_t).view(valid_pos_count, pool_k)
+    hard_k = min(int(num_neg_per_pos), int(pool_k))
+    hard_neg = torch.topk(neg_scores, k=hard_k, dim=1, largest=True).values
+    pos_scores = _decoder_score_pairs(graph_decoder, Z, pos_u_t, pos_v_t).view(-1, 1).expand_as(hard_neg)
+    target = torch.ones_like(pos_scores.reshape(-1))
+    loss = F.margin_ranking_loss(pos_scores.reshape(-1), hard_neg.reshape(-1), target, margin=float(margin))
+    debug.update(
+        {
+            "heart_rank_pairs": int(pos_scores.numel()),
+            "heart_rank_pos": int(valid_pos_count),
+            "heart_rank_neg_pool": int(neg_u_t.numel()),
+            "heart_rank_pos_mean": float(pos_scores.detach().mean().cpu()),
+            "heart_rank_neg_mean": float(hard_neg.detach().mean().cpu()),
+        }
+    )
+    return loss, debug
+
+
+def hybrid_decoder_structure_losses_pairwise(
+    graph_decoder: nn.Module,
+    Z_edit: torch.Tensor,
+    adj_label: torch.Tensor,
+    train_edges_t: torch.Tensor,
+    forbidden_mask: torch.Tensor,
+    labels: np.ndarray | None,
+    rewrite_mask: torch.Tensor | None,
+    *,
+    E0: int,
+    add_ratio: float,
+    remove_ratio: float,
+    add_threshold: float | None,
+    remove_threshold: float | None,
+    add_quantile: float | None,
+    remove_quantile: float | None,
+    max_add: int | None,
+    max_remove: int | None,
+    degree_floor: int,
+    same_cluster_only: bool,
+    require_c0p_endpoint: bool,
+    require_both_c0p: bool,
+    keep_weight: float,
+    add_rank_weight: float,
+    remove_rank_weight: float,
+    rank_margin: float,
+    rank_strategy: str,
+    rank_neg_k: int,
+    rank_pool_factor: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
+    adj_dense = _to_dense(adj_label)
+    ctx = _build_decoded_pair_context(
+        adj_dense,
+        labels,
+        rewrite_mask,
+        degree_floor=degree_floor,
+        same_cluster_only=same_cluster_only,
+        require_c0p_endpoint=require_c0p_endpoint,
+        require_both_c0p=require_both_c0p,
+    )
+    debug_info = _empty_decoder_debug_info()
+    debug_info.update(
+        {
+            "rewrite_nodes": int(ctx["core_mask"].sum().item()),
+            "valid_pairs": int(ctx["valid_pairs"].triu(1).sum().item()),
+            "add_pairs": int(ctx["add_pairs"].triu(1).sum().item()),
+            "removable_pairs": int(ctx["removable_pairs"].triu(1).sum().item()),
+        }
+    )
+
+    add_budget = max(0, int(round(float(add_ratio) * float(max(1, E0)))))
+    if max_add is not None:
+        add_budget = min(add_budget if add_budget > 0 else int(max_add), int(max_add))
+    rem_budget = max(0, int(round(float(remove_ratio) * float(max(1, E0)))))
+    if max_remove is not None:
+        rem_budget = min(rem_budget if rem_budget > 0 else int(max_remove), int(max_remove))
+    debug_info["add_budget"] = int(add_budget)
+    debug_info["remove_budget"] = int(rem_budget)
+
+    edges = train_edges_t.to(device=Z_edit.device, dtype=torch.long)
+    keep_pos_mask = torch.zeros((0,), dtype=torch.bool, device=Z_edit.device)
+    if edges.numel() > 0:
+        valid = (edges[:, 0] >= 0) & (edges[:, 1] >= 0) & (edges[:, 0] < Z_edit.size(0)) & (edges[:, 1] < Z_edit.size(0))
+        edges = edges[valid]
+        if edges.numel() > 0:
+            keep_pos_mask = ~ctx["valid_pairs"][edges[:, 0], edges[:, 1]]
+    keep_pos = edges[keep_pos_mask] if edges.numel() > 0 else edges
+    if keep_pos.size(0) > 8192:
+        order = torch.randperm(keep_pos.size(0), device=Z_edit.device)[:8192]
+        keep_pos = keep_pos.index_select(0, order)
+    keep_neg_mask = (~ctx["valid_pairs"]) & (~forbidden_mask.to(device=Z_edit.device).bool())
+    keep_neg_mask.fill_diagonal_(False)
+    neg_u, neg_v = _sample_pairs_from_mask(keep_neg_mask, int(max(keep_pos.size(0), 1)))
+    keep_loss = _sampled_pair_bce_loss(
+        graph_decoder,
+        Z_edit,
+        keep_pos[:, 0] if keep_pos.numel() > 0 else torch.empty((0,), dtype=torch.long, device=Z_edit.device),
+        keep_pos[:, 1] if keep_pos.numel() > 0 else torch.empty((0,), dtype=torch.long, device=Z_edit.device),
+        neg_u,
+        neg_v,
+    )
+
+    add_ii, add_jj = ctx["add_pairs"].triu(1).nonzero(as_tuple=True)
+    if add_ii.numel() > 500000:
+        keep = torch.randperm(add_ii.numel(), device=Z_edit.device)[:500000]
+        add_ii = add_ii.index_select(0, keep)
+        add_jj = add_jj.index_select(0, keep)
+    with torch.no_grad():
+        add_scores_det = _decoder_score_pairs(graph_decoder, Z_edit.detach(), add_ii, add_jj).detach() if add_ii.numel() > 0 else Z_edit.new_empty((0,))
+    add_sel = _select_candidate_indices(
+        add_scores_det,
+        prefer_high=True,
+        threshold=add_threshold,
+        quantile=add_quantile,
+        budget=add_budget,
+        max_count=max_add,
+    )
+    add_neg_pool = torch.ones_like(add_scores_det, dtype=torch.bool)
+    if add_sel.numel() > 0:
+        add_neg_pool[add_sel] = False
+    add_neg_idx = add_neg_pool.nonzero(as_tuple=True)[0]
+    if rank_strategy == "heart_like":
+        add_neg_idx = _ordered_subset(
+            add_scores_det,
+            add_neg_idx,
+            prefer_high=True,
+            count=max(int(rank_neg_k) * max(1, add_sel.numel()), int(rank_pool_factor) * max(1, add_sel.numel())),
+        )
+    add_pos_scores = _decoder_score_pairs(graph_decoder, Z_edit, add_ii.index_select(0, add_sel), add_jj.index_select(0, add_sel)) if add_sel.numel() > 0 else Z_edit.new_empty((0,))
+    add_neg_scores = _decoder_score_pairs(graph_decoder, Z_edit, add_ii.index_select(0, add_neg_idx), add_jj.index_select(0, add_neg_idx)) if add_neg_idx.numel() > 0 else Z_edit.new_empty((0,))
+    add_rank_loss = _paired_margin_ranking_loss(add_pos_scores, add_neg_scores, rank_margin)
+
+    rem_ii, rem_jj = ctx["removable_pairs"].triu(1).nonzero(as_tuple=True)
+    with torch.no_grad():
+        rem_scores_det = _decoder_score_pairs(graph_decoder, Z_edit.detach(), rem_ii, rem_jj).detach() if rem_ii.numel() > 0 else Z_edit.new_empty((0,))
+    rem_sel = _select_candidate_indices(
+        rem_scores_det,
+        prefer_high=False,
+        threshold=remove_threshold,
+        quantile=remove_quantile,
+        budget=rem_budget,
+        max_count=max_remove,
+    )
+    rem_keep_pool = torch.ones_like(rem_scores_det, dtype=torch.bool)
+    if rem_sel.numel() > 0:
+        rem_keep_pool[rem_sel] = False
+    rem_keep_idx = rem_keep_pool.nonzero(as_tuple=True)[0]
+    if rank_strategy == "heart_like":
+        rem_keep_idx = _ordered_subset(
+            rem_scores_det,
+            rem_keep_idx,
+            prefer_high=True,
+            count=max(int(rank_neg_k) * max(1, rem_sel.numel()), int(rank_pool_factor) * max(1, rem_sel.numel())),
+        )
+    rem_keep_scores = _decoder_score_pairs(graph_decoder, Z_edit, rem_ii.index_select(0, rem_keep_idx), rem_jj.index_select(0, rem_keep_idx)) if rem_keep_idx.numel() > 0 else Z_edit.new_empty((0,))
+    rem_bad_scores = _decoder_score_pairs(graph_decoder, Z_edit, rem_ii.index_select(0, rem_sel), rem_jj.index_select(0, rem_sel)) if rem_sel.numel() > 0 else Z_edit.new_empty((0,))
+    remove_rank_loss = _paired_margin_ranking_loss(rem_keep_scores, rem_bad_scores, rank_margin)
+
+    debug_info.update(
+        {
+            "add_selected": int(add_sel.numel()),
+            "add_negatives": int(add_neg_scores.numel()),
+            "add_rank_pairs": int(min(add_pos_scores.numel(), add_neg_scores.numel())),
+            "remove_selected": int(rem_sel.numel()),
+            "remove_kept": int(rem_keep_scores.numel()),
+            "remove_rank_pairs": int(min(rem_keep_scores.numel(), rem_bad_scores.numel())),
+        }
+    )
+    total = keep_weight * keep_loss + add_rank_weight * add_rank_loss + remove_rank_weight * remove_rank_loss
+    return total, keep_loss, add_rank_loss, remove_rank_loss, debug_info
+
+
+@torch.no_grad()
+def build_decoded_augmented_graph_from_decoder(
+    graph_decoder: nn.Module,
+    Z: torch.Tensor,
+    adj_current_dense: torch.Tensor,
+    labels: np.ndarray | None,
+    node_mask: torch.Tensor | None,
+    **kwargs,
+) -> tuple[torch.Tensor, int, int]:
+    ctx = _build_decoded_pair_context(
+        adj_current_dense,
+        labels,
+        node_mask,
+        degree_floor=int(kwargs.get("degree_floor", 0)),
+        same_cluster_only=bool(kwargs.get("same_cluster_only", True)),
+        require_c0p_endpoint=bool(kwargs.get("require_c0p_endpoint", True)),
+        require_both_c0p=bool(kwargs.get("require_both_c0p", False)),
+        deg0_excl_self=kwargs.get("deg0_excl_self", None),
+    )
+    cand = ctx["add_pairs"] | ctx["removable_pairs"]
+    ii, jj = cand.triu(1).nonzero(as_tuple=True)
+    scores = adj_current_dense.new_zeros(adj_current_dense.shape)
+    if ii.numel() > 0:
+        vals = _decoder_score_pairs(graph_decoder, Z, ii, jj).detach()
+        scores[ii, jj] = vals
+        scores[jj, ii] = vals
+    scores.fill_diagonal_(1.0)
+    return build_decoded_augmented_graph(scores, adj_current_dense, labels, node_mask, **kwargs)
+
+
+def _edge_score_values_from_dot(Z: torch.Tensor, edges) -> np.ndarray:
+    edges_arr = np.asarray(edges)
+    if edges_arr.size == 0:
+        return np.asarray([], dtype=np.float64)
+    out_shape = edges_arr.shape[:-1]
+    flat = edges_arr.reshape(-1, 2)
+    uu = torch.as_tensor(flat[:, 0], dtype=torch.long, device=Z.device)
+    vv = torch.as_tensor(flat[:, 1], dtype=torch.long, device=Z.device)
+    with torch.no_grad():
+        vals = torch.sigmoid((Z.index_select(0, uu) * Z.index_select(0, vv)).sum(dim=1))
+    return vals.detach().cpu().numpy().astype(np.float64).reshape(out_shape)
+
+
+def _edge_score_values_from_decoder(graph_decoder: nn.Module, Z: torch.Tensor, edges) -> np.ndarray:
+    edges_arr = np.asarray(edges)
+    if edges_arr.size == 0:
+        return np.asarray([], dtype=np.float64)
+    out_shape = edges_arr.shape[:-1]
+    flat = edges_arr.reshape(-1, 2)
+    uu = torch.as_tensor(flat[:, 0], dtype=torch.long, device=Z.device)
+    vv = torch.as_tensor(flat[:, 1], dtype=torch.long, device=Z.device)
+    with torch.no_grad():
+        vals = _decoder_score_pairs(graph_decoder, Z, uu, vv)
+    return vals.detach().cpu().numpy().astype(np.float64).reshape(out_shape)
+
+
+def get_scores_from_values(pos_scores, neg_scores):
+    pos_scores = np.asarray(pos_scores, dtype=np.float64).reshape(-1)
+    neg_scores = np.asarray(neg_scores, dtype=np.float64)
+    if neg_scores.ndim == 2:
+        preds_all = np.concatenate([pos_scores, neg_scores.reshape(-1)])
+        labels_all = np.concatenate([np.ones_like(pos_scores), np.zeros(neg_scores.size, dtype=np.float64)])
+        roc_score = roc_auc_score(labels_all, preds_all)
+        ap_score = average_precision_score(labels_all, preds_all)
+        pos_tensor = torch.tensor(pos_scores)
+        neg_tensor = torch.tensor(neg_scores)
+        hitk = [eval_hits_heart(pos_tensor, neg_tensor, k) for k in [1, 3, 10, 20, 50, 100]]
+        return roc_score, ap_score, hitk
+    neg_flat = neg_scores.reshape(-1)
+    preds_all = np.hstack([pos_scores, neg_flat])
+    labels_all = np.hstack([np.ones(len(pos_scores)), np.zeros(len(neg_flat))])
+    roc_score = roc_auc_score(labels_all, preds_all)
+    ap_score = average_precision_score(labels_all, preds_all)
+    pos_tensor = torch.tensor(pos_scores)
+    neg_tensor = torch.tensor(neg_flat)
+    hitk = [eval_hits(pos_tensor, neg_tensor, k) for k in [1, 3, 10, 20, 50, 100]]
+    return roc_score, ap_score, hitk
+
+
+def _score_source_diagnostics_from_values(dot_pos, dot_neg, decoder_pos, decoder_neg) -> dict[str, float]:
+    diag = _score_source_diagnostics(None, None, [], [])
+    dot_pos = np.asarray(dot_pos, dtype=np.float64).reshape(-1)
+    dot_neg = np.asarray(dot_neg, dtype=np.float64).reshape(-1)
+    dec_pos = np.asarray(decoder_pos, dtype=np.float64).reshape(-1)
+    dec_neg = np.asarray(decoder_neg, dtype=np.float64).reshape(-1)
+    if dot_pos.size > 0:
+        diag["diag_dot_pos_mean"] = float(np.mean(dot_pos))
+    if dot_neg.size > 0:
+        diag["diag_dot_neg_mean"] = float(np.mean(dot_neg))
+    if dec_pos.size > 0:
+        diag["diag_decoder_pos_mean"] = float(np.mean(dec_pos))
+    if dec_neg.size > 0:
+        diag["diag_decoder_neg_mean"] = float(np.mean(dec_neg))
+    dot_vals = np.concatenate([dot_pos, dot_neg])
+    dec_vals = np.concatenate([dec_pos, dec_neg])
+    if dot_vals.size > 1 and dec_vals.size > 1 and np.std(dot_vals) > 0 and np.std(dec_vals) > 0:
+        diag["diag_dot_decoder_corr"] = float(np.corrcoef(dot_vals, dec_vals)[0, 1])
+    return diag
 
 def _resolve_node_mask(node_mask: torch.Tensor | None, num_nodes: int, device: torch.device) -> torch.Tensor:
     if node_mask is None:
@@ -3140,28 +3709,53 @@ def train_encoder(
                             pull_strength=editor_pull_strength,
                         )
                         _set_struct_decoder_context(g, decoded_labels_epoch, decoded_c0p_mask_epoch)
-                        decoded_scores = graph_decoder(z_pull_seed).detach()
-                        g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph(
-                            decoded_scores,
-                            g,
-                            decoded_labels_epoch,
-                            decoded_rewrite_mask_epoch,
-                            E0=E0,
-                            add_ratio=decoded_add_ratio,
-                            remove_ratio=decoded_remove_ratio,
-                            add_threshold=decoded_add_threshold,
-                            remove_threshold=decoded_remove_threshold,
-                            add_quantile=decoded_add_quantile,
-                            remove_quantile=decoded_remove_quantile,
-                            max_add=decoded_max_add_per_round,
-                            max_remove=decoded_max_remove_per_round,
-                            per_node_cap_frac=decoded_bound_eff,
-                            deg0_excl_self=None,
-                            degree_floor=decoded_degree_floor_eff,
-                            same_cluster_only=decoded_same_cluster_only,
-                            require_c0p_endpoint=decoded_require_c0p_endpoint,
-                            require_both_c0p=decoded_require_both_c0p,
-                        )
+                        if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
+                            g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph_from_decoder(
+                                graph_decoder,
+                                z_pull_seed,
+                                g,
+                                decoded_labels_epoch,
+                                decoded_rewrite_mask_epoch,
+                                E0=E0,
+                                add_ratio=decoded_add_ratio,
+                                remove_ratio=decoded_remove_ratio,
+                                add_threshold=decoded_add_threshold,
+                                remove_threshold=decoded_remove_threshold,
+                                add_quantile=decoded_add_quantile,
+                                remove_quantile=decoded_remove_quantile,
+                                max_add=decoded_max_add_per_round,
+                                max_remove=decoded_max_remove_per_round,
+                                per_node_cap_frac=decoded_bound_eff,
+                                deg0_excl_self=None,
+                                degree_floor=decoded_degree_floor_eff,
+                                same_cluster_only=decoded_same_cluster_only,
+                                require_c0p_endpoint=decoded_require_c0p_endpoint,
+                                require_both_c0p=decoded_require_both_c0p,
+                            )
+                        else:
+                            with torch.no_grad():
+                                decoded_scores = graph_decoder(z_pull_seed).detach()
+                            g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph(
+                                decoded_scores,
+                                g,
+                                decoded_labels_epoch,
+                                decoded_rewrite_mask_epoch,
+                                E0=E0,
+                                add_ratio=decoded_add_ratio,
+                                remove_ratio=decoded_remove_ratio,
+                                add_threshold=decoded_add_threshold,
+                                remove_threshold=decoded_remove_threshold,
+                                add_quantile=decoded_add_quantile,
+                                remove_quantile=decoded_remove_quantile,
+                                max_add=decoded_max_add_per_round,
+                                max_remove=decoded_max_remove_per_round,
+                                per_node_cap_frac=decoded_bound_eff,
+                                deg0_excl_self=None,
+                                degree_floor=decoded_degree_floor_eff,
+                                same_cluster_only=decoded_same_cluster_only,
+                                require_c0p_endpoint=decoded_require_c0p_endpoint,
+                                require_both_c0p=decoded_require_both_c0p,
+                            )
                         g = g_decoded
                         aug_edge_index = g.to_sparse().indices()
                         decoded_rewrite_applied_this_epoch = True
@@ -3290,10 +3884,19 @@ def train_encoder(
                         warm_pull_mask,
                         pull_strength=editor_pull_strength,
                     ).detach()
-                warm_pred = graph_decoder(warm_seed)
-                decoder_warmup_recon_loss = reconstruction_bce_loss(
-                    warm_pred, adj_label, norm, weight_tensor, train_mask
-                )
+                if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
+                    decoder_warmup_recon_loss = sampled_decoder_reconstruction_loss(
+                        graph_decoder,
+                        warm_seed,
+                        train_edges_t,
+                        forbidden_edge_mask,
+                        num_neg_per_pos=max(1, min(int(heart_rank_neg_k), 4)),
+                    )
+                else:
+                    warm_pred = graph_decoder(warm_seed)
+                    decoder_warmup_recon_loss = reconstruction_bce_loss(
+                        warm_pred, adj_label, norm, weight_tensor, train_mask
+                    )
                 decoder_warmup_total_loss = decoder_warmup_recon_weight * decoder_warmup_recon_loss
             except Exception as e:
                 print(f"[EDIT][WARMUP] decoder warmup failed at epoch {epoch}: {e}")
@@ -3329,57 +3932,116 @@ def train_encoder(
                     pull_strength=editor_pull_strength,
                 )
                 _set_struct_decoder_context(None, edit_labels_epoch, c0p_mask_epoch)
-                A_edit_pred = graph_decoder(z_edit)
+                pairwise_decoder_training = isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder))
                 if decoder_objective == "recon":
-                    edit_recon_loss = reconstruction_bce_loss(A_edit_pred, adj_label, norm, weight_tensor, train_mask)
+                    if pairwise_decoder_training:
+                        edit_recon_loss = sampled_decoder_reconstruction_loss(
+                            graph_decoder,
+                            z_edit,
+                            train_edges_t,
+                            forbidden_edge_mask,
+                            num_neg_per_pos=max(1, min(int(heart_rank_neg_k), 4)),
+                        )
+                    else:
+                        A_edit_pred = graph_decoder(z_edit)
+                        edit_recon_loss = reconstruction_bce_loss(A_edit_pred, adj_label, norm, weight_tensor, train_mask)
                 elif decoder_objective == "hybrid":
                     decoded_degree_floor_eff = max(0, int(degree_threshold) - 1) if decoded_degree_floor is None else int(decoded_degree_floor)
-                    (
-                        edit_recon_loss,
-                        edit_keep_loss,
-                        edit_add_rank_loss,
-                        edit_remove_rank_loss,
-                        edit_decoder_debug,
-                    ) = hybrid_decoder_structure_losses(
-                        A_edit_pred,
-                        adj_label,
-                        norm,
-                        weight_tensor,
-                        train_mask,
-                        edit_labels_epoch,
-                        rewrite_mask,
-                        E0=E0,
-                        add_ratio=decoded_add_ratio,
-                        remove_ratio=decoded_remove_ratio,
-                        add_threshold=decoded_add_threshold,
-                        remove_threshold=decoded_remove_threshold,
-                        add_quantile=decoded_add_quantile,
-                        remove_quantile=decoded_remove_quantile,
-                        max_add=decoded_max_add_per_round,
-                        max_remove=decoded_max_remove_per_round,
-                        degree_floor=decoded_degree_floor_eff,
-                        same_cluster_only=decoded_same_cluster_only,
-                        require_c0p_endpoint=decoded_require_c0p_endpoint,
-                        require_both_c0p=decoded_require_both_c0p,
-                        keep_weight=decoder_keep_weight,
-                        add_rank_weight=decoder_add_rank_weight,
-                        remove_rank_weight=decoder_remove_rank_weight,
-                        rank_margin=decoder_rank_margin,
-                        rank_strategy=decoder_rank_strategy,
-                        rank_neg_k=decoder_rank_neg_k,
-                        rank_pool_factor=decoder_rank_pool_factor,
-                    )
+                    if pairwise_decoder_training:
+                        (
+                            edit_recon_loss,
+                            edit_keep_loss,
+                            edit_add_rank_loss,
+                            edit_remove_rank_loss,
+                            edit_decoder_debug,
+                        ) = hybrid_decoder_structure_losses_pairwise(
+                            graph_decoder,
+                            z_edit,
+                            adj_label,
+                            train_edges_t,
+                            forbidden_edge_mask,
+                            edit_labels_epoch,
+                            rewrite_mask,
+                            E0=E0,
+                            add_ratio=decoded_add_ratio,
+                            remove_ratio=decoded_remove_ratio,
+                            add_threshold=decoded_add_threshold,
+                            remove_threshold=decoded_remove_threshold,
+                            add_quantile=decoded_add_quantile,
+                            remove_quantile=decoded_remove_quantile,
+                            max_add=decoded_max_add_per_round,
+                            max_remove=decoded_max_remove_per_round,
+                            degree_floor=decoded_degree_floor_eff,
+                            same_cluster_only=decoded_same_cluster_only,
+                            require_c0p_endpoint=decoded_require_c0p_endpoint,
+                            require_both_c0p=decoded_require_both_c0p,
+                            keep_weight=decoder_keep_weight,
+                            add_rank_weight=decoder_add_rank_weight,
+                            remove_rank_weight=decoder_remove_rank_weight,
+                            rank_margin=decoder_rank_margin,
+                            rank_strategy=decoder_rank_strategy,
+                            rank_neg_k=decoder_rank_neg_k,
+                            rank_pool_factor=decoder_rank_pool_factor,
+                        )
+                    else:
+                        A_edit_pred = graph_decoder(z_edit)
+                        (
+                            edit_recon_loss,
+                            edit_keep_loss,
+                            edit_add_rank_loss,
+                            edit_remove_rank_loss,
+                            edit_decoder_debug,
+                        ) = hybrid_decoder_structure_losses(
+                            A_edit_pred,
+                            adj_label,
+                            norm,
+                            weight_tensor,
+                            train_mask,
+                            edit_labels_epoch,
+                            rewrite_mask,
+                            E0=E0,
+                            add_ratio=decoded_add_ratio,
+                            remove_ratio=decoded_remove_ratio,
+                            add_threshold=decoded_add_threshold,
+                            remove_threshold=decoded_remove_threshold,
+                            add_quantile=decoded_add_quantile,
+                            remove_quantile=decoded_remove_quantile,
+                            max_add=decoded_max_add_per_round,
+                            max_remove=decoded_max_remove_per_round,
+                            degree_floor=decoded_degree_floor_eff,
+                            same_cluster_only=decoded_same_cluster_only,
+                            require_c0p_endpoint=decoded_require_c0p_endpoint,
+                            require_both_c0p=decoded_require_both_c0p,
+                            keep_weight=decoder_keep_weight,
+                            add_rank_weight=decoder_add_rank_weight,
+                            remove_rank_weight=decoder_remove_rank_weight,
+                            rank_margin=decoder_rank_margin,
+                            rank_strategy=decoder_rank_strategy,
+                            rank_neg_k=decoder_rank_neg_k,
+                            rank_pool_factor=decoder_rank_pool_factor,
+                        )
                 else:
                     raise ValueError(f"Unsupported decoder_objective={decoder_objective}")
                 if heart_rank_weight != 0.0:
-                    edit_heart_rank_loss, edit_heart_rank_debug = heart_train_margin_ranking_loss(
-                        A_edit_pred,
-                        train_edges_t,
-                        forbidden_edge_mask,
-                        num_neg_per_pos=heart_rank_neg_k,
-                        pool_factor=heart_rank_pool_factor,
-                        margin=heart_rank_margin,
-                    )
+                    if pairwise_decoder_training:
+                        edit_heart_rank_loss, edit_heart_rank_debug = heart_train_margin_ranking_loss_pairs(
+                            graph_decoder,
+                            z_edit,
+                            train_edges_t,
+                            forbidden_edge_mask,
+                            num_neg_per_pos=heart_rank_neg_k,
+                            pool_factor=heart_rank_pool_factor,
+                            margin=heart_rank_margin,
+                        )
+                    else:
+                        edit_heart_rank_loss, edit_heart_rank_debug = heart_train_margin_ranking_loss(
+                            A_edit_pred,
+                            train_edges_t,
+                            forbidden_edge_mask,
+                            num_neg_per_pos=heart_rank_neg_k,
+                            pool_factor=heart_rank_pool_factor,
+                            margin=heart_rank_margin,
+                        )
                     edit_decoder_debug.update(
                         {
                             "heart_rank_pairs": int(edit_heart_rank_debug.get("heart_rank_pairs", 0)),
@@ -3576,30 +4238,55 @@ def train_encoder(
                                     eval_pull_mask,
                                     pull_strength=editor_pull_strength,
                                 )
-                                decoded_scores_eval = graph_decoder(Z_pull_eval)
                                 decoded_degree_floor_eff = max(0, int(degree_threshold) - 1) if decoded_degree_floor is None else int(decoded_degree_floor)
                                 decoded_bound_eff = None if (decoded_graph_aug_bound is None or float(decoded_graph_aug_bound) <= 0) else float(decoded_graph_aug_bound)
-                                g_eval, _, _ = build_decoded_augmented_graph(
-                                    decoded_scores_eval,
-                                    _to_dense(adj_label),
-                                    eval_labels,
-                                    eval_rewrite_mask,
-                                    E0=E0,
-                                    add_ratio=decoded_add_ratio,
-                                    remove_ratio=decoded_remove_ratio,
-                                    add_threshold=decoded_add_threshold,
-                                    remove_threshold=decoded_remove_threshold,
-                                    add_quantile=decoded_add_quantile,
-                                    remove_quantile=decoded_remove_quantile,
-                                    max_add=decoded_max_add_per_round,
-                                    max_remove=decoded_max_remove_per_round,
-                                    per_node_cap_frac=decoded_bound_eff,
-                                    deg0_excl_self=None,
-                                    degree_floor=decoded_degree_floor_eff,
-                                    same_cluster_only=decoded_same_cluster_only,
-                                    require_c0p_endpoint=decoded_require_c0p_endpoint,
-                                    require_both_c0p=decoded_require_both_c0p,
-                                )
+                                if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
+                                    g_eval, _, _ = build_decoded_augmented_graph_from_decoder(
+                                        graph_decoder,
+                                        Z_pull_eval,
+                                        _to_dense(adj_label),
+                                        eval_labels,
+                                        eval_rewrite_mask,
+                                        E0=E0,
+                                        add_ratio=decoded_add_ratio,
+                                        remove_ratio=decoded_remove_ratio,
+                                        add_threshold=decoded_add_threshold,
+                                        remove_threshold=decoded_remove_threshold,
+                                        add_quantile=decoded_add_quantile,
+                                        remove_quantile=decoded_remove_quantile,
+                                        max_add=decoded_max_add_per_round,
+                                        max_remove=decoded_max_remove_per_round,
+                                        per_node_cap_frac=decoded_bound_eff,
+                                        deg0_excl_self=None,
+                                        degree_floor=decoded_degree_floor_eff,
+                                        same_cluster_only=decoded_same_cluster_only,
+                                        require_c0p_endpoint=decoded_require_c0p_endpoint,
+                                        require_both_c0p=decoded_require_both_c0p,
+                                    )
+                                else:
+                                    with torch.no_grad():
+                                        decoded_scores_eval = graph_decoder(Z_pull_eval)
+                                    g_eval, _, _ = build_decoded_augmented_graph(
+                                        decoded_scores_eval,
+                                        _to_dense(adj_label),
+                                        eval_labels,
+                                        eval_rewrite_mask,
+                                        E0=E0,
+                                        add_ratio=decoded_add_ratio,
+                                        remove_ratio=decoded_remove_ratio,
+                                        add_threshold=decoded_add_threshold,
+                                        remove_threshold=decoded_remove_threshold,
+                                        add_quantile=decoded_add_quantile,
+                                        remove_quantile=decoded_remove_quantile,
+                                        max_add=decoded_max_add_per_round,
+                                        max_remove=decoded_max_remove_per_round,
+                                        per_node_cap_frac=decoded_bound_eff,
+                                        deg0_excl_self=None,
+                                        degree_floor=decoded_degree_floor_eff,
+                                        same_cluster_only=decoded_same_cluster_only,
+                                        require_c0p_endpoint=decoded_require_c0p_endpoint,
+                                        require_both_c0p=decoded_require_both_c0p,
+                                    )
                                 Z_eval = encoder(features, g_eval.to_sparse().indices())
                             radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask)
                             c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask)
@@ -3721,13 +4408,15 @@ def train_encoder(
                     restrict_gamma=restrict_gamma,
                 )
                 _set_struct_decoder_context(None, diag_labels, diag_c0p_mask)
-                A_dot_diag = dot_product_decode(Z).detach().cpu().numpy()
-                A_decoder_diag = graph_decoder(Z).detach().cpu().numpy()
                 diag_edges_pos = val_edges if ran_full_val else val_edges_eval
                 diag_edges_neg = val_edges_false if ran_full_val else val_edges_false_eval
-                _, _, dot_hit_diag = get_scores(dataset_str, diag_edges_pos, diag_edges_neg, A_dot_diag, adj_orig)
-                _, _, decoder_hit_diag = get_scores(dataset_str, diag_edges_pos, diag_edges_neg, A_decoder_diag, adj_orig)
-                score_diag = _score_source_diagnostics(A_dot_diag, A_decoder_diag, diag_edges_pos, diag_edges_neg)
+                dot_pos_diag = _edge_score_values_from_dot(Z, diag_edges_pos)
+                dot_neg_diag = _edge_score_values_from_dot(Z, diag_edges_neg)
+                decoder_pos_diag = _edge_score_values_from_decoder(graph_decoder, Z, diag_edges_pos)
+                decoder_neg_diag = _edge_score_values_from_decoder(graph_decoder, Z, diag_edges_neg)
+                _, _, dot_hit_diag = get_scores_from_values(dot_pos_diag, dot_neg_diag)
+                _, _, decoder_hit_diag = get_scores_from_values(decoder_pos_diag, decoder_neg_diag)
+                score_diag = _score_source_diagnostics_from_values(dot_pos_diag, dot_neg_diag, decoder_pos_diag, decoder_neg_diag)
                 score_diag["diag_dot_val_hit10"] = float(dot_hit_diag[2]) if len(dot_hit_diag) > 2 else float("nan")
                 score_diag["diag_decoder_val_hit10"] = float(decoder_hit_diag[2]) if len(decoder_hit_diag) > 2 else float("nan")
                 print(
