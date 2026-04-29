@@ -188,6 +188,7 @@ parser.add_argument("--sweep_mode", action="store_true",
 # Edited decoder / decoded-graph augmentation
 parser.add_argument("--use_edited_decoder", action="store_true", help="Enable the edited decoder branch.")
 parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear", "mlp_pair"])
+parser.add_argument("--score_source", type=str, default="dot", choices=["dot", "decoder"], help="Score validation/test edges with dot-product embeddings or the edited graph decoder.")
 parser.add_argument("--mlp_pair_max_rows", type=int, default=16, help="Row chunk size for the mlp_pair decoder to control GPU memory.")
 parser.add_argument("--decoder_objective", type=str, default="hybrid", choices=["recon", "hybrid"], help="Decoder edit objective.")
 parser.add_argument("--decoder_recon_weight", type=float, default=1.0)
@@ -378,6 +379,7 @@ def main():
         seed=args.seed,
         use_edited_decoder=args.use_edited_decoder,
         decoder_type=args.decoder_type,
+        score_source=args.score_source,
         mlp_pair_max_rows=args.mlp_pair_max_rows,
         decoder_objective=args.decoder_objective,
         decoder_recon_weight=args.decoder_recon_weight,
@@ -527,6 +529,8 @@ if __name__ == "__main__":
         objective_tag = f"dobj-{args.decoder_objective}_cobj-{args.compactness_objective}"
 
         extra_tags = []
+        if args.score_source != "dot":
+            extra_tags.append(f"score-{args.score_source}")
         if args.separate_edit_training:
             extra_tags.append(f"rr{_fmt_num(args.edit_phase_retain_recon_weight)}")
             extra_tags.append(f"rc{_fmt_num(args.edit_phase_retain_cl_weight)}")

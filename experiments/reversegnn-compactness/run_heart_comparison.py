@@ -134,6 +134,19 @@ COMPARE_CONFIGS = [
         ],
     },
     {
+        "name": "heart_decoder_scorer_bilinear_hybrid_radius",
+        "family": "new",
+        "mode": "revgnn",
+        "flags": [
+            "--dynamic_c0p_targets",
+            "--decoder_type", "bilinear",
+            "--decoder_objective", "hybrid",
+            "--compactness_objective", "radius",
+            "--decoder_rank_strategy", "heart_like",
+            "--score_source", "decoder",
+        ],
+    },
+    {
         "name": "heart_coeba_v6",
         "family": "old",
         "mode": "coeba_v6",

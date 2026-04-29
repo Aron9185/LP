@@ -990,6 +990,9 @@ def train_encoder(
 
     use_edited_decoder = bool(kwargs.get("use_edited_decoder", False))
     decoder_type = str(kwargs.get("decoder_type", "bilinear"))
+    score_source = str(kwargs.get("score_source", "dot")).lower()
+    if score_source not in {"dot", "decoder"}:
+        raise ValueError(f"Unsupported score_source={score_source}; use dot or decoder.")
     decoder_objective = str(kwargs.get("decoder_objective", "hybrid"))
     decoder_recon_weight = float(kwargs.get("decoder_recon_weight", 1.0))
     decoder_keep_weight = float(kwargs.get("decoder_keep_weight", 1.0))
@@ -1225,6 +1228,14 @@ def train_encoder(
         else:
             raise ValueError(f"Unsupported decoder_type={decoder_type}; use 'bilinear' or 'mlp_pair'.")
 
+    if score_source == "decoder" and graph_decoder is None:
+        raise ValueError("score_source=decoder requires --use_edited_decoder so a graph decoder is available.")
+
+    def _score_adjacency(z: torch.Tensor) -> torch.Tensor:
+        if score_source == "decoder":
+            return graph_decoder(z)
+        return dot_product_decode(z)
+
     def _set_module_requires_grad(module: nn.Module | None, flag: bool):
         if module is None:
             return
@@ -1269,7 +1280,7 @@ def train_encoder(
             f"add_q={decoded_add_quantile} remove_q={decoded_remove_quantile} | "
             f"max_add={decoded_max_add_per_round} max_remove={decoded_max_remove_per_round} | "
             f"decoder_objective={decoder_objective} | compactness_objective={compactness_objective} | "
-            f"mlp_pair_max_rows={mlp_pair_max_rows} | skip_oom_epoch={int(skip_oom_epoch)} | "
+            f"score_source={score_source} | mlp_pair_max_rows={mlp_pair_max_rows} | skip_oom_epoch={int(skip_oom_epoch)} | "
             f"recon_w={decoder_recon_weight} keep_w={decoder_keep_weight} add_rank_w={decoder_add_rank_weight} "
             f"remove_rank_w={decoder_remove_rank_weight} rank_margin={decoder_rank_margin} "
             f"rank_strategy={decoder_rank_strategy} rank_neg_k={decoder_rank_neg_k} rank_pool_factor={decoder_rank_pool_factor} | "
@@ -3120,11 +3131,13 @@ def train_encoder(
         # Evaluate edge prediction
         t1 = time.time()
         encoder.eval()
+        if graph_decoder is not None:
+            graph_decoder.eval()
         # print(f"test time {time.time()-t1:.2f} s")
         with torch.no_grad():
             inference_time_start = time.time()
             Z = encoder(features, edge_index) # Z = encoder(features, adj_norm)
-            A_pred = dot_product_decode(Z)
+            A_pred = _score_adjacency(Z)
             radius_before = Z.new_tensor(0.0)
             radius_after = Z.new_tensor(0.0)
             c0p_radius_before = Z.new_tensor(0.0)
@@ -3658,8 +3671,9 @@ def train_encoder(
         graph_decoder.eval()
     with torch.no_grad():
         Z_best = encoder(features, best_edge_index)
-        A_pred_best = dot_product_decode(Z_best)
+        A_pred_best = _score_adjacency(Z_best)
 
+    print(f"[SCORE] validation/test score_source={score_source}")
     final_test_roc, final_test_ap, final_test_hit = get_scores(
         dataset_str, test_edges, test_edges_false, A_pred_best.data.cpu().numpy(), adj_orig
     )
