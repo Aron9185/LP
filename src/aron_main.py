@@ -187,9 +187,11 @@ parser.add_argument("--sweep_mode", action="store_true",
 
 # Edited decoder / decoded-graph augmentation
 parser.add_argument("--use_edited_decoder", action="store_true", help="Enable the edited decoder branch.")
-parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear", "mlp_pair"])
+parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear", "mlp_pair", "pair_mlp_struct"])
+parser.add_argument("--decoder_normalize_input", dest="decoder_normalize_input", action="store_true", help="L2-normalize decoder input embeddings before pair scoring.")
+parser.add_argument("--no_decoder_normalize_input", dest="decoder_normalize_input", action="store_false", help="Use raw decoder input embeddings without L2 normalization.")
 parser.add_argument("--score_source", type=str, default="dot", choices=["dot", "decoder"], help="Score validation/test edges with dot-product embeddings or the edited graph decoder.")
-parser.add_argument("--mlp_pair_max_rows", type=int, default=16, help="Row chunk size for the mlp_pair decoder to control GPU memory.")
+parser.add_argument("--mlp_pair_max_rows", type=int, default=16, help="Row chunk size for pair decoders to control GPU memory.")
 parser.add_argument("--decoder_objective", type=str, default="hybrid", choices=["recon", "hybrid"], help="Decoder edit objective.")
 parser.add_argument("--decoder_recon_weight", type=float, default=1.0)
 parser.add_argument("--decoder_keep_weight", type=float, default=1.0, help="Weight for structure-preserving BCE outside rewrite scope.")
@@ -215,6 +217,10 @@ parser.add_argument(
     default=4,
     help="Boundary-pool multiplier for heart-like decoder ranking mining.",
 )
+parser.add_argument("--heart_rank_weight", type=float, default=0.0, help="Weight for HeaRT-style train-positive vs hard-nonedge decoder ranking.")
+parser.add_argument("--heart_rank_margin", type=float, default=0.2, help="Margin for HeaRT-style decoder ranking.")
+parser.add_argument("--heart_rank_neg_k", type=int, default=8, help="Hard negatives per train positive for HeaRT-style decoder ranking.")
+parser.add_argument("--heart_rank_pool_factor", type=int, default=4, help="Hard-negative pool multiplier for HeaRT-style decoder ranking.")
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
 parser.add_argument("--preserve_weight", type=float, default=0.0)
@@ -278,6 +284,7 @@ parser.set_defaults(
     phase2_freeze_encoder=True,
     decoder_warmup_in_phase1=True,
     phase2_decoder_inference_only=True,
+    decoder_normalize_input=True,
 )
 
 # also use: --ver aron_desc or --ver aron_asc
@@ -379,6 +386,7 @@ def main():
         seed=args.seed,
         use_edited_decoder=args.use_edited_decoder,
         decoder_type=args.decoder_type,
+        decoder_normalize_input=args.decoder_normalize_input,
         score_source=args.score_source,
         mlp_pair_max_rows=args.mlp_pair_max_rows,
         decoder_objective=args.decoder_objective,
@@ -390,6 +398,10 @@ def main():
         decoder_rank_strategy=args.decoder_rank_strategy,
         decoder_rank_neg_k=args.decoder_rank_neg_k,
         decoder_rank_pool_factor=args.decoder_rank_pool_factor,
+        heart_rank_weight=args.heart_rank_weight,
+        heart_rank_margin=args.heart_rank_margin,
+        heart_rank_neg_k=args.heart_rank_neg_k,
+        heart_rank_pool_factor=args.heart_rank_pool_factor,
         compactness_weight=args.compactness_weight,
         compactness_objective=args.compactness_objective,
         preserve_weight=args.preserve_weight,

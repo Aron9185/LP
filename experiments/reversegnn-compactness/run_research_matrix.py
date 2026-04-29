@@ -200,6 +200,7 @@ def extract_metrics(log_path: Path) -> dict:
     best_validation_hits = parse_best_validation_hits(last_matching_line(text, "[BEST VALIDATION HIT@K]"))
     final_hits = parse_final_hits(last_matching_line(text, "[FINAL TEST] Hit@K:"))
     final_test = parse_final_test(last_matching_line(text, "[FINAL TEST] test_roc ="))
+    final_decoder_diag = parse_key_values(last_matching_line(text, "[DECODER-DIAG][FINAL]"))
 
     edit_graph_rows = re.findall(r"\[EDIT-GRAPH\].*? add=(\d+) remove=(\d+)", text)
     added_total = sum(int(add) for add, _ in edit_graph_rows)
@@ -221,6 +222,21 @@ def extract_metrics(log_path: Path) -> dict:
         "edit_keep": summary.get("edit_keep", float("nan")),
         "edit_add_rank": summary.get("edit_add_rank", float("nan")),
         "edit_remove_rank": summary.get("edit_remove_rank", float("nan")),
+        "edit_heart_rank": summary.get("edit_heart_rank", float("nan")),
+        "heart_rank_pairs": summary.get("heart_rank_pairs", float("nan")),
+        "decoder_normalize_input": summary.get("decoder_normalize_input", float("nan")),
+        "heart_rank_weight": summary.get("heart_rank_weight", float("nan")),
+        "heart_rank_margin": summary.get("heart_rank_margin", float("nan")),
+        "heart_rank_neg_k": summary.get("heart_rank_neg_k", float("nan")),
+        "diag_dot_val_hit10": summary.get("diag_dot_val_hit10", float("nan")),
+        "diag_decoder_val_hit10": summary.get("diag_decoder_val_hit10", float("nan")),
+        "diag_dot_pos_mean": summary.get("diag_dot_pos_mean", float("nan")),
+        "diag_dot_neg_mean": summary.get("diag_dot_neg_mean", float("nan")),
+        "diag_decoder_pos_mean": summary.get("diag_decoder_pos_mean", float("nan")),
+        "diag_decoder_neg_mean": summary.get("diag_decoder_neg_mean", float("nan")),
+        "diag_dot_decoder_corr": summary.get("diag_dot_decoder_corr", float("nan")),
+        "diag_dot_test_hit10": final_decoder_diag.get("dot_test_hit10", float("nan")),
+        "diag_decoder_test_hit10": final_decoder_diag.get("decoder_test_hit10", float("nan")),
         "edit_compact": summary.get("edit_compact", float("nan")),
         "edit_compact_radius": summary.get("edit_compact_radius", float("nan")),
         "edit_compact_proto": summary.get("edit_compact_proto", float("nan")),
@@ -418,6 +434,21 @@ def main():
         "cp_radius_after",
         "added_edges_total",
         "removed_edges_total",
+        "edit_heart_rank",
+        "heart_rank_pairs",
+        "decoder_normalize_input",
+        "heart_rank_weight",
+        "heart_rank_margin",
+        "heart_rank_neg_k",
+        "diag_dot_val_hit10",
+        "diag_decoder_val_hit10",
+        "diag_dot_pos_mean",
+        "diag_dot_neg_mean",
+        "diag_decoder_pos_mean",
+        "diag_decoder_neg_mean",
+        "diag_dot_decoder_corr",
+        "diag_dot_test_hit10",
+        "diag_decoder_test_hit10",
     ]
     summary_df = (
         raw_df.groupby(["dataset", "config"])[numeric_cols]
