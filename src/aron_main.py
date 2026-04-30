@@ -190,7 +190,7 @@ parser.add_argument("--use_edited_decoder", action="store_true", help="Enable th
 parser.add_argument("--decoder_type", type=str, default="bilinear", choices=["bilinear", "mlp_pair", "pair_mlp_struct"])
 parser.add_argument("--decoder_normalize_input", dest="decoder_normalize_input", action="store_true", help="L2-normalize decoder input embeddings before pair scoring.")
 parser.add_argument("--no_decoder_normalize_input", dest="decoder_normalize_input", action="store_false", help="Use raw decoder input embeddings without L2 normalization.")
-parser.add_argument("--score_source", type=str, default="dot", choices=["dot", "decoder"], help="Score validation/test edges with dot-product embeddings or the edited graph decoder.")
+parser.add_argument("--score_source", type=str, default="dot", choices=["dot", "decoder", "pred_decoder"], help="Score validation/test edges with dot-product embeddings, the edit decoder, or the prediction decoder.")
 parser.add_argument("--mlp_pair_max_rows", type=int, default=16, help="Row chunk size for pair decoders to control GPU memory.")
 parser.add_argument("--decoder_objective", type=str, default="hybrid", choices=["recon", "hybrid"], help="Decoder edit objective.")
 parser.add_argument("--decoder_recon_weight", type=float, default=1.0)
@@ -221,6 +221,14 @@ parser.add_argument("--heart_rank_weight", type=float, default=0.0, help="Weight
 parser.add_argument("--heart_rank_margin", type=float, default=0.2, help="Margin for HeaRT-style decoder ranking.")
 parser.add_argument("--heart_rank_neg_k", type=int, default=8, help="Hard negatives per train positive for HeaRT-style decoder ranking.")
 parser.add_argument("--heart_rank_pool_factor", type=int, default=4, help="Hard-negative pool multiplier for HeaRT-style decoder ranking.")
+parser.add_argument("--prediction_decoder_type", type=str, default="none", choices=["none", "pair_residual_struct"], help="Optional prediction decoder trained separately from the edit decoder.")
+parser.add_argument("--prediction_rank_weight", type=float, default=1.0, help="Weight for prediction-decoder HeaRT ranking loss.")
+parser.add_argument("--prediction_bce_weight", type=float, default=0.1, help="Weight for sampled train-edge BCE on prediction-decoder logits.")
+parser.add_argument("--prediction_rank_margin", type=float, default=0.2, help="Margin for prediction-decoder ranking loss.")
+parser.add_argument("--prediction_rank_neg_k", type=int, default=16, help="Hard negatives per train positive for prediction-decoder ranking.")
+parser.add_argument("--prediction_rank_pool_factor", type=int, default=8, help="Hard-negative pool multiplier for prediction-decoder ranking.")
+parser.add_argument("--prediction_joint_start_epoch", type=int, default=-1, help="Epoch when prediction-decoder loss may backpropagate into the encoder. -1 uses decoded rewrite start.")
+parser.add_argument("--prediction_encoder_weight", type=float, default=0.0, help="Weight for the late joint prediction-decoder loss on encoder embeddings.")
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
 parser.add_argument("--preserve_weight", type=float, default=0.0)
@@ -241,6 +249,8 @@ parser.add_argument(
 parser.add_argument("--editor_pull_strength", type=float, default=0.10, help="Direct latent pulling strength (the augmentation trigger).")
 parser.add_argument("--editor_edit_scale", type=float, default=0.0)
 parser.add_argument("--edit_start_epoch", type=int, default=10)
+parser.add_argument("--edit_train_start_epoch", type=int, default=-1, help="Epoch to start edit-decoder training. -1 follows edit_start_epoch for backward compatibility.")
+parser.add_argument("--decoded_rewrite_start_epoch", type=int, default=-1, help="Epoch to start applying decoded graph rewrites. -1 follows edit_start_epoch for backward compatibility.")
 parser.add_argument("--eval_log_every", type=int, default=5)
 parser.add_argument("--freeze_c0p_at_edit_start", dest="freeze_c0p_at_edit_start", action="store_true", help="Freeze GMM/C0p targets once editing starts.")
 parser.add_argument("--dynamic_c0p_targets", dest="freeze_c0p_at_edit_start", action="store_false", help="Recompute GMM/C0p targets every time instead of freezing them.")
@@ -402,6 +412,14 @@ def main():
         heart_rank_margin=args.heart_rank_margin,
         heart_rank_neg_k=args.heart_rank_neg_k,
         heart_rank_pool_factor=args.heart_rank_pool_factor,
+        prediction_decoder_type=args.prediction_decoder_type,
+        prediction_rank_weight=args.prediction_rank_weight,
+        prediction_bce_weight=args.prediction_bce_weight,
+        prediction_rank_margin=args.prediction_rank_margin,
+        prediction_rank_neg_k=args.prediction_rank_neg_k,
+        prediction_rank_pool_factor=args.prediction_rank_pool_factor,
+        prediction_joint_start_epoch=args.prediction_joint_start_epoch,
+        prediction_encoder_weight=args.prediction_encoder_weight,
         compactness_weight=args.compactness_weight,
         compactness_objective=args.compactness_objective,
         preserve_weight=args.preserve_weight,
@@ -413,6 +431,8 @@ def main():
         editor_pull_strength=args.editor_pull_strength,
         editor_edit_scale=args.editor_edit_scale,
         edit_start_epoch=args.edit_start_epoch,
+        edit_train_start_epoch=args.edit_train_start_epoch,
+        decoded_rewrite_start_epoch=args.decoded_rewrite_start_epoch,
         eval_log_every=args.eval_log_every,
         freeze_c0p_at_edit_start=args.freeze_c0p_at_edit_start,
         use_decoded_graph_augment=args.use_decoded_graph_augment,
@@ -543,6 +563,8 @@ if __name__ == "__main__":
         extra_tags = []
         if args.score_source != "dot":
             extra_tags.append(f"score-{args.score_source}")
+        if args.prediction_decoder_type != "none":
+            extra_tags.append(f"pred-{args.prediction_decoder_type}")
         if args.separate_edit_training:
             extra_tags.append(f"rr{_fmt_num(args.edit_phase_retain_recon_weight)}")
             extra_tags.append(f"rc{_fmt_num(args.edit_phase_retain_cl_weight)}")

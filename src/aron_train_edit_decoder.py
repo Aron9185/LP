@@ -483,6 +483,164 @@ class StructuralPairGraphDecoder(nn.Module):
         return torch.where(src == dst, torch.ones_like(probs), probs)
 
 
+class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
+    """Structural pair scorer for final prediction: raw dot logit plus learned residual."""
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        X_cos = F.normalize(Z, p=2, dim=1)
+        n_nodes = X.size(0)
+        row_chunk = max(1, min(self.max_pair_rows, int(max(1, 131072 // max(1, n_nodes)))))
+
+        deg = self._node_vector(self.node_degree_feat, n_nodes, X.dtype, X.device)
+        cn = self._pair_matrix(self.cn_feat, n_nodes, X.dtype, X.device)
+        ra = self._pair_matrix(self.ra_feat, n_nodes, X.dtype, X.device)
+        aa = self._pair_matrix(self.aa_feat, n_nodes, X.dtype, X.device)
+        if self.label_ids.numel() == n_nodes:
+            labels = self.label_ids.to(device=X.device)
+            non_noise = labels != -1
+        else:
+            labels = torch.full((n_nodes,), -1, dtype=torch.long, device=X.device)
+            non_noise = torch.zeros((n_nodes,), dtype=torch.bool, device=X.device)
+        core = self.core_mask.to(device=X.device).bool() if self.core_mask.numel() == n_nodes else torch.zeros((n_nodes,), dtype=torch.bool, device=X.device)
+        proto_dist = self._prototype_distances(X_cos)
+
+        row_logits = []
+        for start in range(0, n_nodes, row_chunk):
+            end = min(n_nodes, start + row_chunk)
+            rows = end - start
+            zi = X[start:end].unsqueeze(1).expand(-1, n_nodes, -1)
+            zj = X.unsqueeze(0).expand(rows, -1, -1)
+            raw_dot = Z[start:end] @ Z.t()
+            cosine = (X_cos[start:end] @ X_cos.t()).unsqueeze(-1)
+            deg_u = deg[start:end].view(-1, 1).expand(-1, n_nodes)
+            deg_v = deg.view(1, -1).expand(rows, -1)
+            label_u = labels[start:end].view(-1, 1)
+            same_cluster = ((label_u == labels.view(1, -1)) & non_noise[start:end].view(-1, 1) & non_noise.view(1, -1)).to(X.dtype)
+            core_u = core[start:end].to(X.dtype).view(-1, 1).expand(-1, n_nodes)
+            core_v = core.to(X.dtype).view(1, -1).expand(rows, -1)
+            cp_u = non_noise[start:end].to(X.dtype).view(-1, 1).expand(-1, n_nodes)
+            cp_v = non_noise.to(X.dtype).view(1, -1).expand(rows, -1)
+            proto_u = proto_dist[start:end].view(-1, 1).expand(-1, n_nodes)
+            proto_v = proto_dist.view(1, -1).expand(rows, -1)
+            scalar_feats = torch.stack(
+                [
+                    raw_dot,
+                    cosine.squeeze(-1),
+                    deg_u,
+                    deg_v,
+                    torch.abs(deg_u - deg_v),
+                    cn[start:end],
+                    ra[start:end],
+                    aa[start:end],
+                    same_cluster,
+                    core_u,
+                    core_v,
+                    cp_u,
+                    cp_v,
+                    proto_u,
+                    proto_v,
+                ],
+                dim=-1,
+            )
+            pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
+            residual = self.net(pair_feats.reshape(-1, pair_feats.size(-1))).view(rows, n_nodes)
+            row_logits.append(raw_dot + residual)
+        logits = torch.cat(row_logits, dim=0)
+        logits = 0.5 * (logits + logits.t())
+        logits.fill_diagonal_(0.0)
+        return logits
+
+    def _score_pairs_one_way(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        X_cos = F.normalize(Z, p=2, dim=1)
+        n_nodes = X.size(0)
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        if src.numel() == 0:
+            return Z.new_empty((0,))
+
+        deg = self._node_vector(self.node_degree_feat, n_nodes, X.dtype, X.device)
+        cn = self._pair_matrix(self.cn_feat, n_nodes, X.dtype, X.device)
+        ra = self._pair_matrix(self.ra_feat, n_nodes, X.dtype, X.device)
+        aa = self._pair_matrix(self.aa_feat, n_nodes, X.dtype, X.device)
+        if self.label_ids.numel() == n_nodes:
+            labels = self.label_ids.to(device=X.device)
+            non_noise = labels != -1
+        else:
+            labels = torch.full((n_nodes,), -1, dtype=torch.long, device=X.device)
+            non_noise = torch.zeros((n_nodes,), dtype=torch.bool, device=X.device)
+        core = self.core_mask.to(device=X.device).bool() if self.core_mask.numel() == n_nodes else torch.zeros((n_nodes,), dtype=torch.bool, device=X.device)
+        proto_dist = self._prototype_distances(X_cos)
+
+        step = max(1, int(batch_size or 32768))
+        outs = []
+        for start in range(0, src.numel(), step):
+            end = min(src.numel(), start + step)
+            u = src[start:end]
+            v = dst[start:end]
+            zi = X.index_select(0, u)
+            zj = X.index_select(0, v)
+            raw_dot = (Z.index_select(0, u) * Z.index_select(0, v)).sum(dim=1, keepdim=True)
+            cosine = (X_cos.index_select(0, u) * X_cos.index_select(0, v)).sum(dim=1, keepdim=True)
+            deg_u = deg.index_select(0, u).view(-1, 1)
+            deg_v = deg.index_select(0, v).view(-1, 1)
+            label_u = labels.index_select(0, u)
+            label_v = labels.index_select(0, v)
+            same_cluster = ((label_u == label_v) & non_noise.index_select(0, u) & non_noise.index_select(0, v)).to(X.dtype).view(-1, 1)
+            core_u = core.index_select(0, u).to(X.dtype).view(-1, 1)
+            core_v = core.index_select(0, v).to(X.dtype).view(-1, 1)
+            cp_u = non_noise.index_select(0, u).to(X.dtype).view(-1, 1)
+            cp_v = non_noise.index_select(0, v).to(X.dtype).view(-1, 1)
+            proto_u = proto_dist.index_select(0, u).view(-1, 1)
+            proto_v = proto_dist.index_select(0, v).view(-1, 1)
+            scalar_feats = torch.cat(
+                [
+                    raw_dot,
+                    cosine,
+                    deg_u,
+                    deg_v,
+                    torch.abs(deg_u - deg_v),
+                    cn[u, v].view(-1, 1),
+                    ra[u, v].view(-1, 1),
+                    aa[u, v].view(-1, 1),
+                    same_cluster,
+                    core_u,
+                    core_v,
+                    cp_u,
+                    cp_v,
+                    proto_u,
+                    proto_v,
+                ],
+                dim=-1,
+            )
+            pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
+            residual = self.net(pair_feats).view(-1, 1)
+            outs.append((raw_dot + residual).view(-1))
+        return torch.cat(outs, dim=0)
+
+    def score_pairs(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        logits = 0.5 * (
+            self._score_pairs_one_way(Z, src, dst, batch_size=batch_size)
+            + self._score_pairs_one_way(Z, dst, src, batch_size=batch_size)
+        )
+        return torch.where(src == dst, torch.zeros_like(logits), logits)
+
+
 def reconstruction_bce_loss(
     adj_pred: torch.Tensor,
     adj_label: torch.Tensor,
@@ -584,6 +742,53 @@ def sampled_decoder_reconstruction_loss(
     allowed_neg.fill_diagonal_(False)
     neg_u, neg_v = _sample_pairs_from_mask(allowed_neg, neg_count)
     return _sampled_pair_bce_loss(graph_decoder, Z, edges[:, 0], edges[:, 1], neg_u, neg_v)
+
+
+def _sampled_pair_bce_logits_loss(
+    scorer: nn.Module,
+    Z: torch.Tensor,
+    pos_u: torch.Tensor,
+    pos_v: torch.Tensor,
+    neg_u: torch.Tensor,
+    neg_v: torch.Tensor,
+) -> torch.Tensor:
+    logits = []
+    labels = []
+    if pos_u.numel() > 0:
+        logits.append(_decoder_score_pairs(scorer, Z, pos_u, pos_v))
+        labels.append(torch.ones((pos_u.numel(),), dtype=Z.dtype, device=Z.device))
+    if neg_u.numel() > 0:
+        logits.append(_decoder_score_pairs(scorer, Z, neg_u, neg_v))
+        labels.append(torch.zeros((neg_u.numel(),), dtype=Z.dtype, device=Z.device))
+    if not logits:
+        return Z.sum() * 0.0
+    return F.binary_cross_entropy_with_logits(torch.cat(logits, dim=0), torch.cat(labels, dim=0))
+
+
+def sampled_prediction_bce_logits_loss(
+    scorer: nn.Module,
+    Z: torch.Tensor,
+    train_edges_t: torch.Tensor,
+    forbidden_mask: torch.Tensor,
+    *,
+    num_neg_per_pos: int = 1,
+    max_pos_edges: int = 8192,
+) -> torch.Tensor:
+    if train_edges_t.numel() == 0:
+        return Z.sum() * 0.0
+    edges = train_edges_t.to(device=Z.device, dtype=torch.long)
+    valid = (edges[:, 0] >= 0) & (edges[:, 1] >= 0) & (edges[:, 0] < Z.size(0)) & (edges[:, 1] < Z.size(0)) & (edges[:, 0] != edges[:, 1])
+    edges = edges[valid]
+    if edges.numel() == 0:
+        return Z.sum() * 0.0
+    if edges.size(0) > int(max_pos_edges):
+        order = torch.randperm(edges.size(0), device=Z.device)[: int(max_pos_edges)]
+        edges = edges.index_select(0, order)
+    neg_count = int(edges.size(0) * max(1, int(num_neg_per_pos)))
+    allowed_neg = (~forbidden_mask.to(device=Z.device).bool()).clone()
+    allowed_neg.fill_diagonal_(False)
+    neg_u, neg_v = _sample_pairs_from_mask(allowed_neg, neg_count)
+    return _sampled_pair_bce_logits_loss(scorer, Z, edges[:, 0], edges[:, 1], neg_u, neg_v)
 
 
 def heart_train_margin_ranking_loss_pairs(
@@ -1864,8 +2069,8 @@ def train_encoder(
     decoder_type = str(kwargs.get("decoder_type", "bilinear"))
     decoder_normalize_input = bool(kwargs.get("decoder_normalize_input", True))
     score_source = str(kwargs.get("score_source", "dot")).lower()
-    if score_source not in {"dot", "decoder"}:
-        raise ValueError(f"Unsupported score_source={score_source}; use dot or decoder.")
+    if score_source not in {"dot", "decoder", "pred_decoder"}:
+        raise ValueError(f"Unsupported score_source={score_source}; use dot, decoder, or pred_decoder.")
     decoder_objective = str(kwargs.get("decoder_objective", "hybrid"))
     decoder_recon_weight = float(kwargs.get("decoder_recon_weight", 1.0))
     decoder_keep_weight = float(kwargs.get("decoder_keep_weight", 1.0))
@@ -1879,6 +2084,14 @@ def train_encoder(
     heart_rank_margin = float(kwargs.get("heart_rank_margin", 0.2))
     heart_rank_neg_k = int(kwargs.get("heart_rank_neg_k", 8))
     heart_rank_pool_factor = int(kwargs.get("heart_rank_pool_factor", 4))
+    prediction_decoder_type = str(kwargs.get("prediction_decoder_type", "none")).lower()
+    prediction_rank_weight = float(kwargs.get("prediction_rank_weight", 1.0))
+    prediction_bce_weight = float(kwargs.get("prediction_bce_weight", 0.1))
+    prediction_rank_margin = float(kwargs.get("prediction_rank_margin", 0.2))
+    prediction_rank_neg_k = int(kwargs.get("prediction_rank_neg_k", 16))
+    prediction_rank_pool_factor = int(kwargs.get("prediction_rank_pool_factor", 8))
+    prediction_joint_start_epoch = int(kwargs.get("prediction_joint_start_epoch", -1))
+    prediction_encoder_weight = float(kwargs.get("prediction_encoder_weight", 0.0))
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
@@ -1887,6 +2100,12 @@ def train_encoder(
     editor_pull_strength = float(kwargs.get("editor_pull_strength", 0.20))
     editor_edit_scale = float(kwargs.get("editor_edit_scale", 0.10))
     edit_start_epoch = int(kwargs.get("edit_start_epoch", 0))
+    edit_train_start_arg = int(kwargs.get("edit_train_start_epoch", -1))
+    decoded_rewrite_start_arg = int(kwargs.get("decoded_rewrite_start_epoch", -1))
+    edit_train_start_epoch = edit_start_epoch if edit_train_start_arg < 0 else edit_train_start_arg
+    decoded_rewrite_start_epoch = edit_start_epoch if decoded_rewrite_start_arg < 0 else decoded_rewrite_start_arg
+    if prediction_joint_start_epoch < 0:
+        prediction_joint_start_epoch = decoded_rewrite_start_epoch
     freeze_c0p_at_edit_start = bool(kwargs.get("freeze_c0p_at_edit_start", True))
     use_decoded_graph_augment = bool(kwargs.get("use_decoded_graph_augment", False))
     decoded_add_ratio = float(kwargs.get("decoded_add_ratio", 0.0))
@@ -2116,6 +2335,21 @@ def train_encoder(
         else:
             raise ValueError(f"Unsupported decoder_type={decoder_type}; use 'bilinear', 'mlp_pair', or 'pair_mlp_struct'.")
 
+    prediction_decoder = None
+    if prediction_decoder_type in {"", "none", "off"}:
+        prediction_decoder_type = "none"
+    elif prediction_decoder_type == "pair_residual_struct":
+        prediction_decoder = ResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+        ).to(device)
+    else:
+        raise ValueError(
+            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none' or 'pair_residual_struct'."
+        )
+
     def _set_struct_decoder_context(
         graph_dense=None,
         labels_np: np.ndarray | None = None,
@@ -2126,16 +2360,33 @@ def train_encoder(
                 graph_decoder.set_graph_context(graph_dense)
             graph_decoder.set_cluster_context(labels_np, core_mask_t)
 
+    def _set_prediction_decoder_context(
+        graph_dense=None,
+        labels_np: np.ndarray | None = None,
+        core_mask_t: torch.Tensor | None = None,
+    ) -> None:
+        if isinstance(prediction_decoder, StructuralPairGraphDecoder):
+            if graph_dense is not None:
+                prediction_decoder.set_graph_context(graph_dense)
+            prediction_decoder.set_cluster_context(labels_np, core_mask_t)
+
     if isinstance(graph_decoder, StructuralPairGraphDecoder):
         _set_struct_decoder_context(adj_train, None, None)
-        print("[DECODER] pair_mlp_struct graph context initialized from train graph")
+        print("[DECODER] pair_mlp_struct edit graph context initialized from train graph")
+    if isinstance(prediction_decoder, StructuralPairGraphDecoder):
+        _set_prediction_decoder_context(adj_train, None, None)
+        print("[PRED-DECODER] pair_residual_struct graph context initialized from train graph")
 
     if score_source == "decoder" and graph_decoder is None:
-        raise ValueError("score_source=decoder requires --use_edited_decoder so a graph decoder is available.")
+        raise ValueError("score_source=decoder requires --use_edited_decoder so an edit decoder is available.")
+    if score_source == "pred_decoder" and prediction_decoder is None:
+        raise ValueError("score_source=pred_decoder requires --prediction_decoder_type pair_residual_struct.")
 
     def _score_adjacency(z: torch.Tensor) -> torch.Tensor:
         if score_source == "decoder":
             return graph_decoder(z)
+        if score_source == "pred_decoder":
+            return prediction_decoder(z)
         return dot_product_decode(z)
 
     def _set_module_requires_grad(module: nn.Module | None, flag: bool):
@@ -2144,29 +2395,39 @@ def train_encoder(
         for p in module.parameters():
             p.requires_grad_(flag)
 
+    def _module_params(module: nn.Module | None) -> list[torch.nn.Parameter]:
+        if module is None:
+            return []
+        return [p for p in module.parameters() if p.requires_grad]
+
     def _build_main_optimizer():
         _set_module_requires_grad(encoder, True)
         _set_module_requires_grad(graph_decoder, True)
+        _set_module_requires_grad(prediction_decoder, True)
         params = list(encoder.parameters())
-        if graph_decoder is not None:
-            params += list(graph_decoder.parameters())
+        params += list(graph_decoder.parameters()) if graph_decoder is not None else []
+        params += list(prediction_decoder.parameters()) if prediction_decoder is not None else []
         return Adam(params, lr=learning_rate, weight_decay=weight_decay)
 
     def _build_phase2_optimizer():
-        if graph_decoder is None:
+        if graph_decoder is None and prediction_decoder is None:
             return _build_main_optimizer()
         if phase2_freeze_encoder or edit_phase_encoder_lr_scale <= 0.0:
             _set_module_requires_grad(encoder, False)
             _set_module_requires_grad(graph_decoder, True)
-            return Adam(graph_decoder.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            _set_module_requires_grad(prediction_decoder, True)
+            params = _module_params(graph_decoder) + _module_params(prediction_decoder)
+            return Adam(params, lr=learning_rate, weight_decay=weight_decay) if params else _build_main_optimizer()
         _set_module_requires_grad(encoder, True)
         _set_module_requires_grad(graph_decoder, True)
-        return Adam(
-            [
-                {"params": list(encoder.parameters()), "lr": learning_rate * edit_phase_encoder_lr_scale, "weight_decay": weight_decay},
-                {"params": list(graph_decoder.parameters()), "lr": learning_rate, "weight_decay": weight_decay},
-            ]
-        )
+        _set_module_requires_grad(prediction_decoder, True)
+        decoder_params = _module_params(graph_decoder) + _module_params(prediction_decoder)
+        groups = [
+            {"params": list(encoder.parameters()), "lr": learning_rate * edit_phase_encoder_lr_scale, "weight_decay": weight_decay},
+        ]
+        if decoder_params:
+            groups.append({"params": decoder_params, "lr": learning_rate, "weight_decay": weight_decay})
+        return Adam(groups)
 
     optimizer = _build_main_optimizer()
     phase2_optimizer_activated = False
@@ -2175,7 +2436,8 @@ def train_encoder(
         print(
             f"[PATH] edited-decoder path active | decoder={decoder_type} | normalize_input={decoder_normalize_input} | "
             f"freeze_c0p={freeze_c0p_at_edit_start} | decoded_graph_augment={use_decoded_graph_augment} | "
-            f"accumulate_base={decoded_accumulate_into_base} | edit_start_epoch={edit_start_epoch} | edit_end_epoch={decoded_edit_end_epoch} | "
+            f"accumulate_base={decoded_accumulate_into_base} | edit_start_epoch={edit_start_epoch} | "
+            f"edit_train_start={edit_train_start_epoch} | rewrite_start={decoded_rewrite_start_epoch} | edit_end_epoch={decoded_edit_end_epoch} | "
             f"separate_edit_training={separate_edit_training} | retain_recon={edit_phase_retain_recon_weight} | retain_cl={edit_phase_retain_cl_weight} | "
             f"add_ratio={decoded_add_ratio} remove_ratio={decoded_remove_ratio} | "
             f"add_thr={decoded_add_threshold} remove_thr={decoded_remove_threshold} | "
@@ -2195,31 +2457,39 @@ def train_encoder(
             f"pull_strength={editor_pull_strength} | compactness_weight={compactness_weight} | "
             f"pull_scope={pull_mask_scope} | compactness_scope={compactness_mask_scope} | rewrite_scope={rewrite_endpoint_scope}"
         )
-    else:
+    if prediction_decoder is not None:
+        print(
+            f"[PRED-DECODER] active | type={prediction_decoder_type} | score_source={score_source} | "
+            f"rank_w={prediction_rank_weight} bce_w={prediction_bce_weight} margin={prediction_rank_margin} "
+            f"neg_k={prediction_rank_neg_k} pool_factor={prediction_rank_pool_factor} | "
+            f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight}"
+        )
+    if not use_edited_decoder and prediction_decoder is None:
         print("[PATH] baseline dot-product path active")
 
-    def _in_edit_phase(ep: int) -> bool:
-        if not (use_edited_decoder and (graph_decoder is not None)):
-            return False
-        if ep < edit_start_epoch:
-            return False
+    def _edit_allowed_before_end(ep: int) -> bool:
         try:
             end_ep = int(decoded_edit_end_epoch) if decoded_edit_end_epoch is not None else -1
         except Exception:
             end_ep = -1
-        if end_ep >= 0 and ep > end_ep:
+        return not (end_ep >= 0 and ep > end_ep)
+
+    def _in_edit_phase(ep: int) -> bool:
+        if not (use_edited_decoder and (graph_decoder is not None)):
             return False
-        return True
+        return ep >= edit_train_start_epoch and _edit_allowed_before_end(ep)
 
     def _decoded_edit_active(ep: int) -> bool:
-        return _in_edit_phase(ep)
+        if not (use_edited_decoder and (graph_decoder is not None)):
+            return False
+        return ep >= decoded_rewrite_start_epoch and _edit_allowed_before_end(ep)
 
     def _decoder_warmup_active(ep: int) -> bool:
         return bool(
             use_edited_decoder
             and (graph_decoder is not None)
             and decoder_warmup_in_phase1
-            and ep < edit_start_epoch
+            and ep < edit_train_start_epoch
         )
 
     data_augmenter = MLP(hidden2, hidden2).to(device)
@@ -2923,6 +3193,8 @@ def train_encoder(
         encoder.train()
         if graph_decoder is not None:
             graph_decoder.train()
+        if prediction_decoder is not None:
+            prediction_decoder.train()
         #print(f"trn time1 {time.time()-t1:.2f} s", flush=True)
         optimizer.zero_grad()
         
@@ -2930,7 +3202,7 @@ def train_encoder(
         hidden_repr = encoder.Z
         in_edit_phase = _in_edit_phase(epoch)
 
-        if use_edited_decoder and _decoded_edit_active(epoch) and stage1_anchor_Z is None:
+        if use_edited_decoder and _in_edit_phase(epoch) and stage1_anchor_Z is None:
             stage1_anchor_Z = Z.detach().clone()
             stage1_anchor_graph_dense = _to_dense(adj_label).detach().clone()
             if use_edited_decoder and freeze_c0p_at_edit_start and fixed_c0p_mask is None:
@@ -2960,13 +3232,19 @@ def train_encoder(
             if separate_edit_training and not phase2_optimizer_activated:
                 if phase2_decoder_inference_only:
                     _set_module_requires_grad(graph_decoder, False)
+                    _set_module_requires_grad(prediction_decoder, True)
+                    phase2_params = _module_params(prediction_decoder)
                     if (not phase2_freeze_encoder) and edit_phase_encoder_lr_scale > 0.0:
                         _set_module_requires_grad(encoder, True)
-                        optimizer = Adam(
-                            encoder.parameters(),
-                            lr=learning_rate * edit_phase_encoder_lr_scale,
-                            weight_decay=weight_decay,
-                        )
+                        groups = [
+                            {"params": list(encoder.parameters()), "lr": learning_rate * edit_phase_encoder_lr_scale, "weight_decay": weight_decay},
+                        ]
+                        if phase2_params:
+                            groups.append({"params": phase2_params, "lr": learning_rate, "weight_decay": weight_decay})
+                        optimizer = Adam(groups)
+                    elif phase2_params:
+                        _set_module_requires_grad(encoder, False)
+                        optimizer = Adam(phase2_params, lr=learning_rate, weight_decay=weight_decay)
                 else:
                     optimizer = _build_phase2_optimizer()
                 phase2_optimizer_activated = True
@@ -3900,7 +4178,7 @@ def train_encoder(
                 decoder_warmup_total_loss = decoder_warmup_recon_weight * decoder_warmup_recon_loss
             except Exception as e:
                 print(f"[EDIT][WARMUP] decoder warmup failed at epoch {epoch}: {e}")
-        elif use_edited_decoder and (graph_decoder is not None) and _decoded_edit_active(epoch):
+        elif use_edited_decoder and (graph_decoder is not None) and _in_edit_phase(epoch):
             try:
                 preserve_anchor = stage1_anchor_Z.detach() if stage1_anchor_Z is not None else Z.detach()
                 edit_seed = Z if (separate_edit_training and in_edit_phase) else bias_Z
@@ -4075,6 +4353,75 @@ def train_encoder(
             except Exception as e:
                 print(f"[EDIT][TRAIN] edited branch failed at epoch {epoch}: {e}")
 
+        prediction_rank_loss = bias_Z.new_tensor(0.0)
+        prediction_bce_loss = bias_Z.new_tensor(0.0)
+        prediction_joint_rank_loss = bias_Z.new_tensor(0.0)
+        prediction_joint_bce_loss = bias_Z.new_tensor(0.0)
+        prediction_total_loss = bias_Z.sum() * 0.0
+        prediction_debug = {
+            "heart_rank_pairs": 0,
+            "heart_rank_pos": 0,
+            "heart_rank_neg_pool": 0,
+            "heart_rank_pos_mean": float("nan"),
+            "heart_rank_neg_mean": float("nan"),
+        }
+
+        def _prediction_objective(pred_z: torch.Tensor):
+            pred_rank = pred_z.sum() * 0.0
+            pred_bce = pred_z.sum() * 0.0
+            pred_debug = dict(prediction_debug)
+            try:
+                pred_labels, pred_c0p_mask = resolve_edit_targets(
+                    pred_z.detach(),
+                    _to_dense(adj_label),
+                    freeze_targets=freeze_c0p_at_edit_start,
+                    fixed_labels=fixed_c0p_labels,
+                    fixed_mask=fixed_c0p_mask,
+                    gmm_k=gmm_k,
+                    gmm_tau=gmm_tau,
+                    restrict_alpha=restrict_alpha,
+                    restrict_gamma=restrict_gamma,
+                )
+                _set_prediction_decoder_context(None, pred_labels, pred_c0p_mask)
+                if prediction_rank_weight != 0.0:
+                    pred_rank, pred_debug = heart_train_margin_ranking_loss_pairs(
+                        prediction_decoder,
+                        pred_z,
+                        train_edges_t,
+                        forbidden_edge_mask,
+                        num_neg_per_pos=prediction_rank_neg_k,
+                        pool_factor=prediction_rank_pool_factor,
+                        margin=prediction_rank_margin,
+                    )
+                if prediction_bce_weight != 0.0:
+                    pred_bce = sampled_prediction_bce_logits_loss(
+                        prediction_decoder,
+                        pred_z,
+                        train_edges_t,
+                        forbidden_edge_mask,
+                        num_neg_per_pos=max(1, min(int(prediction_rank_neg_k), 4)),
+                    )
+            except Exception as e:
+                print(f"[PRED-DECODER][TRAIN] prediction objective failed at epoch {epoch}: {e}")
+            pred_total = prediction_rank_weight * pred_rank + prediction_bce_weight * pred_bce
+            return pred_total, pred_rank, pred_bce, pred_debug
+
+        if prediction_decoder is not None and (prediction_rank_weight != 0.0 or prediction_bce_weight != 0.0):
+            (
+                prediction_total_loss,
+                prediction_rank_loss,
+                prediction_bce_loss,
+                prediction_debug,
+            ) = _prediction_objective(Z.detach())
+            if prediction_encoder_weight != 0.0 and epoch >= prediction_joint_start_epoch:
+                (
+                    prediction_joint_total_loss,
+                    prediction_joint_rank_loss,
+                    prediction_joint_bce_loss,
+                    _,
+                ) = _prediction_objective(Z)
+                prediction_total_loss = prediction_total_loss + prediction_encoder_weight * prediction_joint_total_loss
+
         # if(loss_ver=="nei"):
             # intra_CL = inter_view_CL_loss(device, bias_Z, bias_Z, adj_label, gamma, temperature)
         # else:
@@ -4113,6 +4460,8 @@ def train_encoder(
                 loss = loss + decoder_warmup_total_loss
             elif edit_total_loss is not None:
                 loss = loss + edit_total_loss * aug_graph_weight
+        if prediction_decoder is not None:
+            loss = loss + prediction_total_loss
         #print(f'aug_loss: {aug_loss}, intra_CL: {intra_CL}')
 
         if not torch.isfinite(loss):
@@ -4122,6 +4471,8 @@ def train_encoder(
                 f"edit_recon={float(edit_recon_loss.detach().cpu())}, keep={float(edit_keep_loss.detach().cpu())}, "
                 f"add_rank={float(edit_add_rank_loss.detach().cpu())}, remove_rank={float(edit_remove_rank_loss.detach().cpu())}, "
                 f"heart_rank={float(edit_heart_rank_loss.detach().cpu())}, "
+                f"pred_rank={float(prediction_rank_loss.detach().cpu())}, pred_bce={float(prediction_bce_loss.detach().cpu())}, "
+                f"pred_joint_rank={float(prediction_joint_rank_loss.detach().cpu())}, pred_joint_bce={float(prediction_joint_bce_loss.detach().cpu())}, "
                 f"edit_compact={float(edit_compact_loss.detach().cpu())}, compact_radius={float(edit_compact_radius_loss.detach().cpu())}, "
                 f"compact_proto={float(edit_compact_proto_loss.detach().cpu())}, edit_preserve={float(edit_preserve_loss.detach().cpu())}, "
                 f"rewrite_nodes={edit_decoder_debug['rewrite_nodes']}, valid_pairs={edit_decoder_debug['valid_pairs']}, "
@@ -4160,11 +4511,13 @@ def train_encoder(
         encoder.eval()
         if graph_decoder is not None:
             graph_decoder.eval()
+        if prediction_decoder is not None:
+            prediction_decoder.eval()
         # print(f"test time {time.time()-t1:.2f} s")
         with torch.no_grad():
             inference_time_start = time.time()
             Z = encoder(features, edge_index) # Z = encoder(features, adj_norm)
-            if score_source == "decoder" and use_edited_decoder and (graph_decoder is not None):
+            if (score_source == "decoder" and use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
                 try:
                     score_labels, score_c0p_mask = resolve_edit_targets(
                         Z,
@@ -4177,7 +4530,10 @@ def train_encoder(
                         restrict_alpha=restrict_alpha,
                         restrict_gamma=restrict_gamma,
                     )
-                    _set_struct_decoder_context(None, score_labels, score_c0p_mask)
+                    if score_source == "decoder" and use_edited_decoder and (graph_decoder is not None):
+                        _set_struct_decoder_context(None, score_labels, score_c0p_mask)
+                    if prediction_decoder is not None:
+                        _set_prediction_decoder_context(None, score_labels, score_c0p_mask)
                 except Exception as e:
                     print(f"[DECODER-DIAG] score context failed at epoch {epoch}: {e}")
             A_pred = _score_adjacency(Z)
@@ -4394,7 +4750,16 @@ def train_encoder(
             ran_full_val = True
 
         score_diag = _score_source_diagnostics(None, None, [], [])
-        if use_edited_decoder and (graph_decoder is not None) and np.isfinite(val_roc):
+        score_diag.update(
+            {
+                "diag_pred_val_hit10": float("nan"),
+                "diag_pred_pos_mean": float("nan"),
+                "diag_pred_neg_mean": float("nan"),
+                "diag_dot_pred_corr": float("nan"),
+                "diag_decoder_pred_corr": float("nan"),
+            }
+        )
+        if ((use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None)) and np.isfinite(val_roc):
             try:
                 diag_labels, diag_c0p_mask = resolve_edit_targets(
                     Z,
@@ -4407,28 +4772,60 @@ def train_encoder(
                     restrict_alpha=restrict_alpha,
                     restrict_gamma=restrict_gamma,
                 )
-                _set_struct_decoder_context(None, diag_labels, diag_c0p_mask)
+                if use_edited_decoder and (graph_decoder is not None):
+                    _set_struct_decoder_context(None, diag_labels, diag_c0p_mask)
+                if prediction_decoder is not None:
+                    _set_prediction_decoder_context(None, diag_labels, diag_c0p_mask)
                 diag_edges_pos = val_edges if ran_full_val else val_edges_eval
                 diag_edges_neg = val_edges_false if ran_full_val else val_edges_false_eval
                 dot_pos_diag = _edge_score_values_from_dot(Z, diag_edges_pos)
                 dot_neg_diag = _edge_score_values_from_dot(Z, diag_edges_neg)
-                decoder_pos_diag = _edge_score_values_from_decoder(graph_decoder, Z, diag_edges_pos)
-                decoder_neg_diag = _edge_score_values_from_decoder(graph_decoder, Z, diag_edges_neg)
                 _, _, dot_hit_diag = get_scores_from_values(dot_pos_diag, dot_neg_diag)
-                _, _, decoder_hit_diag = get_scores_from_values(decoder_pos_diag, decoder_neg_diag)
-                score_diag = _score_source_diagnostics_from_values(dot_pos_diag, dot_neg_diag, decoder_pos_diag, decoder_neg_diag)
                 score_diag["diag_dot_val_hit10"] = float(dot_hit_diag[2]) if len(dot_hit_diag) > 2 else float("nan")
-                score_diag["diag_decoder_val_hit10"] = float(decoder_hit_diag[2]) if len(decoder_hit_diag) > 2 else float("nan")
+
+                decoder_pos_diag = np.asarray([], dtype=np.float64)
+                decoder_neg_diag = np.asarray([], dtype=np.float64)
+                if use_edited_decoder and (graph_decoder is not None):
+                    decoder_pos_diag = _edge_score_values_from_decoder(graph_decoder, Z, diag_edges_pos)
+                    decoder_neg_diag = _edge_score_values_from_decoder(graph_decoder, Z, diag_edges_neg)
+                    _, _, decoder_hit_diag = get_scores_from_values(decoder_pos_diag, decoder_neg_diag)
+                    decoder_diag = _score_source_diagnostics_from_values(dot_pos_diag, dot_neg_diag, decoder_pos_diag, decoder_neg_diag)
+                    score_diag.update(decoder_diag)
+                    score_diag["diag_dot_val_hit10"] = float(dot_hit_diag[2]) if len(dot_hit_diag) > 2 else float("nan")
+                    score_diag["diag_decoder_val_hit10"] = float(decoder_hit_diag[2]) if len(decoder_hit_diag) > 2 else float("nan")
+
+                pred_pos_diag = np.asarray([], dtype=np.float64)
+                pred_neg_diag = np.asarray([], dtype=np.float64)
+                if prediction_decoder is not None:
+                    pred_pos_diag = _edge_score_values_from_decoder(prediction_decoder, Z, diag_edges_pos)
+                    pred_neg_diag = _edge_score_values_from_decoder(prediction_decoder, Z, diag_edges_neg)
+                    _, _, pred_hit_diag = get_scores_from_values(pred_pos_diag, pred_neg_diag)
+                    score_diag["diag_pred_val_hit10"] = float(pred_hit_diag[2]) if len(pred_hit_diag) > 2 else float("nan")
+                    if pred_pos_diag.size > 0:
+                        score_diag["diag_pred_pos_mean"] = float(np.mean(pred_pos_diag.reshape(-1)))
+                    if pred_neg_diag.size > 0:
+                        score_diag["diag_pred_neg_mean"] = float(np.mean(pred_neg_diag.reshape(-1)))
+                    dot_vals = np.concatenate([np.asarray(dot_pos_diag).reshape(-1), np.asarray(dot_neg_diag).reshape(-1)])
+                    pred_vals = np.concatenate([pred_pos_diag.reshape(-1), pred_neg_diag.reshape(-1)])
+                    if dot_vals.size > 1 and pred_vals.size > 1 and np.std(dot_vals) > 0 and np.std(pred_vals) > 0:
+                        score_diag["diag_dot_pred_corr"] = float(np.corrcoef(dot_vals, pred_vals)[0, 1])
+                    if decoder_pos_diag.size > 0 or decoder_neg_diag.size > 0:
+                        dec_vals = np.concatenate([decoder_pos_diag.reshape(-1), decoder_neg_diag.reshape(-1)])
+                        if dec_vals.size > 1 and pred_vals.size > 1 and np.std(dec_vals) > 0 and np.std(pred_vals) > 0:
+                            score_diag["diag_decoder_pred_corr"] = float(np.corrcoef(dec_vals, pred_vals)[0, 1])
+
                 print(
                     f"[DECODER-DIAG][E{epoch:04d}] "
-                    f"decoder_type={decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
-                    f"heart_rank_weight={heart_rank_weight:.6f} heart_rank_margin={heart_rank_margin:.6f} "
-                    f"heart_rank_neg_k={heart_rank_neg_k} "
+                    f"decoder_type={decoder_type} pred_decoder_type={prediction_decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
+                    f"heart_rank_weight={heart_rank_weight:.6f} prediction_rank_weight={prediction_rank_weight:.6f} "
                     f"dot_val_hit10={score_diag['diag_dot_val_hit10']:.6f} "
                     f"decoder_val_hit10={score_diag['diag_decoder_val_hit10']:.6f} "
+                    f"pred_val_hit10={score_diag['diag_pred_val_hit10']:.6f} "
                     f"dot_pos_mean={score_diag['diag_dot_pos_mean']:.6f} dot_neg_mean={score_diag['diag_dot_neg_mean']:.6f} "
                     f"decoder_pos_mean={score_diag['diag_decoder_pos_mean']:.6f} decoder_neg_mean={score_diag['diag_decoder_neg_mean']:.6f} "
-                    f"dot_decoder_corr={score_diag['diag_dot_decoder_corr']:.6f}"
+                    f"pred_pos_mean={score_diag['diag_pred_pos_mean']:.6f} pred_neg_mean={score_diag['diag_pred_neg_mean']:.6f} "
+                    f"dot_decoder_corr={score_diag['diag_dot_decoder_corr']:.6f} "
+                    f"dot_pred_corr={score_diag['diag_dot_pred_corr']:.6f} decoder_pred_corr={score_diag['diag_decoder_pred_corr']:.6f}"
                 )
             except Exception as e:
                 print(f"[DECODER-DIAG] failed at epoch {epoch}: {e}")
@@ -4441,7 +4838,7 @@ def train_encoder(
         c0p_radius_after_val = float(c0p_radius_after.detach().cpu())
         cp_radius_before_val = float(cp_radius_before.detach().cpu())
         cp_radius_after_val = float(cp_radius_after.detach().cpu())
-        rewrite_applied_now = bool(use_edited_decoder and epoch >= edit_start_epoch and decoded_rewrite_applied_this_epoch)
+        rewrite_applied_now = bool(use_edited_decoder and epoch >= decoded_rewrite_start_epoch and decoded_rewrite_applied_this_epoch)
         if use_edited_decoder and _decoded_edit_active(epoch):
             if radius_anchor_value is None and np.isfinite(radius_before_val):
                 radius_anchor_value = radius_before_val
@@ -4513,6 +4910,8 @@ def train_encoder(
                 f"edit_recon={float(edit_recon_loss.detach().cpu()):.6f} keep={float(edit_keep_loss.detach().cpu()):.6f} "
                 f"add_rank={float(edit_add_rank_loss.detach().cpu()):.6f} remove_rank={float(edit_remove_rank_loss.detach().cpu()):.6f} "
                 f"heart_rank={float(edit_heart_rank_loss.detach().cpu()):.6f} "
+                f"pred_rank={float(prediction_rank_loss.detach().cpu()):.6f} pred_bce={float(prediction_bce_loss.detach().cpu()):.6f} "
+                f"pred_joint_rank={float(prediction_joint_rank_loss.detach().cpu()):.6f} pred_joint_bce={float(prediction_joint_bce_loss.detach().cpu()):.6f} "
                 f"compact={float(edit_compact_loss.detach().cpu()):.6f} compact_radius={float(edit_compact_radius_loss.detach().cpu()):.6f} "
                 f"compact_proto={float(edit_compact_proto_loss.detach().cpu()):.6f} "
                 f"preserve={float(edit_preserve_loss.detach().cpu()):.6f} "
@@ -4605,6 +5004,10 @@ def train_encoder(
                 best_state_cpu["graph_decoder"] = {
                     k: v.detach().cpu().clone() for k, v in graph_decoder.state_dict().items()
                 }
+            if prediction_decoder is not None:
+                best_state_cpu["prediction_decoder"] = {
+                    k: v.detach().cpu().clone() for k, v in prediction_decoder.state_dict().items()
+                }
             if decoded_accumulate_into_base:
                 best_graph_dense_cpu = _to_dense(adj_label).detach().cpu().clone()
                 best_state_cpu["graph_dense"] = best_graph_dense_cpu
@@ -4637,6 +5040,13 @@ def train_encoder(
                 "edit_add_rank": float(edit_add_rank_loss.detach().cpu()),
                 "edit_remove_rank": float(edit_remove_rank_loss.detach().cpu()),
                 "edit_heart_rank": float(edit_heart_rank_loss.detach().cpu()),
+                "prediction_rank": float(prediction_rank_loss.detach().cpu()),
+                "prediction_bce": float(prediction_bce_loss.detach().cpu()),
+                "prediction_joint_rank": float(prediction_joint_rank_loss.detach().cpu()),
+                "prediction_joint_bce": float(prediction_joint_bce_loss.detach().cpu()),
+                "prediction_rank_pairs": int(prediction_debug.get("heart_rank_pairs", 0)),
+                "prediction_rank_pos": int(prediction_debug.get("heart_rank_pos", 0)),
+                "prediction_rank_neg_pool": int(prediction_debug.get("heart_rank_neg_pool", 0)),
                 "heart_rank_pairs": int(edit_decoder_debug.get("heart_rank_pairs", 0)),
                 "heart_rank_pos": int(edit_decoder_debug.get("heart_rank_pos", 0)),
                 "heart_rank_neg_pool": int(edit_decoder_debug.get("heart_rank_neg_pool", 0)),
@@ -4646,13 +5056,23 @@ def train_encoder(
                 "heart_rank_weight": float(heart_rank_weight),
                 "heart_rank_margin": float(heart_rank_margin),
                 "heart_rank_neg_k": int(heart_rank_neg_k),
+                "prediction_decoder_type": prediction_decoder_type,
+                "prediction_rank_weight": float(prediction_rank_weight),
+                "prediction_bce_weight": float(prediction_bce_weight),
+                "prediction_encoder_weight": float(prediction_encoder_weight),
+                "prediction_joint_start_epoch": int(prediction_joint_start_epoch),
                 "diag_dot_val_hit10": float(score_diag.get("diag_dot_val_hit10", float("nan"))),
                 "diag_decoder_val_hit10": float(score_diag.get("diag_decoder_val_hit10", float("nan"))),
+                "diag_pred_val_hit10": float(score_diag.get("diag_pred_val_hit10", float("nan"))),
                 "diag_dot_pos_mean": float(score_diag.get("diag_dot_pos_mean", float("nan"))),
                 "diag_dot_neg_mean": float(score_diag.get("diag_dot_neg_mean", float("nan"))),
                 "diag_decoder_pos_mean": float(score_diag.get("diag_decoder_pos_mean", float("nan"))),
                 "diag_decoder_neg_mean": float(score_diag.get("diag_decoder_neg_mean", float("nan"))),
+                "diag_pred_pos_mean": float(score_diag.get("diag_pred_pos_mean", float("nan"))),
+                "diag_pred_neg_mean": float(score_diag.get("diag_pred_neg_mean", float("nan"))),
                 "diag_dot_decoder_corr": float(score_diag.get("diag_dot_decoder_corr", float("nan"))),
+                "diag_dot_pred_corr": float(score_diag.get("diag_dot_pred_corr", float("nan"))),
+                "diag_decoder_pred_corr": float(score_diag.get("diag_decoder_pred_corr", float("nan"))),
                 "edit_compact": float(edit_compact_loss.detach().cpu()),
                 "edit_compact_radius": float(edit_compact_radius_loss.detach().cpu()),
                 "edit_compact_proto": float(edit_compact_proto_loss.detach().cpu()),
@@ -4738,11 +5158,18 @@ def train_encoder(
                 f'edit_remove_rank = {best_meta_cpu.get("edit_remove_rank", float("nan")):.6f}, '
                 f'edit_heart_rank = {best_meta_cpu.get("edit_heart_rank", float("nan")):.6f}, '
                 f'heart_rank_pairs = {best_meta_cpu.get("heart_rank_pairs", float("nan")):.0f}, '
+                f'prediction_rank = {best_meta_cpu.get("prediction_rank", float("nan")):.6f}, '
+                f'prediction_bce = {best_meta_cpu.get("prediction_bce", float("nan")):.6f}, '
+                f'prediction_rank_pairs = {best_meta_cpu.get("prediction_rank_pairs", float("nan")):.0f}, '
                 f'dot_val_hit10 = {best_meta_cpu.get("diag_dot_val_hit10", float("nan")):.6f}, '
                 f'decoder_val_hit10 = {best_meta_cpu.get("diag_decoder_val_hit10", float("nan")):.6f}, '
+                f'pred_val_hit10 = {best_meta_cpu.get("diag_pred_val_hit10", float("nan")):.6f}, '
                 f'decoder_pos_mean = {best_meta_cpu.get("diag_decoder_pos_mean", float("nan")):.6f}, '
                 f'decoder_neg_mean = {best_meta_cpu.get("diag_decoder_neg_mean", float("nan")):.6f}, '
                 f'dot_decoder_corr = {best_meta_cpu.get("diag_dot_decoder_corr", float("nan")):.6f}, '
+                f'pred_pos_mean = {best_meta_cpu.get("diag_pred_pos_mean", float("nan")):.6f}, '
+                f'pred_neg_mean = {best_meta_cpu.get("diag_pred_neg_mean", float("nan")):.6f}, '
+                f'dot_pred_corr = {best_meta_cpu.get("diag_dot_pred_corr", float("nan")):.6f}, '
                 f'edit_compact = {best_meta_cpu.get("edit_compact", float("nan")):.6f}, '
                 f'edit_compact_radius = {best_meta_cpu.get("edit_compact_radius", float("nan")):.6f}, '
                 f'edit_compact_proto = {best_meta_cpu.get("edit_compact_proto", float("nan")):.6f}, '
@@ -4757,6 +5184,8 @@ def train_encoder(
             encoder.load_state_dict(best_state_cpu["encoder"], strict=True)
             if (graph_decoder is not None) and ("graph_decoder" in best_state_cpu):
                 graph_decoder.load_state_dict(best_state_cpu["graph_decoder"], strict=True)
+            if (prediction_decoder is not None) and ("prediction_decoder" in best_state_cpu):
+                prediction_decoder.load_state_dict(best_state_cpu["prediction_decoder"], strict=True)
             if "graph_dense" in best_state_cpu:
                 best_graph_dense_cpu = best_state_cpu["graph_dense"].detach().cpu().clone()
             if "best_meta" in best_state_cpu:
@@ -4764,7 +5193,7 @@ def train_encoder(
         else:
             # backward compatibility for old plain state_dict checkpoints
             if isinstance(best_state_cpu, dict):
-                enc_state = {k: v for k, v in best_state_cpu.items() if k not in ("graph_dense", "best_meta", "graph_decoder")}
+                enc_state = {k: v for k, v in best_state_cpu.items() if k not in ("graph_dense", "best_meta", "graph_decoder", "prediction_decoder")}
             else:
                 enc_state = best_state_cpu
             encoder.load_state_dict(enc_state, strict=True)
@@ -4778,13 +5207,15 @@ def train_encoder(
                 encoder.load_state_dict(state["encoder"], strict=True)
                 if (graph_decoder is not None) and ("graph_decoder" in state):
                     graph_decoder.load_state_dict(state["graph_decoder"], strict=True)
+                if (prediction_decoder is not None) and ("prediction_decoder" in state):
+                    prediction_decoder.load_state_dict(state["prediction_decoder"], strict=True)
                 if "graph_dense" in state:
                     best_graph_dense_cpu = state["graph_dense"].detach().cpu().clone()
                 if "best_meta" in state:
                     best_meta_cpu = state["best_meta"]
             else:
                 if isinstance(state, dict):
-                    enc_state = {k: v for k, v in state.items() if k not in ("graph_dense", "best_meta", "graph_decoder")}
+                    enc_state = {k: v for k, v in state.items() if k not in ("graph_dense", "best_meta", "graph_decoder", "prediction_decoder")}
                 else:
                     enc_state = state
                 encoder.load_state_dict(enc_state, strict=True)
@@ -4806,10 +5237,12 @@ def train_encoder(
     encoder.eval()
     if graph_decoder is not None:
         graph_decoder.eval()
+    if prediction_decoder is not None:
+        prediction_decoder.eval()
     final_score_diag = _score_source_diagnostics(None, None, [], [])
     with torch.no_grad():
         Z_best = encoder(features, best_edge_index)
-        if use_edited_decoder and (graph_decoder is not None):
+        if (use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
             try:
                 final_labels, final_c0p_mask = resolve_edit_targets(
                     Z_best,
@@ -4822,18 +5255,36 @@ def train_encoder(
                     restrict_alpha=restrict_alpha,
                     restrict_gamma=restrict_gamma,
                 )
-                _set_struct_decoder_context(best_adj_label, final_labels, final_c0p_mask)
+                if use_edited_decoder and (graph_decoder is not None):
+                    _set_struct_decoder_context(best_adj_label, final_labels, final_c0p_mask)
+                if prediction_decoder is not None:
+                    _set_prediction_decoder_context(None, final_labels, final_c0p_mask)
             except Exception as e:
                 print(f"[DECODER-DIAG] final score context failed: {e}")
         A_pred_best = _score_adjacency(Z_best)
-        if use_edited_decoder and (graph_decoder is not None):
+        if (use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
             A_dot_final = dot_product_decode(Z_best).detach().cpu().numpy()
-            A_decoder_final = graph_decoder(Z_best).detach().cpu().numpy()
             _, _, dot_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_dot_final, adj_orig)
-            _, _, decoder_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_decoder_final, adj_orig)
-            final_score_diag = _score_source_diagnostics(A_dot_final, A_decoder_final, test_edges, test_edges_false)
             final_score_diag["diag_dot_test_hit10"] = float(dot_final_hit[2]) if len(dot_final_hit) > 2 else float("nan")
-            final_score_diag["diag_decoder_test_hit10"] = float(decoder_final_hit[2]) if len(decoder_final_hit) > 2 else float("nan")
+            if use_edited_decoder and (graph_decoder is not None):
+                A_decoder_final = graph_decoder(Z_best).detach().cpu().numpy()
+                _, _, decoder_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_decoder_final, adj_orig)
+                final_score_diag.update(_score_source_diagnostics(A_dot_final, A_decoder_final, test_edges, test_edges_false))
+                final_score_diag["diag_dot_test_hit10"] = float(dot_final_hit[2]) if len(dot_final_hit) > 2 else float("nan")
+                final_score_diag["diag_decoder_test_hit10"] = float(decoder_final_hit[2]) if len(decoder_final_hit) > 2 else float("nan")
+            if prediction_decoder is not None:
+                A_pred_decoder_final = prediction_decoder(Z_best).detach().cpu().numpy()
+                _, _, pred_decoder_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_pred_decoder_final, adj_orig)
+                pred_final_diag = _score_source_diagnostics(A_dot_final, A_pred_decoder_final, test_edges, test_edges_false)
+                final_score_diag["diag_pred_test_hit10"] = float(pred_decoder_final_hit[2]) if len(pred_decoder_final_hit) > 2 else float("nan")
+                final_score_diag["diag_pred_pos_mean"] = pred_final_diag.get("diag_decoder_pos_mean", float("nan"))
+                final_score_diag["diag_pred_neg_mean"] = pred_final_diag.get("diag_decoder_neg_mean", float("nan"))
+                final_score_diag["diag_dot_pred_corr"] = pred_final_diag.get("diag_dot_decoder_corr", float("nan"))
+                if use_edited_decoder and (graph_decoder is not None):
+                    dec_vals = _edge_score_values_np(A_decoder_final, np.concatenate([np.asarray(test_edges).reshape(-1, 2), np.asarray(test_edges_false).reshape(-1, 2)], axis=0))
+                    pred_vals = _edge_score_values_np(A_pred_decoder_final, np.concatenate([np.asarray(test_edges).reshape(-1, 2), np.asarray(test_edges_false).reshape(-1, 2)], axis=0))
+                    if dec_vals.size > 1 and pred_vals.size > 1 and np.std(dec_vals) > 0 and np.std(pred_vals) > 0:
+                        final_score_diag["diag_decoder_pred_corr"] = float(np.corrcoef(dec_vals, pred_vals)[0, 1])
 
     print(f"[SCORE] validation/test score_source={score_source}")
     final_test_roc, final_test_ap, final_test_hit = get_scores(
@@ -4845,19 +5296,23 @@ def train_encoder(
     print(f"[FINAL TEST] test_roc = {final_test_roc:.5f}, test_ap = {final_test_ap:.5f}")
     print(f"[FINAL TEST] Hit@K: 1={final_test_hit[0]}, 3={final_test_hit[1]}, 10={final_test_hit[2]}, "
         f"20={final_test_hit[3]}, 50={final_test_hit[4]}, 100={final_test_hit[5]}")
-    if use_edited_decoder and (graph_decoder is not None):
+    if (use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
         print(
             f"[DECODER-DIAG][FINAL] "
-            f"decoder_type={decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
-            f"heart_rank_weight={heart_rank_weight:.6f} heart_rank_margin={heart_rank_margin:.6f} "
-            f"heart_rank_neg_k={heart_rank_neg_k} "
+            f"decoder_type={decoder_type} pred_decoder_type={prediction_decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
+            f"heart_rank_weight={heart_rank_weight:.6f} prediction_rank_weight={prediction_rank_weight:.6f} "
             f"dot_test_hit10={final_score_diag.get('diag_dot_test_hit10', float('nan')):.6f} "
             f"decoder_test_hit10={final_score_diag.get('diag_decoder_test_hit10', float('nan')):.6f} "
+            f"pred_test_hit10={final_score_diag.get('diag_pred_test_hit10', float('nan')):.6f} "
             f"dot_pos_mean={final_score_diag.get('diag_dot_pos_mean', float('nan')):.6f} "
             f"dot_neg_mean={final_score_diag.get('diag_dot_neg_mean', float('nan')):.6f} "
             f"decoder_pos_mean={final_score_diag.get('diag_decoder_pos_mean', float('nan')):.6f} "
             f"decoder_neg_mean={final_score_diag.get('diag_decoder_neg_mean', float('nan')):.6f} "
-            f"dot_decoder_corr={final_score_diag.get('diag_dot_decoder_corr', float('nan')):.6f}"
+            f"pred_pos_mean={final_score_diag.get('diag_pred_pos_mean', float('nan')):.6f} "
+            f"pred_neg_mean={final_score_diag.get('diag_pred_neg_mean', float('nan')):.6f} "
+            f"dot_decoder_corr={final_score_diag.get('diag_dot_decoder_corr', float('nan')):.6f} "
+            f"dot_pred_corr={final_score_diag.get('diag_dot_pred_corr', float('nan')):.6f} "
+            f"decoder_pred_corr={final_score_diag.get('diag_decoder_pred_corr', float('nan')):.6f}"
         )
 
     if best_meta_cpu is not None:
@@ -4879,17 +5334,30 @@ def train_encoder(
             f"edit_remove_rank={float(best_meta_cpu.get('edit_remove_rank', float('nan'))):.6f} "
             f"edit_heart_rank={float(best_meta_cpu.get('edit_heart_rank', float('nan'))):.6f} "
             f"heart_rank_pairs={float(best_meta_cpu.get('heart_rank_pairs', float('nan'))):.0f} "
+            f"prediction_rank={float(best_meta_cpu.get('prediction_rank', float('nan'))):.6f} "
+            f"prediction_bce={float(best_meta_cpu.get('prediction_bce', float('nan'))):.6f} "
+            f"prediction_joint_rank={float(best_meta_cpu.get('prediction_joint_rank', float('nan'))):.6f} "
+            f"prediction_joint_bce={float(best_meta_cpu.get('prediction_joint_bce', float('nan'))):.6f} "
+            f"prediction_rank_pairs={float(best_meta_cpu.get('prediction_rank_pairs', float('nan'))):.0f} "
+            f"prediction_rank_weight={float(best_meta_cpu.get('prediction_rank_weight', float('nan'))):.6f} "
+            f"prediction_bce_weight={float(best_meta_cpu.get('prediction_bce_weight', float('nan'))):.6f} "
+            f"prediction_encoder_weight={float(best_meta_cpu.get('prediction_encoder_weight', float('nan'))):.6f} "
             f"decoder_normalize_input={float(best_meta_cpu.get('decoder_normalize_input', float('nan'))):.0f} "
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
             f"heart_rank_margin={float(best_meta_cpu.get('heart_rank_margin', float('nan'))):.6f} "
             f"heart_rank_neg_k={float(best_meta_cpu.get('heart_rank_neg_k', float('nan'))):.0f} "
             f"diag_dot_val_hit10={float(best_meta_cpu.get('diag_dot_val_hit10', float('nan'))):.6f} "
             f"diag_decoder_val_hit10={float(best_meta_cpu.get('diag_decoder_val_hit10', float('nan'))):.6f} "
+            f"diag_pred_val_hit10={float(best_meta_cpu.get('diag_pred_val_hit10', float('nan'))):.6f} "
             f"diag_dot_pos_mean={float(best_meta_cpu.get('diag_dot_pos_mean', float('nan'))):.6f} "
             f"diag_dot_neg_mean={float(best_meta_cpu.get('diag_dot_neg_mean', float('nan'))):.6f} "
             f"diag_decoder_pos_mean={float(best_meta_cpu.get('diag_decoder_pos_mean', float('nan'))):.6f} "
             f"diag_decoder_neg_mean={float(best_meta_cpu.get('diag_decoder_neg_mean', float('nan'))):.6f} "
             f"diag_dot_decoder_corr={float(best_meta_cpu.get('diag_dot_decoder_corr', float('nan'))):.6f} "
+            f"diag_pred_pos_mean={float(best_meta_cpu.get('diag_pred_pos_mean', float('nan'))):.6f} "
+            f"diag_pred_neg_mean={float(best_meta_cpu.get('diag_pred_neg_mean', float('nan'))):.6f} "
+            f"diag_dot_pred_corr={float(best_meta_cpu.get('diag_dot_pred_corr', float('nan'))):.6f} "
+            f"diag_decoder_pred_corr={float(best_meta_cpu.get('diag_decoder_pred_corr', float('nan'))):.6f} "
             f"edit_compact={float(best_meta_cpu['edit_compact']):.6f} "
             f"edit_compact_radius={float(best_meta_cpu.get('edit_compact_radius', float('nan'))):.6f} "
             f"edit_compact_proto={float(best_meta_cpu.get('edit_compact_proto', float('nan'))):.6f}"

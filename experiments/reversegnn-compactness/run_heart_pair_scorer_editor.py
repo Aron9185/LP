@@ -1,10 +1,11 @@
-"""Run the HeaRT structural pair-decoder editor matrix.
+"""Run the HeaRT two-decoder editor matrix.
 
-This runner is the first-pass experiment for the heart-pair-scorer-editor branch:
-  1. pair_mlp_struct + dot final scorer
-  2. pair_mlp_struct + decoder final scorer
-  3. pair_mlp_struct + dot final scorer + removal
-  4. pair_mlp_struct + decoder final scorer + removal
+This runner keeps pair_mlp_struct as the edit decoder and adds a residual
+structural prediction decoder trained with HeaRT-style ranking/BCE:
+  1. edit decoder + dot final scorer
+  2. edit decoder + prediction decoder final scorer
+  3. edit decoder + dot final scorer + removal
+  4. edit decoder + prediction decoder final scorer + removal
 """
 
 import argparse
@@ -22,50 +23,59 @@ from run_research_matrix import extract_metrics, flatten_summary_columns, merge_
 
 PAIR_SCORER_CONFIGS = [
     {
-        "name": "pair_struct_dot",
-        "family": "pair_struct",
+        "name": "two_decoder_dot",
+        "family": "two_decoder",
         "score_source": "dot",
         "remove": False,
     },
     {
-        "name": "pair_struct_decoder",
-        "family": "pair_struct",
-        "score_source": "decoder",
+        "name": "two_decoder_pred",
+        "family": "two_decoder",
+        "score_source": "pred_decoder",
         "remove": False,
     },
     {
-        "name": "pair_struct_dot_remove",
-        "family": "pair_struct_remove",
+        "name": "two_decoder_dot_remove",
+        "family": "two_decoder_remove",
         "score_source": "dot",
         "remove": True,
     },
     {
-        "name": "pair_struct_decoder_remove",
-        "family": "pair_struct_remove",
-        "score_source": "decoder",
+        "name": "two_decoder_pred_remove",
+        "family": "two_decoder_remove",
+        "score_source": "pred_decoder",
         "remove": True,
     },
 ]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run HeaRT structural pair-decoder editor experiments.")
-    parser.add_argument("--prefix", type=str, default="heart_pair_scorer_editor_smoke")
+    parser = argparse.ArgumentParser(description="Run HeaRT two-decoder editor experiments.")
+    parser.add_argument("--prefix", type=str, default="heart_two_decoder_editor_smoke")
     parser.add_argument("--datasets", nargs="+", default=["cora", "citeseer"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--epochs", type=int, default=700)
-    parser.add_argument("--edit-start-epoch", type=int, default=100)
+    parser.add_argument("--edit-start-epoch", type=int, default=80)
+    parser.add_argument("--edit-train-start-epoch", type=int, default=80)
+    parser.add_argument("--decoded-rewrite-start-epoch", type=int, default=100)
     parser.add_argument("--editor-pull-strength", type=float, default=1.0)
     parser.add_argument("--decoded-add-ratio", type=float, default=0.01)
     parser.add_argument("--decoded-remove-ratio", type=float, default=0.01)
     parser.add_argument("--decoded-graph-aug-bound", type=float, default=-1.0)
-    parser.add_argument("--heart-rank-weight", type=float, default=1.0)
+    parser.add_argument("--heart-rank-weight", type=float, default=0.0)
     parser.add_argument("--heart-rank-margin", type=float, default=0.2)
     parser.add_argument("--heart-rank-neg-k", type=int, default=8)
     parser.add_argument("--heart-rank-pool-factor", type=int, default=4)
     parser.add_argument("--decoder-rank-neg-k", type=int, default=8)
     parser.add_argument("--decoder-rank-pool-factor", type=int, default=4)
     parser.add_argument("--mlp-pair-max-rows", type=int, default=16)
+    parser.add_argument("--prediction-rank-weight", type=float, default=1.0)
+    parser.add_argument("--prediction-bce-weight", type=float, default=0.1)
+    parser.add_argument("--prediction-rank-margin", type=float, default=0.2)
+    parser.add_argument("--prediction-rank-neg-k", type=int, default=16)
+    parser.add_argument("--prediction-rank-pool-factor", type=int, default=8)
+    parser.add_argument("--prediction-encoder-weight", type=float, default=0.05)
+    parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
     parser.add_argument("--decoder-normalize-input", action="store_true", help="Use normalized pair embeddings. Default uses raw pair embeddings.")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--force", action="store_true")
@@ -139,12 +149,15 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--heart_eval_every", "5",
         "--heart_checkpoint_metric", "hit10",
         "--edit_start_epoch", str(args.edit_start_epoch),
+        "--edit_train_start_epoch", str(args.edit_train_start_epoch),
+        "--decoded_rewrite_start_epoch", str(args.decoded_rewrite_start_epoch),
         "--eval_log_every", "5",
         "--run_tag", cfg["name"],
         "--ver", "no",
         "--use_edited_decoder",
         "--use_decoded_graph_augment",
         "--dynamic_c0p_targets",
+        "--no_decoder_warmup_in_phase1",
         "--decoder_type", "pair_mlp_struct",
         "--decoder_objective", "hybrid",
         "--compactness_objective", "radius",
@@ -166,6 +179,14 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--heart_rank_margin", str(args.heart_rank_margin),
         "--heart_rank_neg_k", str(args.heart_rank_neg_k),
         "--heart_rank_pool_factor", str(args.heart_rank_pool_factor),
+        "--prediction_decoder_type", "pair_residual_struct",
+        "--prediction_rank_weight", str(args.prediction_rank_weight),
+        "--prediction_bce_weight", str(args.prediction_bce_weight),
+        "--prediction_rank_margin", str(args.prediction_rank_margin),
+        "--prediction_rank_neg_k", str(args.prediction_rank_neg_k),
+        "--prediction_rank_pool_factor", str(args.prediction_rank_pool_factor),
+        "--prediction_encoder_weight", str(args.prediction_encoder_weight),
+        "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
     if args.decoder_normalize_input:
@@ -207,7 +228,8 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         f"[done {progress}] {dataset} {cfg['name']} s{seed} -> rc={proc.returncode} "
         f"hit10={metrics.get('test_hit10', float('nan')):.4f} "
         f"dot_diag={metrics.get('diag_dot_test_hit10', float('nan')):.4f} "
-        f"decoder_diag={metrics.get('diag_decoder_test_hit10', float('nan')):.4f}",
+        f"decoder_diag={metrics.get('diag_decoder_test_hit10', float('nan')):.4f} "
+        f"pred_diag={metrics.get('diag_pred_test_hit10', float('nan')):.4f}",
         flush=True,
     )
     return metrics
@@ -220,7 +242,7 @@ def main():
     tasks = [(idx, len(task_specs), cfg, dataset, seed) for idx, (cfg, dataset, seed) in enumerate(task_specs, start=1)]
 
     print(
-        f"HeaRT structural pair-scorer matrix: {len(tasks)} runs "
+        f"HeaRT two-decoder editor matrix: {len(tasks)} runs "
         f"(datasets={args.datasets}, seeds={args.seeds}, workers={args.max_workers})",
         flush=True,
     )
@@ -265,19 +287,33 @@ def main():
         "edit_remove_rank",
         "edit_heart_rank",
         "heart_rank_pairs",
+        "prediction_rank",
+        "prediction_bce",
+        "prediction_joint_rank",
+        "prediction_joint_bce",
+        "prediction_rank_pairs",
+        "prediction_rank_weight",
+        "prediction_bce_weight",
+        "prediction_encoder_weight",
         "decoder_normalize_input",
         "heart_rank_weight",
         "heart_rank_margin",
         "heart_rank_neg_k",
         "diag_dot_val_hit10",
         "diag_decoder_val_hit10",
+        "diag_pred_val_hit10",
         "diag_dot_pos_mean",
         "diag_dot_neg_mean",
         "diag_decoder_pos_mean",
         "diag_decoder_neg_mean",
+        "diag_pred_pos_mean",
+        "diag_pred_neg_mean",
         "diag_dot_decoder_corr",
+        "diag_dot_pred_corr",
+        "diag_decoder_pred_corr",
         "diag_dot_test_hit10",
         "diag_decoder_test_hit10",
+        "diag_pred_test_hit10",
         "rewrite_applied",
     ]
     for col in numeric_cols:
@@ -292,7 +328,7 @@ def main():
     summary_path = artifact_path(f"{args.prefix}_summary.csv")
     summary_df.to_csv(summary_path, index=False)
 
-    print("\n=== HeaRT Structural Pair-Scorer Summary ===")
+    print("\n=== HeaRT Two-Decoder Editor Summary ===")
     print(summary_df.to_string(index=False))
     print(f"\nRaw runs saved to {raw_path}")
     print(f"Summary saved to {summary_path}")
