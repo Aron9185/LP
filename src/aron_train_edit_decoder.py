@@ -1670,8 +1670,9 @@ def compactness_objective_loss(
     core_mask: torch.Tensor | None,
     *,
     compactness_objective: str,
+    radius_metric: str = "cosine",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    radius_loss = cluster_compactness_loss(Z_edit, labels, radius_mask)
+    radius_loss = cluster_compactness_loss(Z_edit, labels, radius_mask, radius_metric=radius_metric)
     proto_loss = prototype_compactness_loss(Z_edit, labels, core_mask)
     if compactness_objective == "radius":
         total = radius_loss
@@ -1744,32 +1745,82 @@ def cluster_compactness_loss(
     Z_edit: torch.Tensor,
     labels: np.ndarray | None,
     node_mask: torch.Tensor | None,
+    *,
+    radius_metric: str = "cosine",
+) -> torch.Tensor:
+    values = cluster_radius_values(Z_edit, labels, node_mask, radius_metric=radius_metric)
+    if values.numel() == 0:
+        return Z_edit.new_tensor(0.0)
+    return values.mean()
+
+
+def cluster_radius_values(
+    Z_edit: torch.Tensor,
+    labels: np.ndarray | None,
+    node_mask: torch.Tensor | None,
+    *,
+    radius_metric: str = "cosine",
 ) -> torch.Tensor:
     if labels is None:
-        return Z_edit.new_tensor(0.0)
+        return Z_edit.new_empty((0,))
     labels_np = np.asarray(labels)
     if node_mask is None:
         node_mask = torch.ones(Z_edit.size(0), dtype=torch.bool, device=Z_edit.device)
     else:
         node_mask = node_mask.to(Z_edit.device).bool()
 
-    per_cluster = []
+    metric = str(radius_metric or "cosine").lower()
+    if metric not in {"cosine", "mahalanobis"}:
+        raise ValueError(f"Unsupported compactness radius metric: {radius_metric}")
+
+    X_cos = F.normalize(Z_edit, p=2, dim=1)
+    values = []
     for c in sorted(set(labels_np.tolist()) - {-1}):
         idx_np = np.where(labels_np == c)[0]
         if idx_np.size == 0:
             continue
         idx_t = torch.as_tensor(idx_np, device=Z_edit.device, dtype=torch.long)
         sel_mask = node_mask.index_select(0, idx_t)
-        if int(sel_mask.sum().item()) <= 1:
+        sel_count = int(sel_mask.sum().item())
+        if sel_count == 0 or (metric == "cosine" and sel_count <= 1):
             continue
         sel_idx = idx_t[sel_mask]
-        X = F.normalize(Z_edit.index_select(0, sel_idx), p=2, dim=1)
-        center = F.normalize(X.mean(dim=0, keepdim=True), p=2, dim=1)
-        radii = 1.0 - (X @ center.t()).squeeze(1)
-        per_cluster.append(radii.mean())
-    if not per_cluster:
-        return Z_edit.new_tensor(0.0)
-    return torch.stack(per_cluster).mean()
+        if metric == "cosine":
+            X = X_cos.index_select(0, sel_idx)
+            center = F.normalize(X.mean(dim=0, keepdim=True), p=2, dim=1)
+            values.append(1.0 - (X @ center.t()).squeeze(1))
+        else:
+            Xc = X_cos.index_select(0, idx_t)
+            mu = Xc.mean(dim=0, keepdim=True)
+            var = Xc.var(dim=0, unbiased=False, keepdim=True) + 1e-6
+            X_sel = X_cos.index_select(0, sel_idx)
+            values.append(torch.sqrt(((X_sel - mu) ** 2 / var).sum(dim=1)))
+    if not values:
+        return Z_edit.new_empty((0,))
+    return torch.cat(values, dim=0)
+
+
+def cluster_radius_summary(
+    Z_edit: torch.Tensor,
+    labels: np.ndarray | None,
+    node_mask: torch.Tensor | None,
+    *,
+    radius_metric: str = "cosine",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    values = cluster_radius_values(Z_edit, labels, node_mask, radius_metric=radius_metric)
+    if values.numel() == 0:
+        zero = Z_edit.new_tensor(0.0)
+        return zero, zero, zero
+    mean = values.mean()
+    p90 = torch.quantile(values, 0.90) if values.numel() > 1 else values[0]
+    max_val = values.max()
+    return mean, p90, max_val
+
+
+def noncompact_node_mask(cp_mask: torch.Tensor | None, c0p_mask: torch.Tensor | None) -> torch.Tensor | None:
+    if cp_mask is None or c0p_mask is None:
+        return None
+    return cp_mask.to(c0p_mask.device).bool() & (~c0p_mask.bool())
 
 
 def non_target_preservation_loss(Z_edit: torch.Tensor, Z_base: torch.Tensor, node_mask: torch.Tensor | None) -> torch.Tensor:
@@ -1915,7 +1966,7 @@ def build_decoded_augmented_graph(
                 break
 
     deg_now = _deg_excl_self(g)
-    cand_rem = valid_pairs & (g > 0)
+    cand_rem = ctx["removable_pairs"].clone()
     cand_rem.fill_diagonal_(False)
     ii, jj = cand_rem.triu(1).nonzero(as_tuple=True)
     if ii.numel() > 0:
@@ -2095,6 +2146,9 @@ def train_encoder(
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
+    compactness_radius_metric = str(kwargs.get("compactness_radius_metric", "cosine")).lower()
+    if compactness_radius_metric not in {"cosine", "mahalanobis"}:
+        raise ValueError("compactness_radius_metric must be one of: cosine, mahalanobis")
     preserve_weight = float(kwargs.get("preserve_weight", 0.0))
     editor_hidden = int(kwargs.get("editor_hidden", hidden2 * 2))
     editor_pull_strength = float(kwargs.get("editor_pull_strength", 0.20))
@@ -2444,6 +2498,7 @@ def train_encoder(
             f"add_q={decoded_add_quantile} remove_q={decoded_remove_quantile} | "
             f"max_add={decoded_max_add_per_round} max_remove={decoded_max_remove_per_round} | "
             f"decoder_objective={decoder_objective} | compactness_objective={compactness_objective} | "
+            f"compactness_radius_metric={compactness_radius_metric} | "
             f"score_source={score_source} | mlp_pair_max_rows={mlp_pair_max_rows} | skip_oom_epoch={int(skip_oom_epoch)} | "
             f"recon_w={decoder_recon_weight} keep_w={decoder_keep_weight} add_rank_w={decoder_add_rank_weight} "
             f"remove_rank_w={decoder_remove_rank_weight} rank_margin={decoder_rank_margin} "
@@ -4337,6 +4392,7 @@ def train_encoder(
                     compactness_mask,
                     c0p_mask_epoch,
                     compactness_objective=compactness_objective,
+                    radius_metric=compactness_radius_metric,
                 )
                 edit_preserve_loss = non_target_preservation_loss(
                     z_edit,
@@ -4543,6 +4599,12 @@ def train_encoder(
             c0p_radius_after = Z.new_tensor(0.0)
             cp_radius_before = Z.new_tensor(0.0)
             cp_radius_after = Z.new_tensor(0.0)
+            noncompact_radius_before = Z.new_tensor(0.0)
+            noncompact_radius_after = Z.new_tensor(0.0)
+            noncompact_radius_p90_before = Z.new_tensor(0.0)
+            noncompact_radius_p90_after = Z.new_tensor(0.0)
+            noncompact_radius_max_before = Z.new_tensor(0.0)
+            noncompact_radius_max_after = Z.new_tensor(0.0)
             if use_edited_decoder and (graph_decoder is not None) and _decoded_edit_active(epoch):
                 try:
                     eval_labels, eval_c0p_mask = resolve_edit_targets(
@@ -4560,10 +4622,16 @@ def train_encoder(
                     eval_pull_mask = eval_c0p_mask if pull_mask_scope == "c0p" else eval_cp_mask
                     eval_compactness_mask = eval_c0p_mask if compactness_mask_scope == "c0p" else eval_cp_mask
                     eval_rewrite_mask = eval_c0p_mask if rewrite_endpoint_scope == "c0p" else eval_cp_mask
+                    eval_noncompact_mask = noncompact_node_mask(eval_cp_mask, eval_c0p_mask)
 
-                    radius_before = cluster_compactness_loss(Z, eval_labels, eval_compactness_mask)
-                    c0p_radius_before = cluster_compactness_loss(Z, eval_labels, eval_c0p_mask)
-                    cp_radius_before = cluster_compactness_loss(Z, eval_labels, eval_cp_mask)
+                    radius_before = cluster_compactness_loss(Z, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
+                    c0p_radius_before = cluster_compactness_loss(Z, eval_labels, eval_c0p_mask, radius_metric=compactness_radius_metric)
+                    cp_radius_before = cluster_compactness_loss(Z, eval_labels, eval_cp_mask, radius_metric=compactness_radius_metric)
+                    (
+                        noncompact_radius_before,
+                        noncompact_radius_p90_before,
+                        noncompact_radius_max_before,
+                    ) = cluster_radius_summary(Z, eval_labels, eval_noncompact_mask, radius_metric=compactness_radius_metric)
 
                     if use_decoded_graph_augment:
                         if decoded_accumulate_into_base:
@@ -4572,18 +4640,32 @@ def train_encoder(
                                 metric_c0p_mask = decoded_metric_mask_epoch if decoded_metric_mask_epoch is not None else eval_c0p_mask
                                 metric_cp_mask = torch.tensor((metric_labels != -1), dtype=torch.bool, device=Z.device) if metric_labels is not None else None
                                 metric_compactness_mask = metric_c0p_mask if compactness_mask_scope == "c0p" else metric_cp_mask
+                                metric_noncompact_mask = noncompact_node_mask(metric_cp_mask, metric_c0p_mask)
 
                                 Z_before_graph = encoder(features, decoded_pre_graph_dense_epoch.to_sparse().indices())
-                                radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_compactness_mask)
-                                radius_after = cluster_compactness_loss(Z, metric_labels, metric_compactness_mask)
-                                c0p_radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_c0p_mask)
-                                c0p_radius_after = cluster_compactness_loss(Z, metric_labels, metric_c0p_mask)
-                                cp_radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_cp_mask)
-                                cp_radius_after = cluster_compactness_loss(Z, metric_labels, metric_cp_mask)
+                                radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_compactness_mask, radius_metric=compactness_radius_metric)
+                                radius_after = cluster_compactness_loss(Z, metric_labels, metric_compactness_mask, radius_metric=compactness_radius_metric)
+                                c0p_radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_c0p_mask, radius_metric=compactness_radius_metric)
+                                c0p_radius_after = cluster_compactness_loss(Z, metric_labels, metric_c0p_mask, radius_metric=compactness_radius_metric)
+                                cp_radius_before = cluster_compactness_loss(Z_before_graph, metric_labels, metric_cp_mask, radius_metric=compactness_radius_metric)
+                                cp_radius_after = cluster_compactness_loss(Z, metric_labels, metric_cp_mask, radius_metric=compactness_radius_metric)
+                                (
+                                    noncompact_radius_before,
+                                    noncompact_radius_p90_before,
+                                    noncompact_radius_max_before,
+                                ) = cluster_radius_summary(Z_before_graph, metric_labels, metric_noncompact_mask, radius_metric=compactness_radius_metric)
+                                (
+                                    noncompact_radius_after,
+                                    noncompact_radius_p90_after,
+                                    noncompact_radius_max_after,
+                                ) = cluster_radius_summary(Z, metric_labels, metric_noncompact_mask, radius_metric=compactness_radius_metric)
                             else:
                                 radius_after = radius_before
                                 c0p_radius_after = c0p_radius_before
                                 cp_radius_after = cp_radius_before
+                                noncompact_radius_after = noncompact_radius_before
+                                noncompact_radius_p90_after = noncompact_radius_p90_before
+                                noncompact_radius_max_after = noncompact_radius_max_before
                         else:
                             if decoded_static_view_enabled and static_decoded_aug_edge_index is not None:
                                 Z_eval = encoder(features, static_decoded_aug_edge_index)
@@ -4644,9 +4726,14 @@ def train_encoder(
                                         require_both_c0p=decoded_require_both_c0p,
                                     )
                                 Z_eval = encoder(features, g_eval.to_sparse().indices())
-                            radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask)
-                            c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask)
-                            cp_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_cp_mask)
+                            radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
+                            c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask, radius_metric=compactness_radius_metric)
+                            cp_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_cp_mask, radius_metric=compactness_radius_metric)
+                            (
+                                noncompact_radius_after,
+                                noncompact_radius_p90_after,
+                                noncompact_radius_max_after,
+                            ) = cluster_radius_summary(Z_eval, eval_labels, eval_noncompact_mask, radius_metric=compactness_radius_metric)
                     else:
                         Z_eval = direct_pull_latent_per_cluster(
                             Z,
@@ -4654,9 +4741,14 @@ def train_encoder(
                             eval_pull_mask,
                             pull_strength=editor_pull_strength,
                         )
-                        radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask)
-                        c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask)
-                        cp_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_cp_mask)
+                        radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
+                        c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask, radius_metric=compactness_radius_metric)
+                        cp_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_cp_mask, radius_metric=compactness_radius_metric)
+                        (
+                            noncompact_radius_after,
+                            noncompact_radius_p90_after,
+                            noncompact_radius_max_after,
+                        ) = cluster_radius_summary(Z_eval, eval_labels, eval_noncompact_mask, radius_metric=compactness_radius_metric)
                 except Exception as e:
                     print(f"[EDIT][EVAL] edited eval failed at epoch {epoch}: {e}")
         
@@ -4838,6 +4930,12 @@ def train_encoder(
         c0p_radius_after_val = float(c0p_radius_after.detach().cpu())
         cp_radius_before_val = float(cp_radius_before.detach().cpu())
         cp_radius_after_val = float(cp_radius_after.detach().cpu())
+        noncompact_radius_before_val = float(noncompact_radius_before.detach().cpu())
+        noncompact_radius_after_val = float(noncompact_radius_after.detach().cpu())
+        noncompact_radius_p90_before_val = float(noncompact_radius_p90_before.detach().cpu())
+        noncompact_radius_p90_after_val = float(noncompact_radius_p90_after.detach().cpu())
+        noncompact_radius_max_before_val = float(noncompact_radius_max_before.detach().cpu())
+        noncompact_radius_max_after_val = float(noncompact_radius_max_after.detach().cpu())
         rewrite_applied_now = bool(use_edited_decoder and epoch >= decoded_rewrite_start_epoch and decoded_rewrite_applied_this_epoch)
         if use_edited_decoder and _decoded_edit_active(epoch):
             if radius_anchor_value is None and np.isfinite(radius_before_val):
@@ -4915,8 +5013,13 @@ def train_encoder(
                 f"compact={float(edit_compact_loss.detach().cpu()):.6f} compact_radius={float(edit_compact_radius_loss.detach().cpu()):.6f} "
                 f"compact_proto={float(edit_compact_proto_loss.detach().cpu()):.6f} "
                 f"preserve={float(edit_preserve_loss.detach().cpu()):.6f} "
-                f"radius_before={radius_before_val:.6f} radius_after={radius_after_val:.6f} "
+                f"radius_metric={compactness_radius_metric} radius_before={radius_before_val:.6f} radius_after={radius_after_val:.6f} "
                 f"delta={radius_delta_val:.6f} radius_anchor={(float(radius_anchor_value) if radius_anchor_value is not None else float('nan')):.6f} "
+                f"c0p_radius_before={c0p_radius_before_val:.6f} c0p_radius_after={c0p_radius_after_val:.6f} "
+                f"cp_radius_before={cp_radius_before_val:.6f} cp_radius_after={cp_radius_after_val:.6f} "
+                f"noncompact_radius_before={noncompact_radius_before_val:.6f} noncompact_radius_after={noncompact_radius_after_val:.6f} "
+                f"noncompact_radius_p90_before={noncompact_radius_p90_before_val:.6f} noncompact_radius_p90_after={noncompact_radius_p90_after_val:.6f} "
+                f"noncompact_radius_max_before={noncompact_radius_max_before_val:.6f} noncompact_radius_max_after={noncompact_radius_max_after_val:.6f} "
                 f"delta_anchor={delta_from_anchor:.6f} delta_prev_rewrite={delta_from_prev_rewrite:.6f} "
                 f"rewrite_applied={int(rewrite_applied_now)} "
                 f"rewrite_nodes={edit_decoder_debug['rewrite_nodes']} "
@@ -5027,10 +5130,17 @@ def train_encoder(
                 "radius_before": float(radius_before_val),
                 "radius_after": float(radius_after_val),
                 "radius_delta": float(radius_delta_val),
+                "compactness_radius_metric": compactness_radius_metric,
                 "c0p_radius_before": float(c0p_radius_before_val),
                 "c0p_radius_after": float(c0p_radius_after_val),
                 "cp_radius_before": float(cp_radius_before_val),
                 "cp_radius_after": float(cp_radius_after_val),
+                "noncompact_radius_before": float(noncompact_radius_before_val),
+                "noncompact_radius_after": float(noncompact_radius_after_val),
+                "noncompact_radius_p90_before": float(noncompact_radius_p90_before_val),
+                "noncompact_radius_p90_after": float(noncompact_radius_p90_after_val),
+                "noncompact_radius_max_before": float(noncompact_radius_max_before_val),
+                "noncompact_radius_max_after": float(noncompact_radius_max_after_val),
                 "radius_anchor": float(radius_anchor_value) if radius_anchor_value is not None else float("nan"),
                 "delta_anchor": float(delta_from_anchor),
                 "delta_prev_rewrite": float(delta_from_prev_rewrite),
@@ -5144,10 +5254,17 @@ def train_encoder(
                 f'radius_before = {best_meta_cpu.get("radius_before", float("nan")):.6f}, '
                 f'radius_after = {best_meta_cpu.get("radius_after", float("nan")):.6f}, '
                 f'delta = {best_meta_cpu.get("radius_delta", float("nan")):.6f}, '
+                f'radius_metric = {best_meta_cpu.get("compactness_radius_metric", compactness_radius_metric)}, '
                 f'c0p_radius_before = {best_meta_cpu.get("c0p_radius_before", float("nan")):.6f}, '
                 f'c0p_radius_after = {best_meta_cpu.get("c0p_radius_after", float("nan")):.6f}, '
                 f'cp_radius_before = {best_meta_cpu.get("cp_radius_before", float("nan")):.6f}, '
                 f'cp_radius_after = {best_meta_cpu.get("cp_radius_after", float("nan")):.6f}, '
+                f'noncompact_radius_before = {best_meta_cpu.get("noncompact_radius_before", float("nan")):.6f}, '
+                f'noncompact_radius_after = {best_meta_cpu.get("noncompact_radius_after", float("nan")):.6f}, '
+                f'noncompact_radius_p90_before = {best_meta_cpu.get("noncompact_radius_p90_before", float("nan")):.6f}, '
+                f'noncompact_radius_p90_after = {best_meta_cpu.get("noncompact_radius_p90_after", float("nan")):.6f}, '
+                f'noncompact_radius_max_before = {best_meta_cpu.get("noncompact_radius_max_before", float("nan")):.6f}, '
+                f'noncompact_radius_max_after = {best_meta_cpu.get("noncompact_radius_max_after", float("nan")):.6f}, '
                 f'radius_anchor = {best_meta_cpu.get("radius_anchor", float("nan")):.6f}, '
                 f'delta_anchor = {best_meta_cpu.get("delta_anchor", float("nan")):.6f}, '
                 f'delta_prev_rewrite = {best_meta_cpu.get("delta_prev_rewrite", float("nan")):.6f}, '
@@ -5318,12 +5435,19 @@ def train_encoder(
     if best_meta_cpu is not None:
         print(
             f"[SANITY SUMMARY] best_val_epoch={int(best_meta_cpu['epoch'])+1} val_roc={float(best_meta_cpu['val_roc']):.6f} "
+            f"radius_metric={best_meta_cpu.get('compactness_radius_metric', compactness_radius_metric)} "
             f"radius_before={float(best_meta_cpu['radius_before']):.6f} radius_after={float(best_meta_cpu['radius_after']):.6f} "
             f"delta={float(best_meta_cpu['radius_delta']):.6f} "
             f"c0p_radius_before={float(best_meta_cpu.get('c0p_radius_before', float('nan'))):.6f} "
             f"c0p_radius_after={float(best_meta_cpu.get('c0p_radius_after', float('nan'))):.6f} "
             f"cp_radius_before={float(best_meta_cpu.get('cp_radius_before', float('nan'))):.6f} "
             f"cp_radius_after={float(best_meta_cpu.get('cp_radius_after', float('nan'))):.6f} "
+            f"noncompact_radius_before={float(best_meta_cpu.get('noncompact_radius_before', float('nan'))):.6f} "
+            f"noncompact_radius_after={float(best_meta_cpu.get('noncompact_radius_after', float('nan'))):.6f} "
+            f"noncompact_radius_p90_before={float(best_meta_cpu.get('noncompact_radius_p90_before', float('nan'))):.6f} "
+            f"noncompact_radius_p90_after={float(best_meta_cpu.get('noncompact_radius_p90_after', float('nan'))):.6f} "
+            f"noncompact_radius_max_before={float(best_meta_cpu.get('noncompact_radius_max_before', float('nan'))):.6f} "
+            f"noncompact_radius_max_after={float(best_meta_cpu.get('noncompact_radius_max_after', float('nan'))):.6f} "
             f"radius_anchor={float(best_meta_cpu['radius_anchor']):.6f} "
             f"delta_anchor={float(best_meta_cpu['delta_anchor']):.6f} "
             f"delta_prev_rewrite={float(best_meta_cpu['delta_prev_rewrite']):.6f} "

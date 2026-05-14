@@ -231,6 +231,7 @@ parser.add_argument("--prediction_joint_start_epoch", type=int, default=-1, help
 parser.add_argument("--prediction_encoder_weight", type=float, default=0.0, help="Weight for the late joint prediction-decoder loss on encoder embeddings.")
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
+parser.add_argument("--compactness_radius_metric", type=str, default="cosine", choices=["cosine", "mahalanobis"], help="Radius metric used by compactness diagnostics/objective.")
 parser.add_argument("--preserve_weight", type=float, default=0.0)
 parser.add_argument("--separate_edit_training", action="store_true", help="Use two-stage training: task learning before edit_start_epoch, then edit-only optimization afterward.")
 parser.add_argument("--edit_phase_retain_recon_weight", type=float, default=0.0, help="Optional reconstruction-retention weight during phase-2 edit training.")
@@ -259,8 +260,8 @@ parser.add_argument("--decoded_add_ratio", type=float, default=0.02, help="Per-e
 parser.add_argument("--decoded_remove_ratio", type=float, default=0.00, help="Per-epoch remove budget for decoded graph rewrite, measured as a fraction of E0.")
 parser.add_argument("--decoded_add_threshold", type=float, default=None, help="Add decoded edges with score >= this threshold. Overrides add_ratio when set.")
 parser.add_argument("--decoded_remove_threshold", type=float, default=None, help="Remove decoded edges with score <= this threshold. Overrides remove_ratio when set.")
-parser.add_argument("--decoded_add_quantile", type=float, default=None, help="Add decoded edges from the top-q valid non-edge scores. Example 0.002 keeps the top 0.2%.")
-parser.add_argument("--decoded_remove_quantile", type=float, default=None, help="Remove decoded edges from the bottom-q valid existing-edge scores. Example 0.001 keeps the lowest 0.1%.")
+parser.add_argument("--decoded_add_quantile", type=float, default=None, help="Add decoded edges from the top-q valid non-edge scores. Example 0.002 keeps the top 0.2%%.")
+parser.add_argument("--decoded_remove_quantile", type=float, default=None, help="Remove decoded edges from the bottom-q valid existing-edge scores. Example 0.001 keeps the lowest 0.1%%.")
 parser.add_argument("--decoded_max_add_per_round", type=int, default=None, help="Hard cap on decoded edge additions per rewrite round.")
 parser.add_argument("--decoded_max_remove_per_round", type=int, default=None, help="Hard cap on decoded edge removals per rewrite round.")
 parser.add_argument("--decoded_graph_aug_bound", type=float, default=-1.0, help="Per-node cap fraction for decoded graph additions. Set <= 0 to disable the cap entirely.")
@@ -422,6 +423,7 @@ def main():
         prediction_encoder_weight=args.prediction_encoder_weight,
         compactness_weight=args.compactness_weight,
         compactness_objective=args.compactness_objective,
+        compactness_radius_metric=args.compactness_radius_metric,
         preserve_weight=args.preserve_weight,
         separate_edit_training=args.separate_edit_training,
         edit_phase_retain_recon_weight=args.edit_phase_retain_recon_weight,
@@ -558,7 +560,7 @@ if __name__ == "__main__":
         loss_tag = f"task-{args.loss_ver}" if getattr(args, "loss_ver", "") else "task-na"
         weight_tag = f"dr{_fmt_num(args.decoder_recon_weight)}_cp{_fmt_num(args.compactness_weight)}_pv{_fmt_num(args.preserve_weight)}"
         stage_tag = f"es{_fmt_num(args.edit_start_epoch)}"
-        objective_tag = f"dobj-{args.decoder_objective}_cobj-{args.compactness_objective}"
+        objective_tag = f"dobj-{args.decoder_objective}_cobj-{args.compactness_objective}_rmet-{args.compactness_radius_metric}"
 
         extra_tags = []
         if args.score_source != "dot":
@@ -641,6 +643,7 @@ if __name__ == "__main__":
         print(f"edit_phase_retain_recon_weight={args.edit_phase_retain_recon_weight} edit_phase_retain_cl_weight={args.edit_phase_retain_cl_weight}")
         print(f"phase2_task_main_loss={int(args.phase2_task_main_loss)} edit_phase_edit_weight={args.edit_phase_edit_weight}")
         print(f"phase2_freeze_encoder={int(args.phase2_freeze_encoder)} edit_phase_encoder_lr_scale={args.edit_phase_encoder_lr_scale}")
+        print(f"compactness_objective={args.compactness_objective} compactness_radius_metric={args.compactness_radius_metric} compactness_weight={args.compactness_weight}")
         print(f"decoded_edit_end_epoch={args.decoded_edit_end_epoch} decoder_warmup_in_phase1={int(args.decoder_warmup_in_phase1)} decoder_warmup_recon_weight={args.decoder_warmup_recon_weight} decoder_warmup_use_pulled_latent={int(args.decoder_warmup_use_pulled_latent)} phase2_decoder_inference_only={int(args.phase2_decoder_inference_only)}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} add_thr={args.decoded_add_threshold} remove_thr={args.decoded_remove_threshold} add_q={args.decoded_add_quantile} remove_q={args.decoded_remove_quantile} max_add={args.decoded_max_add_per_round} max_remove={args.decoded_max_remove_per_round}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} per_node_cap={args.decoded_graph_aug_bound}")

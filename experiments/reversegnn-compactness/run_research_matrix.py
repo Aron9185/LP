@@ -81,6 +81,7 @@ def parse_args():
     parser.add_argument("--decoded-add-ratio", type=float, default=0.01)
     parser.add_argument("--decoded-remove-ratio", type=float, default=0.0)
     parser.add_argument("--decoded-graph-aug-bound", type=float, default=-1.0)
+    parser.add_argument("--compactness-radius-metric", choices=["cosine", "mahalanobis"], default="cosine")
     parser.add_argument("--max-workers", type=int, default=2)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run a tiny cora-only, seed-0 smoke pass.")
@@ -217,6 +218,12 @@ def extract_metrics(log_path: Path) -> dict:
         "c0p_radius_after": summary.get("c0p_radius_after", float("nan")),
         "cp_radius_before": summary.get("cp_radius_before", float("nan")),
         "cp_radius_after": summary.get("cp_radius_after", float("nan")),
+        "noncompact_radius_before": summary.get("noncompact_radius_before", float("nan")),
+        "noncompact_radius_after": summary.get("noncompact_radius_after", float("nan")),
+        "noncompact_radius_p90_before": summary.get("noncompact_radius_p90_before", float("nan")),
+        "noncompact_radius_p90_after": summary.get("noncompact_radius_p90_after", float("nan")),
+        "noncompact_radius_max_before": summary.get("noncompact_radius_max_before", float("nan")),
+        "noncompact_radius_max_after": summary.get("noncompact_radius_max_after", float("nan")),
         "rewrite_applied": summary.get("rewrite_applied", float("nan")),
         "edit_recon": summary.get("edit_recon", float("nan")),
         "edit_keep": summary.get("edit_keep", float("nan")),
@@ -325,6 +332,7 @@ def run_one(task: tuple[dict, str, int], args) -> dict:
         "--decoded_remove_ratio", str(args.decoded_remove_ratio),
         "--decoded_graph_aug_bound", str(args.decoded_graph_aug_bound),
         "--editor_pull_strength", str(args.editor_pull_strength),
+        "--compactness_radius_metric", args.compactness_radius_metric,
         "--ver", "no",
         *cfg["flags"],
         *args.extra_flag,
@@ -446,6 +454,12 @@ def main():
         "c0p_radius_after",
         "cp_radius_before",
         "cp_radius_after",
+        "noncompact_radius_before",
+        "noncompact_radius_after",
+        "noncompact_radius_p90_before",
+        "noncompact_radius_p90_after",
+        "noncompact_radius_max_before",
+        "noncompact_radius_max_after",
         "added_edges_total",
         "removed_edges_total",
         "edit_heart_rank",

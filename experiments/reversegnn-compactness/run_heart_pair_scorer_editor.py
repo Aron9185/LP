@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument("--prediction-rank-pool-factor", type=int, default=8)
     parser.add_argument("--prediction-encoder-weight", type=float, default=0.05)
     parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
+    parser.add_argument("--compactness-radius-metric", choices=["cosine", "mahalanobis"], default="cosine")
     parser.add_argument("--decoder-normalize-input", action="store_true", help="Use normalized pair embeddings. Default uses raw pair embeddings.")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--force", action="store_true")
@@ -161,6 +162,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--decoder_type", "pair_mlp_struct",
         "--decoder_objective", "hybrid",
         "--compactness_objective", "radius",
+        "--compactness_radius_metric", args.compactness_radius_metric,
         "--decoder_rank_strategy", "heart_like",
         "--score_source", cfg["score_source"],
         "--pull_mask_scope", "cp",
@@ -281,6 +283,12 @@ def main():
         "c0p_radius_after",
         "cp_radius_before",
         "cp_radius_after",
+        "noncompact_radius_before",
+        "noncompact_radius_after",
+        "noncompact_radius_p90_before",
+        "noncompact_radius_p90_after",
+        "noncompact_radius_max_before",
+        "noncompact_radius_max_after",
         "added_edges_total",
         "removed_edges_total",
         "edit_add_rank",
