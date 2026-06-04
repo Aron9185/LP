@@ -1,4 +1,4 @@
-"""Run the HeaRT two-decoder editor matrix.
+"""Run the two-decoder editor matrix.
 
 This runner keeps pair_mlp_struct as the edit decoder and adds a residual
 structural prediction decoder trained with HeaRT-style ranking/BCE:
@@ -50,15 +50,25 @@ PAIR_SCORER_CONFIGS = [
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run HeaRT two-decoder editor experiments.")
+    parser = argparse.ArgumentParser(description="Run two-decoder editor experiments.")
     parser.add_argument("--prefix", type=str, default="heart_two_decoder_editor_smoke")
     parser.add_argument("--datasets", nargs="+", default=["cora", "citeseer"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--epochs", type=int, default=700)
+    parser.add_argument(
+        "--split-mode",
+        choices=["random", "heart", "cimage_paper"],
+        default="heart",
+        help="Dataset split passed to src/aron_main.py. Use cimage_paper for PyG RandomLinkSplit(0.1 val, 0.05 test).",
+    )
     parser.add_argument("--edit-start-epoch", type=int, default=80)
     parser.add_argument("--edit-train-start-epoch", type=int, default=80)
     parser.add_argument("--decoded-rewrite-start-epoch", type=int, default=100)
+    parser.add_argument("--decoded-rewrite-every", type=int, default=1)
     parser.add_argument("--editor-pull-strength", type=float, default=1.0)
+    parser.add_argument("--pull-mask-scope", choices=["cp", "c0p"], default="cp")
+    parser.add_argument("--compactness-mask-scope", choices=["cp", "c0p"], default="cp")
+    parser.add_argument("--rewrite-endpoint-scope", choices=["cp", "c0p"], default="c0p")
     parser.add_argument("--decoded-add-ratio", type=float, default=0.01)
     parser.add_argument("--decoded-remove-ratio", type=float, default=0.01)
     parser.add_argument("--decoded-graph-aug-bound", type=float, default=-1.0)
@@ -78,6 +88,15 @@ def parse_args():
     parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
     parser.add_argument("--compactness-radius-metric", choices=["cosine", "mahalanobis"], default="cosine")
     parser.add_argument("--decoder-normalize-input", action="store_true", help="Use normalized pair embeddings. Default uses raw pair embeddings.")
+    parser.add_argument("--eval-log-every", type=int, default=5)
+    parser.add_argument("--train-eval-every", type=int, default=1)
+    parser.add_argument("--skip-train-acc", action="store_true")
+    parser.add_argument("--decoder-diag-every", type=int, default=-1)
+    parser.add_argument("--edit-metric-every", type=int, default=1)
+    parser.add_argument("--full-matrix-eval", action="store_true", help="Forward --full_matrix_eval instead of the default edge-only eval.")
+    parser.add_argument("--heart-eval-every", type=int, default=5)
+    parser.add_argument("--heart-val-frac", type=float, default=1.0)
+    parser.add_argument("--heart-checkpoint-metric", type=str, default="hit10")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -90,9 +109,37 @@ def parse_args():
         "--extra_flag",
         action="append",
         default=[],
-        help="Extra raw flag/token to forward to src/aron_main.py. Repeat once per token.",
+        help="Extra raw flag/token to forward to src/aron_main.py. Repeat once per token. Use --split-mode instead of forwarding --split_mode.",
     )
     return parser.parse_args()
+
+
+def normalize_forwarded_flags(args) -> None:
+    """Consume legacy split-mode forwarding so the child command is unambiguous."""
+    cleaned: list[str] = []
+    tokens = list(args.extra_flag)
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in {"--split_mode", "--split-mode"}:
+            if i + 1 >= len(tokens):
+                raise ValueError(f"{token} forwarded via --extra_flag requires a value")
+            value = tokens[i + 1]
+            if value not in {"random", "heart", "cimage_paper"}:
+                raise ValueError(f"Unsupported split mode forwarded via --extra_flag: {value}")
+            args.split_mode = value
+            i += 2
+            continue
+        if token.startswith("--split_mode=") or token.startswith("--split-mode="):
+            value = token.split("=", 1)[1]
+            if value not in {"random", "heart", "cimage_paper"}:
+                raise ValueError(f"Unsupported split mode forwarded via --extra_flag: {value}")
+            args.split_mode = value
+            i += 1
+            continue
+        cleaned.append(token)
+        i += 1
+    args.extra_flag = cleaned
 
 
 def config_subset(names: list[str] | None) -> list[dict]:
@@ -145,14 +192,15 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--dataset", dataset,
         "--seed", str(seed),
         "--epochs", str(args.epochs),
-        "--split_mode", "heart",
-        "--heart_val_frac", "1.0",
-        "--heart_eval_every", "5",
-        "--heart_checkpoint_metric", "hit10",
+        "--split_mode", args.split_mode,
         "--edit_start_epoch", str(args.edit_start_epoch),
         "--edit_train_start_epoch", str(args.edit_train_start_epoch),
         "--decoded_rewrite_start_epoch", str(args.decoded_rewrite_start_epoch),
-        "--eval_log_every", "5",
+        "--decoded_rewrite_every", str(args.decoded_rewrite_every),
+        "--eval_log_every", str(args.eval_log_every),
+        "--train_eval_every", str(args.train_eval_every),
+        "--decoder_diag_every", str(args.decoder_diag_every),
+        "--edit_metric_every", str(args.edit_metric_every),
         "--run_tag", cfg["name"],
         "--ver", "no",
         "--use_edited_decoder",
@@ -165,9 +213,9 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--compactness_radius_metric", args.compactness_radius_metric,
         "--decoder_rank_strategy", "heart_like",
         "--score_source", cfg["score_source"],
-        "--pull_mask_scope", "cp",
-        "--compactness_mask_scope", "cp",
-        "--rewrite_endpoint_scope", "c0p",
+        "--pull_mask_scope", args.pull_mask_scope,
+        "--compactness_mask_scope", args.compactness_mask_scope,
+        "--rewrite_endpoint_scope", args.rewrite_endpoint_scope,
         "--decoded_same_cluster_only",
         "--decoded_require_c0p_endpoint",
         "--decoded_temporary_view_only",
@@ -191,6 +239,18 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
+    if args.skip_train_acc:
+        cmd.append("--skip_train_acc")
+    if args.full_matrix_eval:
+        cmd.append("--full_matrix_eval")
+    else:
+        cmd.append("--edge_eval")
+    if args.split_mode == "heart":
+        cmd.extend([
+            "--heart_val_frac", str(args.heart_val_frac),
+            "--heart_eval_every", str(args.heart_eval_every),
+            "--heart_checkpoint_metric", args.heart_checkpoint_metric,
+        ])
     if args.decoder_normalize_input:
         cmd.append("--decoder_normalize_input")
     else:
@@ -239,13 +299,14 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
 
 def main():
     args = parse_args()
+    normalize_forwarded_flags(args)
     configs = config_subset(args.configs)
     task_specs = [(cfg, dataset, seed) for cfg in configs for dataset in args.datasets for seed in args.seeds]
     tasks = [(idx, len(task_specs), cfg, dataset, seed) for idx, (cfg, dataset, seed) in enumerate(task_specs, start=1)]
 
     print(
-        f"HeaRT two-decoder editor matrix: {len(tasks)} runs "
-        f"(datasets={args.datasets}, seeds={args.seeds}, workers={args.max_workers})",
+        f"Two-decoder editor matrix: {len(tasks)} runs "
+        f"(split={args.split_mode}, datasets={args.datasets}, seeds={args.seeds}, workers={args.max_workers})",
         flush=True,
     )
     rows = []
@@ -289,11 +350,36 @@ def main():
         "noncompact_radius_p90_after",
         "noncompact_radius_max_before",
         "noncompact_radius_max_after",
+        "editor_noncompact_push_strength",
+        "editor_noise_push_strength",
+        "editor_push_preserve_norm",
+        "push_noncompact_count",
+        "push_noise_count",
+        "push_noncompact_anchor_cosdist_before",
+        "push_noncompact_anchor_cosdist_after",
+        "push_noise_anchor_cosdist_before",
+        "push_noise_anchor_cosdist_after",
         "added_edges_total",
         "removed_edges_total",
         "edit_add_rank",
         "edit_remove_rank",
         "edit_heart_rank",
+        "lp_full_graph",
+        "maskgae_feature_loss",
+        "maskgae_aug_feature_loss",
+        "cimage_factor_loss",
+        "cimage_cluster_loss",
+        "cimage_aug_factor_loss",
+        "cimage_aug_cluster_loss",
+        "cimage_factor_weight",
+        "cimage_cluster_weight",
+        "cimage_num_factors",
+        "cimage_num_clusters",
+        "cimage_pseudo_label_threshold",
+        "cimage_factor_select_ratio",
+        "cimage_mrmr_redundancy_weight",
+        "cimage_cluster_balance_weight",
+        "cimage_sce_power",
         "heart_rank_pairs",
         "prediction_rank",
         "prediction_bce",

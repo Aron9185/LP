@@ -2,6 +2,8 @@
 
 This report summarizes the work done after the 4/30 experiment note.
 
+For the continuation after May 14, use `post_0514_experiment_report.md`. This file remains the historical rollup from the 4/30 diagnosis through the May 14 checkpoint.
+
 Important evaluation note: the 4/30 note focused on HeaRT `samples.npy` alignment, where Hit@10 numbers were in the `20-50` range. Most results in this report are the later random-split setting, so the absolute Hit@10 numbers are not directly comparable to the 4/30 HeaRT-samples table. Within each table below, methods are compared under the same seed/split budget.
 
 ## Starting Point After 4/30
@@ -228,6 +230,38 @@ Source artifact:
 
 - `results/random_two_decoder_aug_compact_ablation_report.md`
 
+## 7. Mahalanobis Radius Diagnostic
+
+After adding `--compactness_radius_metric`, we reran the current add+compact setting and the `add000_compact000` candidate with Mahalanobis radius accounting.
+
+Setup:
+
+- seeds `0-4`
+- datasets Cora and Citeseer
+- split: random
+- config: `two_decoder_pred`
+- edit decoder: `pair_mlp_struct`
+- prediction head: `pair_residual_struct`
+- score source: `pred_decoder`
+- radius metric: `mahalanobis`
+
+| Dataset | Variant | Add Ratio | Compact W | ROC-AUC | AP | Hit@10 | Delta vs Current | Edit-Decoder Test Hit@10 | Added Edges |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Cora | current | 0.01 | 0.2 | 95.86 +/- 0.47 | 96.15 +/- 0.56 | 69.64 +/- 6.57 | +0.00 | 30.93 +/- 2.69 | 2700 |
+| Cora | `add000_compact000` | 0.00 | 0.0 | 95.89 +/- 0.44 | 96.19 +/- 0.53 | 69.87 +/- 5.04 | +0.23 | 63.30 +/- 8.23 | 0 |
+| Citeseer | current | 0.01 | 0.2 | 96.22 +/- 0.55 | 96.67 +/- 0.40 | 72.84 +/- 2.98 | +0.00 | 14.07 +/- 0.66 | 2340 |
+| Citeseer | `add000_compact000` | 0.00 | 0.0 | 96.22 +/- 0.60 | 96.67 +/- 0.40 | 73.98 +/- 1.86 | +1.14 | 60.92 +/- 2.46 | 0 |
+
+Conclusion: Mahalanobis radius accounting does not rescue the add+compact setting. The no-add/no-compact candidate is still tied or better on ROC-AUC/AP/Hit@10, and the edit-decoder-only diagnostic is much healthier without decoded additions.
+
+This does not replace the recommended 10-seed confirmation, because it only covers seeds `0-4`.
+
+Source artifacts:
+
+- `results/random_two_decoder_mahalanobis_current_20260515b_summary.csv`
+- `results/random_two_decoder_mahalanobis_add000_compact000_20260515b_summary.csv`
+- `results/mahalanobis_diag_20260515b_driver.log`
+
 ## Final Diagnosis For This Commit
 
 1. **The separate structure-aware prediction head is the main win.**
@@ -248,7 +282,7 @@ Source artifact:
 
 5. **Compactness is not currently a reliable objective.**
 
-   Stronger/frozen compactness can move radius more, but it does not improve ROC-AUC/AP/Hit@10 and can hurt badly.
+   Stronger/frozen compactness can move radius more, but it does not improve ROC-AUC/AP/Hit@10 and can hurt badly. The Mahalanobis diagnostic also does not make the add+compact setting look better.
 
 6. **The edit-decoder diagnostic is not enough.**
 
@@ -273,8 +307,9 @@ This candidate is called `add000_compact000` in the augmentation/compactness abl
 
 ## Recommended Next Steps
 
-1. Confirm `add000_compact000` to 10 seeds on Cora and Citeseer, checking ROC-AUC/AP/Hit@10 together.
+1. Confirm `add000_compact000` to 10 seeds on Cora and Citeseer, checking ROC-AUC/AP/Hit@10 together. The Mahalanobis run was still only seeds `0-4`.
 2. If `add000_compact000` holds, simplify the method by disabling decoded graph additions and compactness.
 3. Keep removal disabled.
 4. Keep `pair_mlp_struct` as the shared edit decoder unless future 10-seed evidence says otherwise.
-5. Focus future work on prediction-head training/selection rather than stronger compactness or edit-decoder-only diagnostics.
+5. After the 10-seed confirmation, improve augmentation and pulling as separate mechanisms: measure edge proposals, pull targets, and final prediction quality independently.
+6. Keep prediction-head training/selection as the other main improvement path, and avoid optimizing stronger compactness or edit-decoder-only diagnostics unless they improve ROC-AUC/AP/Hit@10.

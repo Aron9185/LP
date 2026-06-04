@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 from ogb.linkproppred import Evaluator
 from tqdm import tqdm
 from preprocessing import *
-from model import VGNAE_ENCODER, VGAE_ENCODER, dot_product_decode, MLP, LogReg
+from model import VGNAE_ENCODER, VGAE_ENCODER, MaskGAE_ENCODER, CIMAGELite_ENCODER, CIMAGEFull_ENCODER, dot_product_decode, MLP, LogReg
 from loss import loss_function, inter_view_CL_loss, intra_view_CL_loss, Cluster
 from utils import *
 from input_data import CalN2V
@@ -251,6 +251,23 @@ def _structural_pair_features_from_adj(adj_like) -> tuple[np.ndarray, np.ndarray
     )
 
 
+def _dense_binary_adj_feature(adj_like) -> np.ndarray:
+    adj_csr = _adjacency_to_binary_csr(adj_like)
+    return adj_csr.toarray().astype(np.float32, copy=False)
+
+
+def _torch_sparse_binary_adj(adj_like, *, device: torch.device) -> torch.Tensor:
+    adj_csr = _adjacency_to_binary_csr(adj_like).tocoo()
+    if adj_csr.nnz == 0:
+        indices = torch.empty((2, 0), dtype=torch.long, device=device)
+        values = torch.empty((0,), dtype=torch.float32, device=device)
+    else:
+        indices_np = np.vstack([adj_csr.row, adj_csr.col]).astype(np.int64, copy=False)
+        indices = torch.as_tensor(indices_np, dtype=torch.long, device=device)
+        values = torch.as_tensor(adj_csr.data.astype(np.float32, copy=False), dtype=torch.float32, device=device)
+    return torch.sparse_coo_tensor(indices, values, size=adj_csr.shape, device=device).coalesce()
+
+
 class StructuralPairGraphDecoder(nn.Module):
     """Chunked pair MLP with embedding, graph-structural, and cluster features."""
 
@@ -277,8 +294,20 @@ class StructuralPairGraphDecoder(nn.Module):
         self.register_buffer("cn_feat", torch.empty(0, 0), persistent=False)
         self.register_buffer("ra_feat", torch.empty(0, 0), persistent=False)
         self.register_buffer("aa_feat", torch.empty(0, 0), persistent=False)
+        self.register_buffer("adj_feat", torch.empty(0, 0), persistent=False)
+        self.register_buffer(
+            "adj_sparse_feat",
+            torch.sparse_coo_tensor(
+                torch.empty((2, 0), dtype=torch.long),
+                torch.empty((0,), dtype=torch.float32),
+                size=(0, 0),
+            ).coalesce(),
+            persistent=False,
+        )
         self.register_buffer("label_ids", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("core_mask", torch.empty(0, dtype=torch.bool), persistent=False)
+        self._pair_feature_cache_key = None
+        self._pair_feature_cache = {}
 
     def set_graph_context(self, adj_like) -> None:
         device = next(self.parameters()).device
@@ -287,6 +316,9 @@ class StructuralPairGraphDecoder(nn.Module):
         self.cn_feat = torch.as_tensor(cn, dtype=torch.float32, device=device)
         self.ra_feat = torch.as_tensor(ra, dtype=torch.float32, device=device)
         self.aa_feat = torch.as_tensor(aa, dtype=torch.float32, device=device)
+        self.adj_feat = torch.as_tensor(_dense_binary_adj_feature(adj_like), dtype=torch.float32, device=device)
+        self.adj_sparse_feat = _torch_sparse_binary_adj(adj_like, device=device)
+        self._clear_pair_feature_cache()
 
     def set_cluster_context(self, labels: np.ndarray | None, core_mask: torch.Tensor | None) -> None:
         device = next(self.parameters()).device
@@ -301,6 +333,10 @@ class StructuralPairGraphDecoder(nn.Module):
             self.core_mask = torch.zeros((n_nodes,), dtype=torch.bool, device=device)
         else:
             self.core_mask = core_mask.to(device=device).bool()
+
+    def _clear_pair_feature_cache(self) -> None:
+        self._pair_feature_cache_key = None
+        self._pair_feature_cache = {}
 
     def _node_vector(self, buf: torch.Tensor, n_nodes: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         if buf.numel() != n_nodes:
@@ -328,6 +364,28 @@ class StructuralPairGraphDecoder(nn.Module):
             proto = F.normalize(Xc.mean(dim=0, keepdim=True), p=2, dim=1)
             out[idx] = 1.0 - (Xc @ proto.t()).squeeze(1)
         return out
+
+    def _extra_pair_matrix_scalar_features(
+        self,
+        Z: torch.Tensor,
+        start: int,
+        end: int,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        return []
+
+    def _extra_pair_scalar_features(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        return []
 
     def forward(self, Z: torch.Tensor) -> torch.Tensor:
         X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
@@ -366,24 +424,35 @@ class StructuralPairGraphDecoder(nn.Module):
             cp_v = non_noise.to(X.dtype).view(1, -1).expand(rows, -1)
             proto_u = proto_dist[start:end].view(-1, 1).expand(-1, n_nodes)
             proto_v = proto_dist.view(1, -1).expand(rows, -1)
+            scalar_list = [
+                raw_dot.squeeze(-1),
+                cosine.squeeze(-1),
+                deg_u,
+                deg_v,
+                torch.abs(deg_u - deg_v),
+                cn[start:end],
+                ra[start:end],
+                aa[start:end],
+                same_cluster,
+                core_u,
+                core_v,
+                cp_u,
+                cp_v,
+                proto_u,
+                proto_v,
+            ]
+            scalar_list.extend(
+                self._extra_pair_matrix_scalar_features(
+                    Z,
+                    start,
+                    end,
+                    n_nodes,
+                    X.dtype,
+                    X.device,
+                )
+            )
             scalar_feats = torch.stack(
-                [
-                    raw_dot.squeeze(-1),
-                    cosine.squeeze(-1),
-                    deg_u,
-                    deg_v,
-                    torch.abs(deg_u - deg_v),
-                    cn[start:end],
-                    ra[start:end],
-                    aa[start:end],
-                    same_cluster,
-                    core_u,
-                    core_v,
-                    cp_u,
-                    cp_v,
-                    proto_u,
-                    proto_v,
-                ],
+                scalar_list,
                 dim=-1,
             )
             pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
@@ -443,24 +512,35 @@ class StructuralPairGraphDecoder(nn.Module):
             cp_v = non_noise.index_select(0, v).to(X.dtype).view(-1, 1)
             proto_u = proto_dist.index_select(0, u).view(-1, 1)
             proto_v = proto_dist.index_select(0, v).view(-1, 1)
+            scalar_parts = [
+                raw_dot,
+                cosine,
+                deg_u,
+                deg_v,
+                torch.abs(deg_u - deg_v),
+                cn[u, v].view(-1, 1),
+                ra[u, v].view(-1, 1),
+                aa[u, v].view(-1, 1),
+                same_cluster,
+                core_u,
+                core_v,
+                cp_u,
+                cp_v,
+                proto_u,
+                proto_v,
+            ]
+            scalar_parts.extend(
+                self._extra_pair_scalar_features(
+                    Z,
+                    u,
+                    v,
+                    n_nodes,
+                    X.dtype,
+                    X.device,
+                )
+            )
             scalar_feats = torch.cat(
-                [
-                    raw_dot,
-                    cosine,
-                    deg_u,
-                    deg_v,
-                    torch.abs(deg_u - deg_v),
-                    cn[u, v].view(-1, 1),
-                    ra[u, v].view(-1, 1),
-                    aa[u, v].view(-1, 1),
-                    same_cluster,
-                    core_u,
-                    core_v,
-                    cp_u,
-                    cp_v,
-                    proto_u,
-                    proto_v,
-                ],
+                scalar_parts,
                 dim=-1,
             )
             pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
@@ -523,24 +603,35 @@ class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
             cp_v = non_noise.to(X.dtype).view(1, -1).expand(rows, -1)
             proto_u = proto_dist[start:end].view(-1, 1).expand(-1, n_nodes)
             proto_v = proto_dist.view(1, -1).expand(rows, -1)
+            scalar_list = [
+                raw_dot,
+                cosine.squeeze(-1),
+                deg_u,
+                deg_v,
+                torch.abs(deg_u - deg_v),
+                cn[start:end],
+                ra[start:end],
+                aa[start:end],
+                same_cluster,
+                core_u,
+                core_v,
+                cp_u,
+                cp_v,
+                proto_u,
+                proto_v,
+            ]
+            scalar_list.extend(
+                self._extra_pair_matrix_scalar_features(
+                    Z,
+                    start,
+                    end,
+                    n_nodes,
+                    X.dtype,
+                    X.device,
+                )
+            )
             scalar_feats = torch.stack(
-                [
-                    raw_dot,
-                    cosine.squeeze(-1),
-                    deg_u,
-                    deg_v,
-                    torch.abs(deg_u - deg_v),
-                    cn[start:end],
-                    ra[start:end],
-                    aa[start:end],
-                    same_cluster,
-                    core_u,
-                    core_v,
-                    cp_u,
-                    cp_v,
-                    proto_u,
-                    proto_v,
-                ],
+                scalar_list,
                 dim=-1,
             )
             pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
@@ -600,24 +691,35 @@ class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
             cp_v = non_noise.index_select(0, v).to(X.dtype).view(-1, 1)
             proto_u = proto_dist.index_select(0, u).view(-1, 1)
             proto_v = proto_dist.index_select(0, v).view(-1, 1)
+            scalar_parts = [
+                raw_dot,
+                cosine,
+                deg_u,
+                deg_v,
+                torch.abs(deg_u - deg_v),
+                cn[u, v].view(-1, 1),
+                ra[u, v].view(-1, 1),
+                aa[u, v].view(-1, 1),
+                same_cluster,
+                core_u,
+                core_v,
+                cp_u,
+                cp_v,
+                proto_u,
+                proto_v,
+            ]
+            scalar_parts.extend(
+                self._extra_pair_scalar_features(
+                    Z,
+                    u,
+                    v,
+                    n_nodes,
+                    X.dtype,
+                    X.device,
+                )
+            )
             scalar_feats = torch.cat(
-                [
-                    raw_dot,
-                    cosine,
-                    deg_u,
-                    deg_v,
-                    torch.abs(deg_u - deg_v),
-                    cn[u, v].view(-1, 1),
-                    ra[u, v].view(-1, 1),
-                    aa[u, v].view(-1, 1),
-                    same_cluster,
-                    core_u,
-                    core_v,
-                    cp_u,
-                    cp_v,
-                    proto_u,
-                    proto_v,
-                ],
+                scalar_parts,
                 dim=-1,
             )
             pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
@@ -639,6 +741,85 @@ class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
             + self._score_pairs_one_way(Z, dst, src, batch_size=batch_size)
         )
         return torch.where(src == dst, torch.zeros_like(logits), logits)
+
+
+class NCNCResidualStructuralPairPredictionDecoder(ResidualStructuralPairPredictionDecoder):
+    """Residual prediction decoder with an NCNC-style completed-CN feature."""
+
+    scalar_dim = 16
+
+    def _completion_cache_key(self, Z: torch.Tensor) -> tuple:
+        return (
+            int(Z.data_ptr()),
+            int(getattr(Z, "_version", 0)),
+            int(Z.size(0)),
+            int(Z.size(1)),
+            str(Z.device),
+            str(Z.dtype),
+        )
+
+    def _ncnc_residual_cn_matrix(
+        self,
+        Z: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        adj_dense = self._pair_matrix(self.adj_feat, n_nodes, dtype, device)
+        if adj_dense.numel() == 0 or tuple(adj_dense.shape) != (n_nodes, n_nodes):
+            return torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device)
+        if self.adj_sparse_feat.numel() == 0 or tuple(self.adj_sparse_feat.shape) != (n_nodes, n_nodes):
+            return torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device)
+
+        key = self._completion_cache_key(Z)
+        if self._pair_feature_cache_key == key and "ncnc_residual_cn" in self._pair_feature_cache:
+            return self._pair_feature_cache["ncnc_residual_cn"].to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            z_detached = Z.detach()
+            raw_prob = torch.sigmoid(z_detached @ z_detached.t()).to(dtype=dtype, device=device)
+            missing_mask = (1.0 - adj_dense).clamp_min(0.0)
+            missing_mask.fill_diagonal_(0.0)
+            prob_missing = raw_prob * missing_mask
+            prob_missing.fill_diagonal_(0.0)
+
+            adj_sparse = self.adj_sparse_feat.to(device=device, dtype=dtype).coalesce()
+            one_side = torch.sparse.mm(adj_sparse, prob_missing)
+            residual_cn = one_side + one_side.t()
+            residual_cn.fill_diagonal_(0.0)
+            residual_cn = torch.log1p(residual_cn.clamp_min(0.0))
+            max_val = residual_cn.max()
+            if bool(torch.isfinite(max_val)) and float(max_val.item()) > 0.0:
+                residual_cn = residual_cn / max_val.clamp_min(1e-12)
+            residual_cn = residual_cn.to(device=device, dtype=dtype)
+
+        self._pair_feature_cache_key = key
+        self._pair_feature_cache = {"ncnc_residual_cn": residual_cn}
+        return residual_cn
+
+    def _extra_pair_matrix_scalar_features(
+        self,
+        Z: torch.Tensor,
+        start: int,
+        end: int,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        residual_cn = self._ncnc_residual_cn_matrix(Z, n_nodes, dtype, device)
+        return [residual_cn[start:end]]
+
+    def _extra_pair_scalar_features(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        residual_cn = self._ncnc_residual_cn_matrix(Z, n_nodes, dtype, device)
+        return [residual_cn[src, dst].view(-1, 1)]
 
 
 def reconstruction_bce_loss(
@@ -908,6 +1089,7 @@ def hybrid_decoder_structure_losses_pairwise(
     same_cluster_only: bool,
     require_c0p_endpoint: bool,
     require_both_c0p: bool,
+    require_c0p_noncompact_endpoint: bool,
     keep_weight: float,
     add_rank_weight: float,
     remove_rank_weight: float,
@@ -925,6 +1107,7 @@ def hybrid_decoder_structure_losses_pairwise(
         same_cluster_only=same_cluster_only,
         require_c0p_endpoint=require_c0p_endpoint,
         require_both_c0p=require_both_c0p,
+        require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
     )
     debug_info = _empty_decoder_debug_info()
     debug_info.update(
@@ -1055,6 +1238,7 @@ def build_decoded_augmented_graph_from_decoder(
         same_cluster_only=bool(kwargs.get("same_cluster_only", True)),
         require_c0p_endpoint=bool(kwargs.get("require_c0p_endpoint", True)),
         require_both_c0p=bool(kwargs.get("require_both_c0p", False)),
+        require_c0p_noncompact_endpoint=bool(kwargs.get("require_c0p_noncompact_endpoint", False)),
         deg0_excl_self=kwargs.get("deg0_excl_self", None),
     )
     cand = ctx["add_pairs"] | ctx["removable_pairs"]
@@ -1152,6 +1336,7 @@ def _build_decoded_pair_context(
     same_cluster_only: bool = True,
     require_c0p_endpoint: bool = True,
     require_both_c0p: bool = False,
+    require_c0p_noncompact_endpoint: bool = False,
     deg0_excl_self: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     device = adj_current_dense.device
@@ -1176,7 +1361,10 @@ def _build_decoded_pair_context(
         non_noise = lbl_t != -1
         same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & non_noise[:, None] & non_noise[None, :]
 
-    if require_both_c0p:
+    if require_c0p_noncompact_endpoint:
+        noncompact_cp = non_noise & (~core_mask)
+        endpoint_ok = (core_mask[:, None] & noncompact_cp[None, :]) | (noncompact_cp[:, None] & core_mask[None, :])
+    elif require_both_c0p:
         endpoint_ok = core_mask[:, None] & core_mask[None, :]
     elif require_c0p_endpoint:
         endpoint_ok = core_mask[:, None] | core_mask[None, :]
@@ -1206,6 +1394,8 @@ def _build_decoded_pair_context(
         "eye": eye,
         "existing": existing,
         "core_mask": core_mask,
+        "same_cluster": same_cluster,
+        "non_noise": non_noise,
         "valid_pairs": valid_pairs,
         "add_pairs": add_pairs,
         "removable_pairs": removable_pairs,
@@ -1462,6 +1652,7 @@ def hybrid_decoder_structure_losses(
     same_cluster_only: bool,
     require_c0p_endpoint: bool,
     require_both_c0p: bool,
+    require_c0p_noncompact_endpoint: bool,
     keep_weight: float,
     add_rank_weight: float,
     remove_rank_weight: float,
@@ -1479,6 +1670,7 @@ def hybrid_decoder_structure_losses(
         same_cluster_only=same_cluster_only,
         require_c0p_endpoint=require_c0p_endpoint,
         require_both_c0p=require_both_c0p,
+        require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
     )
 
     keep_mask = ~ctx["valid_pairs"]
@@ -1648,9 +1840,10 @@ def prototype_compactness_loss(
         sel_idx = idx_t[sel_mask]
         X = F.normalize(Z_edit.index_select(0, sel_idx), p=2, dim=1)
         proto = F.normalize(X.mean(dim=0, keepdim=True), p=2, dim=1)
+        target_id = len(prototypes)
         prototypes.append(proto.squeeze(0))
         supervised_idx.append(sel_idx)
-        targets.append(torch.full((sel_idx.numel(),), cluster_pos, dtype=torch.long, device=Z_edit.device))
+        targets.append(torch.full((sel_idx.numel(),), target_id, dtype=torch.long, device=Z_edit.device))
 
     if len(prototypes) <= 1:
         return Z_edit.new_tensor(0.0)
@@ -1711,15 +1904,58 @@ def dynamic_c0p_targets(
     return labels_epoch, c0p_mask_epoch.bool().detach()
 
 
+def _empty_pull_push_diagnostics(
+    *,
+    push_scope: str = "none",
+    noncompact_push_strength: float = 0.0,
+    noise_push_strength: float = 0.0,
+    preserve_norm: bool = True,
+) -> dict[str, float]:
+    return {
+        "editor_noncompact_push_strength": float(noncompact_push_strength),
+        "editor_noise_push_strength": float(noise_push_strength),
+        "editor_push_preserve_norm": float(int(bool(preserve_norm))),
+        "push_noncompact_count": 0.0,
+        "push_noise_count": 0.0,
+        "push_noncompact_anchor_cosdist_before": float("nan"),
+        "push_noncompact_anchor_cosdist_after": float("nan"),
+        "push_noise_anchor_cosdist_before": float("nan"),
+        "push_noise_anchor_cosdist_after": float("nan"),
+    }
+
+
+def _mean_cosine_distance(X: torch.Tensor, Y: torch.Tensor) -> float:
+    if X.numel() == 0 or Y.numel() == 0:
+        return float("nan")
+    sim = F.cosine_similarity(X, Y, dim=1, eps=1e-12)
+    return float((1.0 - sim).mean().detach().cpu())
+
+
 def direct_pull_latent_per_cluster(
     Z: torch.Tensor,
     labels: np.ndarray | None,
     node_mask: torch.Tensor | None,
     pull_strength: float = 0.20,
-) -> torch.Tensor:
+    *,
+    c0p_mask: torch.Tensor | None = None,
+    push_scope: str = "none",
+    noncompact_push_strength: float = 0.0,
+    noise_push_strength: float = 0.0,
+    push_preserve_norm: bool = True,
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    push_scope_eff = str(push_scope or "none").lower()
+    if push_scope_eff not in {"none", "noncompact_cp", "noise", "noncompact_cp_and_noise"}:
+        push_scope_eff = "none"
+    diag = _empty_pull_push_diagnostics(
+        push_scope=push_scope_eff,
+        noncompact_push_strength=noncompact_push_strength,
+        noise_push_strength=noise_push_strength,
+        preserve_norm=push_preserve_norm,
+    )
     if labels is None:
-        return Z
-    labels_np = np.asarray(labels)
+        return (Z, diag) if return_diagnostics else Z
+    labels_np = np.asarray(labels, dtype=np.int64)
     Z_edit = Z.clone()
     if node_mask is None:
         node_mask = torch.ones(Z.size(0), dtype=torch.bool, device=Z.device)
@@ -1738,7 +1974,82 @@ def direct_pull_latent_per_cluster(
         sel_Z = Z.index_select(0, sel_idx)
         center = sel_Z.mean(dim=0, keepdim=True)
         Z_edit[sel_idx] = sel_Z + pull_strength * (center - sel_Z)
-    return Z_edit
+
+    if push_scope_eff == "none" or (
+        float(noncompact_push_strength) <= 0.0 and float(noise_push_strength) <= 0.0
+    ):
+        return (Z_edit, diag) if return_diagnostics else Z_edit
+
+    device = Z.device
+    lbl_t = torch.as_tensor(labels_np, device=device, dtype=torch.long)
+    non_noise = lbl_t != -1
+    if c0p_mask is None:
+        c0p_mask_t = torch.zeros(Z.size(0), dtype=torch.bool, device=device)
+    else:
+        c0p_mask_t = c0p_mask.to(device).bool() & non_noise
+
+    cluster_ids = sorted(set(labels_np.tolist()) - {-1})
+    anchor_by_cluster: dict[int, torch.Tensor] = {}
+    anchor_rows = []
+    for c in cluster_ids:
+        cluster_mask = lbl_t == int(c)
+        cluster_idx = cluster_mask.nonzero(as_tuple=True)[0]
+        if cluster_idx.numel() == 0:
+            continue
+        c0p_idx = (cluster_mask & c0p_mask_t).nonzero(as_tuple=True)[0]
+        anchor_idx = c0p_idx if c0p_idx.numel() > 0 else cluster_idx
+        anchor = Z_edit.index_select(0, anchor_idx).mean(dim=0)
+        anchor_by_cluster[int(c)] = anchor
+        anchor_rows.append(anchor)
+
+    if not anchor_rows:
+        return (Z_edit, diag) if return_diagnostics else Z_edit
+
+    def _apply_push(sel_idx: torch.Tensor, anchors: torch.Tensor, strength: float) -> tuple[float, float]:
+        if sel_idx.numel() == 0 or float(strength) <= 0.0:
+            return float("nan"), float("nan")
+        before = Z_edit.index_select(0, sel_idx)
+        before_dist = _mean_cosine_distance(before, anchors)
+        pushed = before + float(strength) * (before - anchors)
+        if push_preserve_norm:
+            orig_norm = Z.index_select(0, sel_idx).norm(dim=1, keepdim=True).clamp_min(1e-12)
+            pushed_norm = pushed.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            pushed = pushed * (orig_norm / pushed_norm)
+        Z_edit[sel_idx] = pushed
+        after_dist = _mean_cosine_distance(Z_edit.index_select(0, sel_idx), anchors)
+        return before_dist, after_dist
+
+    if push_scope_eff in {"noncompact_cp", "noncompact_cp_and_noise"} and float(noncompact_push_strength) > 0.0:
+        noncompact_mask = non_noise & (~c0p_mask_t)
+        sel_parts = []
+        anchor_parts = []
+        for c, anchor in anchor_by_cluster.items():
+            sel_idx = (noncompact_mask & (lbl_t == int(c))).nonzero(as_tuple=True)[0]
+            if sel_idx.numel() == 0:
+                continue
+            sel_parts.append(sel_idx)
+            anchor_parts.append(anchor.view(1, -1).expand(sel_idx.numel(), -1))
+        if sel_parts:
+            sel_idx_all = torch.cat(sel_parts, dim=0)
+            anchors_all = torch.cat(anchor_parts, dim=0)
+            before, after = _apply_push(sel_idx_all, anchors_all, float(noncompact_push_strength))
+            diag["push_noncompact_count"] = float(sel_idx_all.numel())
+            diag["push_noncompact_anchor_cosdist_before"] = before
+            diag["push_noncompact_anchor_cosdist_after"] = after
+
+    if push_scope_eff in {"noise", "noncompact_cp_and_noise"} and float(noise_push_strength) > 0.0:
+        noise_idx = (lbl_t == -1).nonzero(as_tuple=True)[0]
+        if noise_idx.numel() > 0:
+            anchor_mat = torch.stack(anchor_rows, dim=0)
+            sims = F.normalize(Z_edit.index_select(0, noise_idx), p=2, dim=1) @ F.normalize(anchor_mat, p=2, dim=1).t()
+            nearest = sims.argmax(dim=1)
+            anchors = anchor_mat.index_select(0, nearest)
+            before, after = _apply_push(noise_idx, anchors, float(noise_push_strength))
+            diag["push_noise_count"] = float(noise_idx.numel())
+            diag["push_noise_anchor_cosdist_before"] = before
+            diag["push_noise_anchor_cosdist_after"] = after
+
+    return (Z_edit, diag) if return_diagnostics else Z_edit
 
 
 def cluster_compactness_loss(
@@ -1823,6 +2134,165 @@ def noncompact_node_mask(cp_mask: torch.Tensor | None, c0p_mask: torch.Tensor | 
     return cp_mask.to(c0p_mask.device).bool() & (~c0p_mask.bool())
 
 
+def _cluster_intra_degree(adj_dense: torch.Tensor, labels: np.ndarray | None) -> torch.Tensor:
+    """Degree induced by each node's assigned non-noise cluster, excluding self-loops."""
+    if labels is None:
+        return _deg_excl_self(adj_dense)
+    device = adj_dense.device
+    labels_np = np.asarray(labels, dtype=np.int64)
+    lbl_t = torch.from_numpy(labels_np).to(device=device, dtype=torch.long)
+    non_noise = lbl_t != -1
+    same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & non_noise[:, None] & non_noise[None, :]
+    g = ((adj_dense > 0) | (adj_dense.t() > 0)).to(torch.float32)
+    g.fill_diagonal_(0.0)
+    return (g * same_cluster.to(g.dtype)).sum(dim=1).to(torch.long)
+
+
+def _cluster_min_degree_summary(
+    adj_dense: torch.Tensor,
+    labels: np.ndarray | None,
+    node_mask: torch.Tensor | None,
+    *,
+    target: int = -1,
+) -> dict[str, float]:
+    """Summarize per-cluster minimum intra-cluster degree for the selected nodes."""
+    empty = {
+        "clusters": 0,
+        "worst_min": float("nan"),
+        "mean_min": float("nan"),
+        "need_nodes": 0,
+        "bad_clusters": 0,
+    }
+    if labels is None:
+        return empty
+    device = adj_dense.device
+    labels_np = np.asarray(labels, dtype=np.int64)
+    lbl_t = torch.from_numpy(labels_np).to(device=device, dtype=torch.long)
+    non_noise = lbl_t != -1
+    scope_mask = non_noise if node_mask is None else (node_mask.to(device).bool() & non_noise)
+    if not bool(scope_mask.any().item()):
+        return empty
+
+    intra_deg = _cluster_intra_degree(adj_dense, labels)
+    cluster_mins: list[float] = []
+    need_nodes = 0
+    bad_clusters = 0
+    target_eff = int(target)
+    for cluster_id in torch.unique(lbl_t[scope_mask]).detach().cpu().tolist():
+        idx = scope_mask & (lbl_t == int(cluster_id))
+        if not bool(idx.any().item()):
+            continue
+        vals = intra_deg[idx]
+        min_val = float(vals.min().item())
+        cluster_mins.append(min_val)
+        if target_eff > 0:
+            below = vals < target_eff
+            need_nodes += int(below.sum().item())
+            bad_clusters += int(bool(below.any().item()))
+    if not cluster_mins:
+        return empty
+    return {
+        "clusters": len(cluster_mins),
+        "worst_min": float(min(cluster_mins)),
+        "mean_min": float(np.mean(cluster_mins)),
+        "need_nodes": need_nodes,
+        "bad_clusters": bad_clusters,
+    }
+
+
+def _decoded_add_degree_target_mask(
+    ctx: dict[str, torch.Tensor],
+    target_deg0: torch.Tensor,
+    target: int,
+    mode: str,
+) -> tuple[torch.Tensor, str]:
+    """Choose which nodes the degree-target add pass should try to repair."""
+    mode_eff = str(mode or "rewrite").lower()
+    allowed = {"rewrite", "cp", "cluster_deficit", "rewrite_or_cluster_deficit"}
+    if mode_eff not in allowed:
+        mode_eff = "rewrite"
+
+    rewrite_mask = ctx["core_mask"].bool()
+    cp_mask = ctx["non_noise"].bool()
+    deficit_mask = cp_mask & (target_deg0 < int(target))
+    if mode_eff == "rewrite":
+        target_mask = rewrite_mask
+    elif mode_eff == "cp":
+        target_mask = cp_mask
+    elif mode_eff == "cluster_deficit":
+        target_mask = deficit_mask
+    else:
+        target_mask = rewrite_mask | deficit_mask
+    return target_mask.bool(), mode_eff
+
+
+def _graph_diff_summary(
+    base_dense: torch.Tensor,
+    view_dense: torch.Tensor,
+    labels: np.ndarray | None = None,
+    node_mask: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Undirected edge-set difference between two graph views, excluding self-loops."""
+    device = view_dense.device
+    n_nodes = view_dense.size(0)
+    upper = torch.triu(torch.ones((n_nodes, n_nodes), dtype=torch.bool, device=device), diagonal=1)
+    base = ((base_dense.to(device) > 0) | (base_dense.to(device).t() > 0)) & upper
+    view = ((view_dense > 0) | (view_dense.t() > 0)) & upper
+    added = view & (~base)
+    removed = base & (~view)
+    intersection = base & view
+    union = base | view
+
+    base_edges = int(base.sum().item())
+    view_edges = int(view.sum().item())
+    added_edges = int(added.sum().item())
+    removed_edges = int(removed.sum().item())
+    symdiff_edges = added_edges + removed_edges
+    union_edges = int(union.sum().item())
+    intersection_edges = int(intersection.sum().item())
+
+    same_cluster_added = float("nan")
+    same_cluster_removed = float("nan")
+    cross_cluster_added = float("nan")
+    cross_cluster_removed = float("nan")
+    target_touch_added = float("nan")
+    target_touch_removed = float("nan")
+    if labels is not None:
+        labels_np = np.asarray(labels, dtype=np.int64)
+        lbl_t = torch.from_numpy(labels_np).to(device=device, dtype=torch.long)
+        non_noise = lbl_t != -1
+        same_cluster = (lbl_t[:, None] == lbl_t[None, :]) & non_noise[:, None] & non_noise[None, :]
+        same_cluster = same_cluster & upper
+        cp_pair = non_noise[:, None] & non_noise[None, :] & upper
+        same_cluster_added = int((added & same_cluster).sum().item())
+        same_cluster_removed = int((removed & same_cluster).sum().item())
+        cross_cluster_added = int((added & cp_pair & (~same_cluster)).sum().item())
+        cross_cluster_removed = int((removed & cp_pair & (~same_cluster)).sum().item())
+    if node_mask is not None:
+        target = node_mask.to(device).bool()
+        target_touch = (target[:, None] | target[None, :]) & upper
+        target_touch_added = int((added & target_touch).sum().item())
+        target_touch_removed = int((removed & target_touch).sum().item())
+
+    return {
+        "base_edges": base_edges,
+        "view_edges": view_edges,
+        "added_vs_base": added_edges,
+        "removed_vs_base": removed_edges,
+        "symdiff_edges": symdiff_edges,
+        "edge_jaccard": intersection_edges / float(max(1, union_edges)),
+        "diff_frac_base": symdiff_edges / float(max(1, base_edges)),
+        "add_frac_base": added_edges / float(max(1, base_edges)),
+        "remove_frac_base": removed_edges / float(max(1, base_edges)),
+        "same_cluster_added": same_cluster_added,
+        "same_cluster_removed": same_cluster_removed,
+        "cross_cluster_added": cross_cluster_added,
+        "cross_cluster_removed": cross_cluster_removed,
+        "target_touch_added": target_touch_added,
+        "target_touch_removed": target_touch_removed,
+    }
+
+
 def non_target_preservation_loss(Z_edit: torch.Tensor, Z_base: torch.Tensor, node_mask: torch.Tensor | None) -> torch.Tensor:
     if node_mask is None:
         return Z_edit.new_tensor(0.0)
@@ -1874,11 +2344,16 @@ def build_decoded_augmented_graph(
     max_add: int | None = None,
     max_remove: int | None = None,
     per_node_cap_frac: float = 0.10,
+    add_degree_target: int | None = None,
+    add_degree_target_scope: str = "total",
+    add_degree_target_nodes: str = "rewrite",
+    guarantee_degree_target: bool = False,
     deg0_excl_self: torch.Tensor | None = None,
     degree_floor: int = 0,
     same_cluster_only: bool = True,
     require_c0p_endpoint: bool = True,
     require_both_c0p: bool = False,
+    require_c0p_noncompact_endpoint: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
     """
     Rewrite the current graph using decoder scores from the pulled latent.
@@ -1904,19 +2379,49 @@ def build_decoded_augmented_graph(
         same_cluster_only=same_cluster_only,
         require_c0p_endpoint=require_c0p_endpoint,
         require_both_c0p=require_both_c0p,
+        require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
         deg0_excl_self=deg0_excl_self,
     )
     g = ctx["graph_dense"].clone().to(score.dtype)
     eye = ctx["eye"]
     existing = ctx["existing"]
     valid_pairs = ctx["valid_pairs"]
+    same_cluster = ctx["same_cluster"]
     deg0 = ctx["deg0"]
+    deg_now = deg0.clone().to(torch.long)
     if per_node_cap_frac is None or float(per_node_cap_frac) <= 0:
         node_caps = torch.full((N,), N, dtype=torch.long, device=device)
     else:
         base_deg = torch.clamp(deg0, min=1)
         node_caps = torch.ceil(float(per_node_cap_frac) * base_deg.float()).to(torch.long)
         node_caps = torch.clamp(node_caps, min=1)
+    add_degree_target_eff = -1 if add_degree_target is None else int(add_degree_target)
+    guarantee_degree_target_eff = bool(guarantee_degree_target)
+    add_degree_target_scope_eff = str(add_degree_target_scope or "total").lower()
+    if add_degree_target_scope_eff not in {"total", "intra_cluster"}:
+        add_degree_target_scope_eff = "total"
+    target_deg0 = deg0
+    if add_degree_target_scope_eff == "intra_cluster":
+        target_deg0 = _cluster_intra_degree(g, labels).to(device=device, dtype=torch.long)
+    target_deg_now = target_deg0.clone().to(torch.long)
+    add_degree_target_mask, add_degree_target_nodes_eff = _decoded_add_degree_target_mask(
+        ctx,
+        target_deg0,
+        add_degree_target_eff,
+        add_degree_target_nodes,
+    )
+    add_degree_target_enabled = add_degree_target_eff > 0 and bool(add_degree_target_mask.any().item())
+    if add_degree_target_enabled:
+        target_deficit0 = torch.clamp(
+            torch.full_like(target_deg0, add_degree_target_eff) - target_deg0,
+            min=0,
+        )
+        target_deficit0 = torch.where(
+            add_degree_target_mask,
+            target_deficit0,
+            torch.zeros_like(target_deficit0),
+        )
+        node_caps = torch.maximum(node_caps, target_deficit0)
     node_add_used = torch.zeros(N, dtype=torch.long, device=device)
 
     add_budget = max(0, int(round(float(add_ratio) * float(max(1, E0)))))
@@ -1942,30 +2447,107 @@ def build_decoded_augmented_graph(
             keep = add_scores >= thr
             ii, jj, add_scores = ii[keep], jj[keep], add_scores[keep]
     if ii.numel() > 0:
-        order = torch.argsort(add_scores, descending=True)
-        limit = len(order)
+        score_order = torch.argsort(add_scores, descending=True)
+        limit = len(score_order)
         if add_threshold is None and add_quantile is None:
             limit = min(limit, add_budget)
         if max_add is not None:
             limit = min(limit, int(max_add))
-        for idx in order[:limit].tolist():
-            i = int(ii[idx].item())
-            j = int(jj[idx].item())
-            if node_add_used[i] >= node_caps[i] or node_add_used[j] >= node_caps[j]:
-                continue
-            if g[i, j] > 0:
-                continue
-            g[i, j] = 1.0
-            g[j, i] = 1.0
-            node_add_used[i] += 1
-            node_add_used[j] += 1
-            added += 1
-            if max_add is None and add_threshold is None and add_quantile is None and added >= add_budget:
-                break
-            if max_add is not None and added >= int(max_add):
-                break
+        if add_degree_target_enabled:
+            pair_deficit = torch.maximum(target_deficit0.index_select(0, ii), target_deficit0.index_select(0, jj))
+            pair_deficit_sum = target_deficit0.index_select(0, ii) + target_deficit0.index_select(0, jj)
+            degree_key = pair_deficit.float() * 1_000_000.0 + pair_deficit_sum.float() * 1_000.0 + add_scores
+            degree_order = torch.argsort(degree_key, descending=True)
+        else:
+            degree_order = score_order.new_empty((0,))
 
-    deg_now = _deg_excl_self(g)
+        repair_added = 0
+        repair_limit = limit
+
+        def _try_add_candidates(
+            order_idx: torch.Tensor,
+            require_active_deficit: bool,
+            *,
+            limit_eff: int,
+            enforce_node_caps: bool,
+        ) -> None:
+            nonlocal added
+            for idx in order_idx.tolist():
+                if added >= limit_eff:
+                    break
+                i = int(ii[idx].item())
+                j = int(jj[idx].item())
+                if require_active_deficit:
+                    if add_degree_target_scope_eff == "intra_cluster" and not bool(same_cluster[i, j].item()):
+                        continue
+                    i_needs = bool(add_degree_target_mask[i].item()) and int(target_deg_now[i].item()) < add_degree_target_eff
+                    j_needs = bool(add_degree_target_mask[j].item()) and int(target_deg_now[j].item()) < add_degree_target_eff
+                    if not (i_needs or j_needs):
+                        continue
+                if enforce_node_caps and (node_add_used[i] >= node_caps[i] or node_add_used[j] >= node_caps[j]):
+                    continue
+                if g[i, j] > 0:
+                    continue
+                g[i, j] = 1.0
+                g[j, i] = 1.0
+                deg_now[i] += 1
+                deg_now[j] += 1
+                if add_degree_target_scope_eff == "total" or bool(same_cluster[i, j].item()):
+                    target_deg_now[i] += 1
+                    target_deg_now[j] += 1
+                node_add_used[i] += 1
+                node_add_used[j] += 1
+                added += 1
+
+        if add_degree_target_enabled:
+            repair_start = int(added)
+            repair_limit = len(degree_order) if guarantee_degree_target_eff else limit
+            if max_add is not None:
+                repair_limit = min(repair_limit, int(max_add))
+            _try_add_candidates(
+                degree_order,
+                require_active_deficit=True,
+                limit_eff=repair_limit,
+                enforce_node_caps=not guarantee_degree_target_eff,
+            )
+            repair_added = int(added) - repair_start
+        if added < limit:
+            _try_add_candidates(
+                score_order,
+                require_active_deficit=False,
+                limit_eff=limit,
+                enforce_node_caps=True,
+            )
+
+        if add_degree_target_enabled:
+            before_need = int(((target_deficit0 > 0) & add_degree_target_mask).sum().item())
+            after_need = int(((target_deg_now < add_degree_target_eff) & add_degree_target_mask).sum().item())
+            min_target_deg = int(target_deg_now[add_degree_target_mask].min().item()) if bool(add_degree_target_mask.any().item()) else -1
+            target_mask_nodes = int(add_degree_target_mask.sum().item())
+            cluster_before = _cluster_min_degree_summary(
+                ctx["graph_dense"],
+                labels,
+                add_degree_target_mask,
+                target=add_degree_target_eff,
+            )
+            cluster_after = _cluster_min_degree_summary(
+                g,
+                labels,
+                add_degree_target_mask,
+                target=add_degree_target_eff,
+            )
+            print(
+                f"[DECODED-DEG] target={add_degree_target_eff} scope={add_degree_target_scope_eff} "
+                f"target_nodes={add_degree_target_nodes_eff} target_mask_nodes={target_mask_nodes} "
+                f"guarantee_target={int(guarantee_degree_target_eff)} repair_added={repair_added} "
+                f"need_before={before_need} need_after={after_need} unrepaired={after_need} "
+                f"min_target_deg={min_target_deg} add_limit={limit} repair_limit={repair_limit} "
+                f"cluster_bad_before={int(cluster_before['bad_clusters'])} "
+                f"cluster_bad_after={int(cluster_after['bad_clusters'])} "
+                f"cluster_worst_min_before={cluster_before['worst_min']:.6f} "
+                f"cluster_worst_min_after={cluster_after['worst_min']:.6f}"
+            )
+
     cand_rem = ctx["removable_pairs"].clone()
     cand_rem.fill_diagonal_(False)
     ii, jj = cand_rem.triu(1).nonzero(as_tuple=True)
@@ -2152,12 +2734,19 @@ def train_encoder(
     preserve_weight = float(kwargs.get("preserve_weight", 0.0))
     editor_hidden = int(kwargs.get("editor_hidden", hidden2 * 2))
     editor_pull_strength = float(kwargs.get("editor_pull_strength", 0.20))
+    editor_push_scope = str(kwargs.get("editor_push_scope", "none") or "none").lower()
+    if editor_push_scope not in {"none", "noncompact_cp", "noise", "noncompact_cp_and_noise"}:
+        raise ValueError("editor_push_scope must be one of: none, noncompact_cp, noise, noncompact_cp_and_noise")
+    editor_noncompact_push_strength = float(kwargs.get("editor_noncompact_push_strength", 0.0))
+    editor_noise_push_strength = float(kwargs.get("editor_noise_push_strength", 0.0))
+    editor_push_preserve_norm = bool(kwargs.get("editor_push_preserve_norm", True))
     editor_edit_scale = float(kwargs.get("editor_edit_scale", 0.10))
     edit_start_epoch = int(kwargs.get("edit_start_epoch", 0))
     edit_train_start_arg = int(kwargs.get("edit_train_start_epoch", -1))
     decoded_rewrite_start_arg = int(kwargs.get("decoded_rewrite_start_epoch", -1))
     edit_train_start_epoch = edit_start_epoch if edit_train_start_arg < 0 else edit_train_start_arg
     decoded_rewrite_start_epoch = edit_start_epoch if decoded_rewrite_start_arg < 0 else decoded_rewrite_start_arg
+    decoded_rewrite_every = max(1, int(kwargs.get("decoded_rewrite_every", 1)))
     if prediction_joint_start_epoch < 0:
         prediction_joint_start_epoch = decoded_rewrite_start_epoch
     freeze_c0p_at_edit_start = bool(kwargs.get("freeze_c0p_at_edit_start", True))
@@ -2173,11 +2762,25 @@ def train_encoder(
     decoded_same_cluster_only = bool(kwargs.get("decoded_same_cluster_only", False))
     decoded_require_c0p_endpoint = bool(kwargs.get("decoded_require_c0p_endpoint", False))
     decoded_require_both_c0p = bool(kwargs.get("decoded_require_both_c0p", False))
+    decoded_require_c0p_noncompact_endpoint = bool(kwargs.get("decoded_require_c0p_noncompact_endpoint", False))
     decoded_graph_aug_bound = kwargs.get("decoded_graph_aug_bound", None)
+    decoded_add_degree_target = int(kwargs.get("decoded_add_degree_target", -1) or -1)
+    decoded_add_degree_target_scope = str(kwargs.get("decoded_add_degree_target_scope", "total") or "total").lower()
+    if decoded_add_degree_target_scope not in {"total", "intra_cluster"}:
+        raise ValueError("decoded_add_degree_target_scope must be one of: total, intra_cluster")
+    decoded_add_degree_target_nodes = str(kwargs.get("decoded_add_degree_target_nodes", "rewrite") or "rewrite").lower()
+    if decoded_add_degree_target_nodes not in {"rewrite", "cp", "cluster_deficit", "rewrite_or_cluster_deficit"}:
+        raise ValueError("decoded_add_degree_target_nodes must be one of: rewrite, cp, cluster_deficit, rewrite_or_cluster_deficit")
+    decoded_guarantee_degree_target = bool(kwargs.get("decoded_guarantee_degree_target", False))
     decoded_degree_floor = kwargs.get("decoded_degree_floor", None)
     decoded_accumulate_into_base = bool(kwargs.get("decoded_accumulate_into_base", True))
     decoded_edit_end_epoch = kwargs.get("decoded_edit_end_epoch", -1)
     eval_log_every = int(kwargs.get("eval_log_every", 10))
+    train_eval_every = max(1, int(kwargs.get("train_eval_every", 1)))
+    skip_train_acc = bool(kwargs.get("skip_train_acc", False))
+    decoder_diag_every = int(kwargs.get("decoder_diag_every", -1))
+    edit_metric_every = int(kwargs.get("edit_metric_every", 1))
+    edge_eval = bool(kwargs.get("edge_eval", True))
     separate_edit_training = bool(kwargs.get("separate_edit_training", False))
     edit_phase_retain_recon_weight = float(kwargs.get("edit_phase_retain_recon_weight", 0.0))
     edit_phase_retain_cl_weight = float(kwargs.get("edit_phase_retain_cl_weight", 0.0))
@@ -2193,6 +2796,39 @@ def train_encoder(
     pull_mask_scope = str(kwargs.get("pull_mask_scope", "cp"))
     compactness_mask_scope = str(kwargs.get("compactness_mask_scope", "cp"))
     rewrite_endpoint_scope = str(kwargs.get("rewrite_endpoint_scope", "c0p"))
+    raw_ae_backbone = str(kwargs.get("ae_backbone", "vgnae")).lower()
+    ae_backbone = "vgnae" if raw_ae_backbone == "vgae" else raw_ae_backbone
+    ae_backbone = "cimage_full" if ae_backbone == "cimage" else ae_backbone
+    if ae_backbone not in {"vgnae", "maskgae", "cimage_lite", "cimage_full"}:
+        raise ValueError(f"Unsupported ae_backbone={raw_ae_backbone}; use vgnae, vgae, maskgae, cimage_lite, or cimage_full.")
+    maskgae_mask_rate = float(kwargs.get("maskgae_mask_rate", 0.3))
+    maskgae_feature_weight = float(kwargs.get("maskgae_feature_weight", 1.0))
+    cimage_factor_weight = float(kwargs.get("cimage_factor_weight", 0.1))
+    cimage_cluster_weight = float(kwargs.get("cimage_cluster_weight", 0.1))
+    cimage_num_factors = int(kwargs.get("cimage_num_factors", 8))
+    cimage_num_clusters = int(kwargs.get("cimage_num_clusters", 16))
+    cimage_cluster_alpha = float(kwargs.get("cimage_cluster_alpha", 1.0))
+    cimage_pseudo_label_threshold = float(kwargs.get("cimage_pseudo_label_threshold", 0.90))
+    cimage_factor_select_ratio = float(kwargs.get("cimage_factor_select_ratio", 0.50))
+    cimage_mrmr_redundancy_weight = float(kwargs.get("cimage_mrmr_redundancy_weight", 0.20))
+    cimage_cluster_balance_weight = float(kwargs.get("cimage_cluster_balance_weight", 0.05))
+    cimage_sce_power = float(kwargs.get("cimage_sce_power", 2.0))
+    if maskgae_mask_rate < 0.0 or maskgae_mask_rate > 1.0:
+        raise ValueError(f"maskgae_mask_rate must be in [0, 1], got {maskgae_mask_rate}")
+    if maskgae_feature_weight < 0.0:
+        raise ValueError(f"maskgae_feature_weight must be >= 0, got {maskgae_feature_weight}")
+    if cimage_factor_weight < 0.0 or cimage_cluster_weight < 0.0:
+        raise ValueError("cimage_factor_weight and cimage_cluster_weight must be >= 0")
+    if cimage_num_factors <= 0 or cimage_num_clusters <= 0:
+        raise ValueError("cimage_num_factors and cimage_num_clusters must be positive")
+    if not (0.0 <= cimage_pseudo_label_threshold <= 1.0):
+        raise ValueError("cimage_pseudo_label_threshold must be in [0, 1]")
+    if not (0.0 < cimage_factor_select_ratio < 1.0):
+        raise ValueError("cimage_factor_select_ratio must be in (0, 1)")
+    if cimage_mrmr_redundancy_weight < 0.0 or cimage_cluster_balance_weight < 0.0:
+        raise ValueError("cimage_mrmr_redundancy_weight and cimage_cluster_balance_weight must be >= 0")
+    if cimage_sce_power <= 0.0:
+        raise ValueError("cimage_sce_power must be positive")
 
 
     # ------------------------------------------------------------
@@ -2202,6 +2838,10 @@ def train_encoder(
     split_mode = str(kwargs.get("split_mode", "random")).lower()
     heart_data_dir = str(kwargs.get("heart_data_dir", "dataset"))
     heart_filename = str(kwargs.get("heart_filename", "samples.npy"))
+    lp_train_graph = str(kwargs.get("lp_train_graph", "train")).lower()
+    if lp_train_graph not in {"train", "full"}:
+        raise ValueError(f"Unsupported lp_train_graph={lp_train_graph}; use train or full.")
+    lp_full_graph_protocol = lp_train_graph == "full"
 
     is_heart = (split_mode == "heart")
 
@@ -2246,6 +2886,13 @@ def train_encoder(
         if split_mode == "heart":
             print(f"[SPLIT] HeaRT | root={heart_data_dir} | filename={heart_filename}")
             adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false =  mask_test_edges_heart(adj, dataset_str, heart_root=heart_data_dir, filename=heart_filename)
+        elif split_mode == "cimage_paper":
+            print("[SPLIT] CIMAGE paper RandomLinkSplit | num_val=0.1 num_test=0.05")
+            adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges_cimage_paper(
+                adj,
+                dataset_str,
+                split_seed=seed,
+            )
         else:
             print(f"[SPLIT] random old mask_test_edges | split_seed={seed}")
             adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges(
@@ -2285,20 +2932,40 @@ def train_encoder(
             f"[HeaRT-EVAL] fixed val subset per run: {keep_num}/{num_val_full} "
             f"({keep_num / max(1, num_val_full):.3f}) | eval_every={heart_eval_every}"
         )
-    else:
+    elif is_heart:
         print("[HeaRT-EVAL] full validation used during training")
+    else:
+        print("[EVAL] random split full validation/test used during training")
 
     heart_full_val_during_training = bool(is_heart and len(val_edges_eval) == len(val_edges))
     if is_heart:
         print(f"[HeaRT-EVAL] checkpoint_metric=val_{heart_checkpoint_metric}")
 
-    adj = adj_train
-    train_mask = torch.ones(num_nodes*num_nodes, dtype = torch.bool, requires_grad = False).to(device)
+    if lp_full_graph_protocol:
+        full_adj_train = adj_orig.copy().tocsr()
+        full_edges_triu = sparse_to_tuple(sp.triu(full_adj_train))[0]
+        print(
+            f"[LP-PROTOCOL] full graph leakage enabled: encoder/reconstruction use all observed edges "
+            f"| split_train_edges={len(train_edges)} full_train_edges={len(full_edges_triu)} "
+            f"| heldout_val={len(val_edges)} heldout_test={len(test_edges)}"
+        )
+        adj_train = full_adj_train
+        train_edges = np.asarray(full_edges_triu, dtype=np.int64)
+    else:
+        print("[LP-PROTOCOL] no-leak train graph: encoder/reconstruction use train split only")
 
-    for r, c in val_edges:
-        train_mask[num_nodes * r + c] = False
-    for r, c in test_edges:
-        train_mask[num_nodes * r + c] = False
+    adj = adj_train
+
+    def _make_reconstruction_train_mask() -> torch.Tensor:
+        mask = torch.ones(num_nodes * num_nodes, dtype=torch.bool, requires_grad=False, device=device)
+        if not lp_full_graph_protocol:
+            for r, c in val_edges:
+                mask[num_nodes * r + c] = False
+            for r, c in test_edges:
+                mask[num_nodes * r + c] = False
+        return mask
+
+    train_mask = _make_reconstruction_train_mask()
     training_instance_number = torch.sum(train_mask).item()
 
     train_edges_t = torch.as_tensor(np.asarray(train_edges, dtype=np.int64), dtype=torch.long, device=device)
@@ -2366,7 +3033,38 @@ def train_encoder(
         return adj_train_new, edge_index_new, adj_norm_new, adj_label_new, pos_weight_new, norm_new, weight_tensor_new
 
     # init model and optimizer
-    encoder = VGNAE_ENCODER(feat_dim, hidden1, hidden2, dropout, device).to(device) # encoder = VGAE_ENCODER(feat_dim, hidden1, hidden2, dropout, device).to(device)
+    if ae_backbone == "maskgae":
+        encoder = MaskGAE_ENCODER(feat_dim, hidden1, hidden2, dropout, device, mask_rate=maskgae_mask_rate).to(device)
+    elif ae_backbone == "cimage_lite":
+        encoder = CIMAGELite_ENCODER(
+            feat_dim,
+            hidden1,
+            hidden2,
+            dropout,
+            device,
+            mask_rate=maskgae_mask_rate,
+            num_factors=cimage_num_factors,
+            num_clusters=cimage_num_clusters,
+            cluster_alpha=cimage_cluster_alpha,
+        ).to(device)
+    elif ae_backbone == "cimage_full":
+        encoder = CIMAGEFull_ENCODER(
+            feat_dim,
+            hidden1,
+            hidden2,
+            dropout,
+            device,
+            mask_rate=maskgae_mask_rate,
+            num_factors=cimage_num_factors,
+            num_clusters=cimage_num_clusters,
+            pseudo_label_threshold=cimage_pseudo_label_threshold,
+            factor_select_ratio=cimage_factor_select_ratio,
+            mrmr_redundancy_weight=cimage_mrmr_redundancy_weight,
+            cluster_balance_weight=cimage_cluster_balance_weight,
+            sce_power=cimage_sce_power,
+        ).to(device)
+    else:
+        encoder = VGNAE_ENCODER(feat_dim, hidden1, hidden2, dropout, device).to(device) # encoder = VGAE_ENCODER(feat_dim, hidden1, hidden2, dropout, device).to(device)
 
     graph_decoder = None
     if use_edited_decoder:
@@ -2399,9 +3097,16 @@ def train_encoder(
             normalize_input=decoder_normalize_input,
             max_pair_rows=mlp_pair_max_rows,
         ).to(device)
+    elif prediction_decoder_type == "pair_residual_struct_ncnc":
+        prediction_decoder = NCNCResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+        ).to(device)
     else:
         raise ValueError(
-            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none' or 'pair_residual_struct'."
+            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', or 'pair_residual_struct_ncnc'."
         )
 
     def _set_struct_decoder_context(
@@ -2429,12 +3134,12 @@ def train_encoder(
         print("[DECODER] pair_mlp_struct edit graph context initialized from train graph")
     if isinstance(prediction_decoder, StructuralPairGraphDecoder):
         _set_prediction_decoder_context(adj_train, None, None)
-        print("[PRED-DECODER] pair_residual_struct graph context initialized from train graph")
+        print(f"[PRED-DECODER] {prediction_decoder_type} graph context initialized from train graph")
 
     if score_source == "decoder" and graph_decoder is None:
         raise ValueError("score_source=decoder requires --use_edited_decoder so an edit decoder is available.")
     if score_source == "pred_decoder" and prediction_decoder is None:
-        raise ValueError("score_source=pred_decoder requires --prediction_decoder_type pair_residual_struct.")
+        raise ValueError("score_source=pred_decoder requires a structural prediction decoder.")
 
     def _score_adjacency(z: torch.Tensor) -> torch.Tensor:
         if score_source == "decoder":
@@ -2442,6 +3147,25 @@ def train_encoder(
         if score_source == "pred_decoder":
             return prediction_decoder(z)
         return dot_product_decode(z)
+
+    def _edge_score_values_for_source(z: torch.Tensor, edges) -> np.ndarray:
+        if score_source == "decoder":
+            return _edge_score_values_from_decoder(graph_decoder, z, edges)
+        if score_source == "pred_decoder":
+            return _edge_score_values_from_decoder(prediction_decoder, z, edges)
+        return _edge_score_values_from_dot(z, edges)
+
+    def _evaluate_edges_for_source(
+        z: torch.Tensor,
+        edges_pos,
+        edges_neg,
+        score_matrix_np: np.ndarray | None = None,
+    ):
+        if score_matrix_np is not None:
+            return get_scores(dataset_str, edges_pos, edges_neg, score_matrix_np, adj_orig)
+        pos_scores = _edge_score_values_for_source(z, edges_pos)
+        neg_scores = _edge_score_values_for_source(z, edges_neg)
+        return get_scores_from_values(pos_scores, neg_scores)
 
     def _set_module_requires_grad(module: nn.Module | None, flag: bool):
         if module is None:
@@ -2485,13 +3209,51 @@ def train_encoder(
 
     optimizer = _build_main_optimizer()
     phase2_optimizer_activated = False
+    cimage_backbones = {"cimage_lite", "cimage_full"}
+
+    def _encoder_reconstruction_loss(A_pred_cur: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        beta_eff = 0.0 if ae_backbone in {"maskgae"} | cimage_backbones else beta
+        recon_cur = loss_function(
+            A_pred_cur,
+            adj_label,
+            encoder.mean,
+            encoder.logstd,
+            norm,
+            weight_tensor,
+            alpha,
+            beta_eff,
+            train_mask,
+        )
+        feature_loss = A_pred_cur.new_tensor(0.0)
+        if ae_backbone in {"maskgae", "cimage_lite"} and maskgae_feature_weight != 0.0:
+            feature_loss = encoder.masked_feature_loss()
+            recon_cur = recon_cur + maskgae_feature_weight * feature_loss
+        cimage_factor_loss = A_pred_cur.new_tensor(0.0)
+        cimage_cluster_loss = A_pred_cur.new_tensor(0.0)
+        if ae_backbone in cimage_backbones:
+            cimage_factor_loss, cimage_cluster_loss = encoder.cimage_losses()
+            recon_cur = (
+                recon_cur
+                + cimage_factor_weight * cimage_factor_loss
+                + cimage_cluster_weight * cimage_cluster_loss
+            )
+        return recon_cur, feature_loss, cimage_factor_loss, cimage_cluster_loss
 
     if use_edited_decoder:
         print(
             f"[PATH] edited-decoder path active | decoder={decoder_type} | normalize_input={decoder_normalize_input} | "
+            f"ae_backbone={ae_backbone}"
+            f"{' (vgae alias)' if raw_ae_backbone == 'vgae' else ''}"
+            f"{' (cimage alias)' if raw_ae_backbone == 'cimage' else ''} | "
+            f"maskgae_mask_rate={maskgae_mask_rate} maskgae_feature_w={maskgae_feature_weight} | "
+            f"cimage_factor_w={cimage_factor_weight} cimage_cluster_w={cimage_cluster_weight} "
+            f"cimage_factors={cimage_num_factors} cimage_clusters={cimage_num_clusters} "
+            f"cimage_pseudo_thr={cimage_pseudo_label_threshold} cimage_factor_select={cimage_factor_select_ratio} "
+            f"cimage_mrmr_red={cimage_mrmr_redundancy_weight} cimage_balance={cimage_cluster_balance_weight} "
+            f"cimage_sce_power={cimage_sce_power} | "
             f"freeze_c0p={freeze_c0p_at_edit_start} | decoded_graph_augment={use_decoded_graph_augment} | "
             f"accumulate_base={decoded_accumulate_into_base} | edit_start_epoch={edit_start_epoch} | "
-            f"edit_train_start={edit_train_start_epoch} | rewrite_start={decoded_rewrite_start_epoch} | edit_end_epoch={decoded_edit_end_epoch} | "
+            f"edit_train_start={edit_train_start_epoch} | rewrite_start={decoded_rewrite_start_epoch} | rewrite_every={decoded_rewrite_every} | edit_end_epoch={decoded_edit_end_epoch} | "
             f"separate_edit_training={separate_edit_training} | retain_recon={edit_phase_retain_recon_weight} | retain_cl={edit_phase_retain_cl_weight} | "
             f"add_ratio={decoded_add_ratio} remove_ratio={decoded_remove_ratio} | "
             f"add_thr={decoded_add_threshold} remove_thr={decoded_remove_threshold} | "
@@ -2506,10 +3268,17 @@ def train_encoder(
             f"heart_rank_w={heart_rank_weight} heart_margin={heart_rank_margin} "
             f"heart_neg_k={heart_rank_neg_k} heart_pool_factor={heart_rank_pool_factor} | "
             f"compactness_weight={compactness_weight} | preserve_weight={preserve_weight} | "
+            f"c0p_noncompact_endpoint={int(decoded_require_c0p_noncompact_endpoint)} | "
+            f"decoded_add_degree_target={decoded_add_degree_target} | "
+            f"decoded_add_degree_target_scope={decoded_add_degree_target_scope} | "
+            f"decoded_add_degree_target_nodes={decoded_add_degree_target_nodes} | "
+            f"decoded_guarantee_degree_target={decoded_guarantee_degree_target} | "
             f"phase2_freeze_encoder={phase2_freeze_encoder} | edit_phase_encoder_lr_scale={edit_phase_encoder_lr_scale} | "
             f"decoder_warmup_in_phase1={decoder_warmup_in_phase1} | decoder_warmup_recon_weight={decoder_warmup_recon_weight} | "
             f"decoder_warmup_use_pulled_latent={decoder_warmup_use_pulled_latent} | "
             f"pull_strength={editor_pull_strength} | compactness_weight={compactness_weight} | "
+            f"push_scope={editor_push_scope} | noncompact_push={editor_noncompact_push_strength} | "
+            f"noise_push={editor_noise_push_strength} | push_preserve_norm={int(editor_push_preserve_norm)} | "
             f"pull_scope={pull_mask_scope} | compactness_scope={compactness_mask_scope} | rewrite_scope={rewrite_endpoint_scope}"
         )
     if prediction_decoder is not None:
@@ -2520,7 +3289,21 @@ def train_encoder(
             f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight}"
         )
     if not use_edited_decoder and prediction_decoder is None:
-        print("[PATH] baseline dot-product path active")
+        print(
+            f"[PATH] baseline dot-product path active | ae_backbone={ae_backbone}"
+            f"{' (vgae alias)' if raw_ae_backbone == 'vgae' else ''}"
+            f"{' (cimage alias)' if raw_ae_backbone == 'cimage' else ''} | "
+            f"maskgae_mask_rate={maskgae_mask_rate} maskgae_feature_w={maskgae_feature_weight}"
+            f" cimage_factor_w={cimage_factor_weight} cimage_cluster_w={cimage_cluster_weight}"
+            f" cimage_factors={cimage_num_factors} cimage_clusters={cimage_num_clusters}"
+            f" cimage_pseudo_thr={cimage_pseudo_label_threshold} cimage_factor_select={cimage_factor_select_ratio}"
+        )
+    print(
+        f"[EVAL-POLICY] eval_log_every={eval_log_every} train_eval_every={train_eval_every} "
+        f"skip_train_acc={int(skip_train_acc)} decoder_diag_every={decoder_diag_every} "
+        f"edit_metric_every={edit_metric_every} edge_eval={int(edge_eval)} heart_eval_every={heart_eval_every} "
+        f"heart_val_frac={heart_val_frac}"
+    )
 
     def _edit_allowed_before_end(ep: int) -> bool:
         try:
@@ -2538,6 +3321,13 @@ def train_encoder(
         if not (use_edited_decoder and (graph_decoder is not None)):
             return False
         return ep >= decoded_rewrite_start_epoch and _edit_allowed_before_end(ep)
+
+    def _decoded_rewrite_due(ep: int) -> bool:
+        if not _decoded_edit_active(ep):
+            return False
+        if ep == decoded_rewrite_start_epoch or ep == num_epoch - 1:
+            return True
+        return ((ep - decoded_rewrite_start_epoch) % decoded_rewrite_every) == 0
 
     def _decoder_warmup_active(ep: int) -> bool:
         return bool(
@@ -2810,7 +3600,7 @@ def train_encoder(
                 optimizer.zero_grad()
                 Z0 = encoder(features, edge_index)  # original edges
                 A_pred0 = dot_product_decode(Z0)
-                recon0 = loss_function(A_pred0, adj_label, encoder.mean, encoder.logstd, norm, weight_tensor, alpha, beta, train_mask)
+                recon0, maskgae_feat0, cimage_factor0, cimage_cluster0 = _encoder_reconstruction_loss(A_pred0)
                 # only intra-view CL during pretrain
                 if loss_ver == "nei":
                     cl0 = inter_view_CL_loss(device, Z0, Z0, adj_label, gamma, temperature)
@@ -2820,7 +3610,15 @@ def train_encoder(
                 loss0.backward()
                 optimizer.step()
                 if (pe+1) % 20 == 0 or pe == 0:
-                    print(f"[pretrain] epoch {pe+1}/{pretrain_epochs} loss={float(loss0):.4f}")
+                    msg = f"[pretrain] epoch {pe+1}/{pretrain_epochs} loss={float(loss0):.4f}"
+                    if ae_backbone in {"maskgae", "cimage_lite"}:
+                        msg += f" maskgae_feat={float(maskgae_feat0.detach().cpu()):.4f}"
+                    if ae_backbone in cimage_backbones:
+                        msg += (
+                            f" cimage_factor={float(cimage_factor0.detach().cpu()):.4f}"
+                            f" cimage_cluster={float(cimage_cluster0.detach().cpu()):.4f}"
+                        )
+                    print(msg)
 
             with torch.no_grad():
                 Z0 = encoder(features, edge_index)
@@ -3019,11 +3817,7 @@ def train_encoder(
                 
                 # ---- rebuild all training tensors on the pruned train graph ----
                 # 1) train_mask & training_instance_number
-                train_mask = torch.ones(num_nodes * num_nodes, dtype=torch.bool, requires_grad=False).to(device)
-                for r, c in val_edges:
-                    train_mask[num_nodes * r + c] = False
-                for r, c in test_edges:
-                    train_mask[num_nodes * r + c] = False
+                train_mask = _make_reconstruction_train_mask()
                 training_instance_number = torch.sum(train_mask).item()
 
                 # 2) APPNP / edge_index on pruned graph
@@ -3243,8 +4037,15 @@ def train_encoder(
         modification_ratio = 0.0
         decoded_rewrite_applied_this_epoch = False
         decoded_pre_graph_dense_epoch = None
+        decoded_pre_rewrite_graph_dense_epoch = None
         decoded_metric_labels_epoch = None
         decoded_metric_mask_epoch = None
+        pull_push_diag_epoch = _empty_pull_push_diagnostics(
+            push_scope=editor_push_scope,
+            noncompact_push_strength=editor_noncompact_push_strength,
+            noise_push_strength=editor_noise_push_strength,
+            preserve_norm=editor_push_preserve_norm,
+        )
         encoder.train()
         if graph_decoder is not None:
             graph_decoder.train()
@@ -3318,7 +4119,12 @@ def train_encoder(
 
                 # adjusted_weight_tensor = weight_tensor * torch.abs(A_pred.view(-1)[train_mask] - adj_label.to_dense().view(-1)[train_mask]).detach()
                 # recon_loss = loss_function(A_pred, adj_label, encoder.mean, encoder.logstd, norm, adjusted_weight_tensor, alpha, beta, train_mask)
-        recon_loss = loss_function(A_pred, adj_label, encoder.mean, encoder.logstd, norm, weight_tensor, alpha, beta, train_mask)
+        (
+            recon_loss,
+            maskgae_feat_loss,
+            cimage_factor_loss,
+            cimage_cluster_loss,
+        ) = _encoder_reconstruction_loss(A_pred)
         if(loss_ver=="nei"):
             ori_intra_CL = inter_view_CL_loss(device, Z, Z, adj_label, gamma, temperature)
         else:
@@ -3999,8 +4805,9 @@ def train_encoder(
             decoded_mask_epoch = None
             decoded_graph_added = 0
             decoded_graph_removed = 0
-            if use_decoded_graph_augment and _decoded_edit_active(epoch):
+            if use_decoded_graph_augment and _decoded_rewrite_due(epoch):
                 try:
+                    decoded_pre_rewrite_graph_dense_epoch = g.detach().clone()
                     decoded_degree_floor_eff = max(0, int(degree_threshold) - 1) if decoded_degree_floor is None else int(decoded_degree_floor)
                     decoded_bound_eff = None if (decoded_graph_aug_bound is None or float(decoded_graph_aug_bound) <= 0) else float(decoded_graph_aug_bound)
 
@@ -4011,11 +4818,16 @@ def train_encoder(
                         decoded_mask_epoch = static_decoded_mask
                         decoded_graph_added = static_decoded_graph_added
                         decoded_graph_removed = static_decoded_graph_removed
+                        decoded_rewrite_applied_this_epoch = True
                         print(
                             f"[EDIT-GRAPH][E{epoch:04d}] reuse_static=1 built_epoch={static_decoded_built_epoch} "
                             f"add={decoded_graph_added} remove={decoded_graph_removed} "
                             f"same_cluster_only={decoded_same_cluster_only} c0p_endpoint={decoded_require_c0p_endpoint} "
-                            f"per_node_cap={decoded_bound_eff} accumulate_base={decoded_accumulate_into_base}"
+                            f"c0p_noncompact_endpoint={decoded_require_c0p_noncompact_endpoint} "
+                            f"per_node_cap={decoded_bound_eff} add_degree_target={decoded_add_degree_target} "
+                            f"add_degree_target_scope={decoded_add_degree_target_scope} "
+                            f"add_degree_target_nodes={decoded_add_degree_target_nodes} "
+                            f"guarantee_degree_target={decoded_guarantee_degree_target} accumulate_base={decoded_accumulate_into_base}"
                         )
                     else:
                         if decoded_accumulate_into_base:
@@ -4035,13 +4847,32 @@ def train_encoder(
                         decoded_cp_mask_epoch = torch.tensor((decoded_labels_epoch != -1), dtype=torch.bool, device=Z.device) if decoded_labels_epoch is not None else None
                         decoded_pull_mask_epoch = decoded_c0p_mask_epoch if pull_mask_scope == "c0p" else decoded_cp_mask_epoch
                         decoded_rewrite_mask_epoch = decoded_c0p_mask_epoch if rewrite_endpoint_scope == "c0p" else decoded_cp_mask_epoch
-                        z_pull_seed = direct_pull_latent_per_cluster(
+                        z_pull_seed, pull_push_diag_epoch = direct_pull_latent_per_cluster(
                             Z.detach(),
                             decoded_labels_epoch,
                             decoded_pull_mask_epoch,
                             pull_strength=editor_pull_strength,
+                            c0p_mask=decoded_c0p_mask_epoch,
+                            push_scope=editor_push_scope,
+                            noncompact_push_strength=editor_noncompact_push_strength,
+                            noise_push_strength=editor_noise_push_strength,
+                            push_preserve_norm=editor_push_preserve_norm,
+                            return_diagnostics=True,
                         )
-                        _set_struct_decoder_context(g, decoded_labels_epoch, decoded_c0p_mask_epoch)
+                        print(
+                            f"[PULL-PUSH][E{epoch:04d}] scope={editor_push_scope} "
+                            f"pull_scope={pull_mask_scope} pull_strength={editor_pull_strength:.6f} "
+                            f"noncompact_push={editor_noncompact_push_strength:.6f} noise_push={editor_noise_push_strength:.6f} "
+                            f"preserve_norm={int(editor_push_preserve_norm)} "
+                            f"noncompact_count={int(pull_push_diag_epoch['push_noncompact_count'])} "
+                            f"noise_count={int(pull_push_diag_epoch['push_noise_count'])} "
+                            f"noncompact_cosdist_before={pull_push_diag_epoch['push_noncompact_anchor_cosdist_before']:.6f} "
+                            f"noncompact_cosdist_after={pull_push_diag_epoch['push_noncompact_anchor_cosdist_after']:.6f} "
+                            f"noise_cosdist_before={pull_push_diag_epoch['push_noise_anchor_cosdist_before']:.6f} "
+                            f"noise_cosdist_after={pull_push_diag_epoch['push_noise_anchor_cosdist_after']:.6f}"
+                        )
+                        decoder_graph_context = None if ((not decoded_accumulate_into_base) and ver == "no") else g
+                        _set_struct_decoder_context(decoder_graph_context, decoded_labels_epoch, decoded_c0p_mask_epoch)
                         if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
                             g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph_from_decoder(
                                 graph_decoder,
@@ -4059,11 +4890,16 @@ def train_encoder(
                                 max_add=decoded_max_add_per_round,
                                 max_remove=decoded_max_remove_per_round,
                                 per_node_cap_frac=decoded_bound_eff,
+                                add_degree_target=decoded_add_degree_target,
+                                add_degree_target_scope=decoded_add_degree_target_scope,
+                                add_degree_target_nodes=decoded_add_degree_target_nodes,
+                                guarantee_degree_target=decoded_guarantee_degree_target,
                                 deg0_excl_self=None,
                                 degree_floor=decoded_degree_floor_eff,
                                 same_cluster_only=decoded_same_cluster_only,
                                 require_c0p_endpoint=decoded_require_c0p_endpoint,
                                 require_both_c0p=decoded_require_both_c0p,
+                                require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
                             )
                         else:
                             with torch.no_grad():
@@ -4083,11 +4919,16 @@ def train_encoder(
                                 max_add=decoded_max_add_per_round,
                                 max_remove=decoded_max_remove_per_round,
                                 per_node_cap_frac=decoded_bound_eff,
+                                add_degree_target=decoded_add_degree_target,
+                                add_degree_target_scope=decoded_add_degree_target_scope,
+                                add_degree_target_nodes=decoded_add_degree_target_nodes,
+                                guarantee_degree_target=decoded_guarantee_degree_target,
                                 deg0_excl_self=None,
                                 degree_floor=decoded_degree_floor_eff,
                                 same_cluster_only=decoded_same_cluster_only,
                                 require_c0p_endpoint=decoded_require_c0p_endpoint,
                                 require_both_c0p=decoded_require_both_c0p,
+                                require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
                             )
                         g = g_decoded
                         aug_edge_index = g.to_sparse().indices()
@@ -4104,7 +4945,11 @@ def train_encoder(
                             print(
                                 f"[EDIT-GRAPH][E{epoch:04d}] cached_static_view=1 add={decoded_graph_added} remove={decoded_graph_removed} "
                                 f"same_cluster_only={decoded_same_cluster_only} c0p_endpoint={decoded_require_c0p_endpoint} "
-                                f"per_node_cap={decoded_bound_eff} accumulate_base={decoded_accumulate_into_base}"
+                                f"c0p_noncompact_endpoint={decoded_require_c0p_noncompact_endpoint} "
+                                f"per_node_cap={decoded_bound_eff} add_degree_target={decoded_add_degree_target} "
+                                f"add_degree_target_scope={decoded_add_degree_target_scope} "
+                                f"add_degree_target_nodes={decoded_add_degree_target_nodes} "
+                                f"guarantee_degree_target={decoded_guarantee_degree_target} accumulate_base={decoded_accumulate_into_base}"
                             )
 
                         if decoded_accumulate_into_base:
@@ -4118,23 +4963,135 @@ def train_encoder(
                         print(
                             f"[EDIT-GRAPH][E{epoch:04d}] add={decoded_graph_added} remove={decoded_graph_removed} "
                             f"same_cluster_only={decoded_same_cluster_only} c0p_endpoint={decoded_require_c0p_endpoint} "
-                            f"per_node_cap={decoded_bound_eff} accumulate_base={decoded_accumulate_into_base} "
+                            f"c0p_noncompact_endpoint={decoded_require_c0p_noncompact_endpoint} "
+                            f"per_node_cap={decoded_bound_eff} add_degree_target={decoded_add_degree_target} "
+                            f"add_degree_target_scope={decoded_add_degree_target_scope} "
+                            f"add_degree_target_nodes={decoded_add_degree_target_nodes} "
+                            f"guarantee_degree_target={decoded_guarantee_degree_target} accumulate_base={decoded_accumulate_into_base} "
                             f"add_thr={decoded_add_threshold} remove_thr={decoded_remove_threshold} "
                             f"add_q={decoded_add_quantile} remove_q={decoded_remove_quantile} "
                             f"max_add={decoded_max_add_per_round} max_remove={decoded_max_remove_per_round}"
                         )
                 except Exception as e:
                     print(f"[EDIT-GRAPH][TRAIN] decoded graph rewrite failed at epoch {epoch}: {e}")
+
+            if decoded_rewrite_applied_this_epoch and decoded_pre_rewrite_graph_dense_epoch is not None:
+                try:
+                    diff_pre = _graph_diff_summary(
+                        decoded_pre_rewrite_graph_dense_epoch,
+                        g,
+                        decoded_labels_epoch,
+                        decoded_mask_epoch,
+                    )
+                    print(
+                        f"[GRAPH-DIFF][E{epoch:04d}] scope=pre_rewrite "
+                        f"base_edges={int(diff_pre['base_edges'])} view_edges={int(diff_pre['view_edges'])} "
+                        f"added_vs_base={int(diff_pre['added_vs_base'])} removed_vs_base={int(diff_pre['removed_vs_base'])} "
+                        f"symdiff_edges={int(diff_pre['symdiff_edges'])} "
+                        f"edge_jaccard={diff_pre['edge_jaccard']:.6f} diff_frac_base={diff_pre['diff_frac_base']:.6f} "
+                        f"add_frac_base={diff_pre['add_frac_base']:.6f} remove_frac_base={diff_pre['remove_frac_base']:.6f} "
+                        f"same_cluster_added={diff_pre['same_cluster_added']:.6f} same_cluster_removed={diff_pre['same_cluster_removed']:.6f} "
+                        f"cross_cluster_added={diff_pre['cross_cluster_added']:.6f} cross_cluster_removed={diff_pre['cross_cluster_removed']:.6f} "
+                        f"target_touch_added={diff_pre['target_touch_added']:.6f} target_touch_removed={diff_pre['target_touch_removed']:.6f} "
+                        f"add_budget_ratio={decoded_add_ratio:.6f} remove_budget_ratio={decoded_remove_ratio:.6f} "
+                        f"accumulate_base={decoded_accumulate_into_base}"
+                    )
+                    if decoded_accumulate_into_base and stage1_anchor_graph_dense is not None:
+                        diff_start = _graph_diff_summary(
+                            stage1_anchor_graph_dense,
+                            g,
+                            decoded_labels_epoch,
+                            decoded_mask_epoch,
+                        )
+                        print(
+                            f"[GRAPH-DIFF][E{epoch:04d}] scope=edit_start "
+                            f"base_edges={int(diff_start['base_edges'])} view_edges={int(diff_start['view_edges'])} "
+                            f"added_vs_base={int(diff_start['added_vs_base'])} removed_vs_base={int(diff_start['removed_vs_base'])} "
+                            f"symdiff_edges={int(diff_start['symdiff_edges'])} "
+                            f"edge_jaccard={diff_start['edge_jaccard']:.6f} diff_frac_base={diff_start['diff_frac_base']:.6f} "
+                            f"add_frac_base={diff_start['add_frac_base']:.6f} remove_frac_base={diff_start['remove_frac_base']:.6f} "
+                            f"same_cluster_added={diff_start['same_cluster_added']:.6f} same_cluster_removed={diff_start['same_cluster_removed']:.6f} "
+                            f"cross_cluster_added={diff_start['cross_cluster_added']:.6f} cross_cluster_removed={diff_start['cross_cluster_removed']:.6f} "
+                            f"target_touch_added={diff_start['target_touch_added']:.6f} target_touch_removed={diff_start['target_touch_removed']:.6f} "
+                            f"add_budget_ratio={decoded_add_ratio:.6f} remove_budget_ratio={decoded_remove_ratio:.6f} "
+                            f"accumulate_base={decoded_accumulate_into_base}"
+                        )
+                except Exception as e:
+                    print(f"[GRAPH-DIFF][E{epoch:04d}] graph-diff summary failed: {e}")
             
             # Aron (for minimum node degree)
             # Node degree calculation (ignoring self-loops)
             node_degrees = torch.sum(g, dim=1) - torch.diag(g)
 
             # Calculate minimum and average node degrees
-            node_degrees = torch.sum(g, dim=1) - torch.diag(g)
             min_degree = torch.min(node_degrees)
-            #print(f'Minimum node degree: {min_degree.item()}')
+            mean_degree = torch.mean(node_degrees.float())
             minimum_node_degree_history.append(min_degree.item())
+            degree_cp_min = float("nan")
+            degree_cp_mean = float("nan")
+            degree_c0p_min = float("nan")
+            degree_c0p_mean = float("nan")
+            degree_cluster_line = None
+            try:
+                if decoded_labels_epoch is not None:
+                    degree_cp_mask = torch.as_tensor(
+                        np.asarray(decoded_labels_epoch) != -1,
+                        dtype=torch.bool,
+                        device=node_degrees.device,
+                    )
+                    if bool(degree_cp_mask.any().item()):
+                        cp_degrees = node_degrees[degree_cp_mask]
+                        degree_cp_min = float(cp_degrees.min().item())
+                        degree_cp_mean = float(cp_degrees.float().mean().item())
+                if decoded_mask_epoch is not None:
+                    degree_c0p_mask = decoded_mask_epoch.to(node_degrees.device).bool()
+                    if bool(degree_c0p_mask.any().item()):
+                        c0p_degrees = node_degrees[degree_c0p_mask]
+                        degree_c0p_min = float(c0p_degrees.min().item())
+                        degree_c0p_mean = float(c0p_degrees.float().mean().item())
+                if decoded_labels_epoch is not None:
+                    degree_target_for_summary = int(decoded_add_degree_target) if int(decoded_add_degree_target) > 0 else -1
+                    cp_cluster_summary = _cluster_min_degree_summary(
+                        g,
+                        decoded_labels_epoch,
+                        torch.as_tensor(
+                            np.asarray(decoded_labels_epoch) != -1,
+                            dtype=torch.bool,
+                            device=node_degrees.device,
+                        ),
+                        target=degree_target_for_summary,
+                    )
+                    c0p_cluster_summary = _cluster_min_degree_summary(
+                        g,
+                        decoded_labels_epoch,
+                        decoded_mask_epoch,
+                        target=degree_target_for_summary,
+                    )
+                    degree_cluster_line = (
+                        f"[DEGREE-CLUSTER][E{epoch:04d}] target={degree_target_for_summary} "
+                        f"cp_clusters={int(cp_cluster_summary['clusters'])} "
+                        f"cp_worst_min={cp_cluster_summary['worst_min']:.6f} "
+                        f"cp_mean_min={cp_cluster_summary['mean_min']:.6f} "
+                        f"cp_need_nodes={int(cp_cluster_summary['need_nodes'])} "
+                        f"cp_bad_clusters={int(cp_cluster_summary['bad_clusters'])} "
+                        f"c0p_clusters={int(c0p_cluster_summary['clusters'])} "
+                        f"c0p_worst_min={c0p_cluster_summary['worst_min']:.6f} "
+                        f"c0p_mean_min={c0p_cluster_summary['mean_min']:.6f} "
+                        f"c0p_need_nodes={int(c0p_cluster_summary['need_nodes'])} "
+                        f"c0p_bad_clusters={int(c0p_cluster_summary['bad_clusters'])} "
+                        f"added_this_epoch={int(added_this_epoch)} removed_this_epoch={int(removed_this_epoch)}"
+                    )
+            except Exception as e:
+                print(f"[DEGREE][E{epoch:04d}] degree-scope summary failed: {e}")
+            print(
+                f"[DEGREE][E{epoch:04d}] "
+                f"min_degree={float(min_degree.item()):.6f} mean_degree={float(mean_degree.item()):.6f} "
+                f"c0p_min_degree={degree_c0p_min:.6f} c0p_mean_degree={degree_c0p_mean:.6f} "
+                f"cp_min_degree={degree_cp_min:.6f} cp_mean_degree={degree_cp_mean:.6f} "
+                f"added_this_epoch={int(added_this_epoch)} removed_this_epoch={int(removed_this_epoch)}"
+            )
+            if degree_cluster_line is not None:
+                print(degree_cluster_line)
 
         modification_ratio_history.append(modification_ratio)
         add_hist.append(int(added_this_epoch))
@@ -4164,8 +5121,16 @@ def train_encoder(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         aug_loss = bias_Z.new_tensor(0.0)
+        maskgae_aug_feat_loss = bias_Z.new_tensor(0.0)
+        cimage_aug_factor_loss = bias_Z.new_tensor(0.0)
+        cimage_aug_cluster_loss = bias_Z.new_tensor(0.0)
         try:
-            aug_loss = loss_function(dot_product_decode(bias_Z), adj_label, encoder.mean, encoder.logstd, norm, weight_tensor, alpha, beta, train_mask) # aug_loss = loss_function(dot_product_decode(bias_Z), aug_adj_labels[i], encoder.mean, encoder.logstd, aug_norms[i], aug_weight_tensors[i], alpha, beta, train_mask)
+            (
+                aug_loss,
+                maskgae_aug_feat_loss,
+                cimage_aug_factor_loss,
+                cimage_aug_cluster_loss,
+            ) = _encoder_reconstruction_loss(dot_product_decode(bias_Z)) # aug_loss = loss_function(dot_product_decode(bias_Z), aug_adj_labels[i], encoder.mean, encoder.logstd, aug_norms[i], aug_weight_tensors[i], alpha, beta, train_mask)
         except RuntimeError as e:
             if not (skip_oom_epoch and _is_cuda_oom_like(e)):
                 raise
@@ -4216,6 +5181,11 @@ def train_encoder(
                         warm_labels,
                         warm_pull_mask,
                         pull_strength=editor_pull_strength,
+                        c0p_mask=warm_c0p_mask,
+                        push_scope=editor_push_scope,
+                        noncompact_push_strength=editor_noncompact_push_strength,
+                        noise_push_strength=editor_noise_push_strength,
+                        push_preserve_norm=editor_push_preserve_norm,
                     ).detach()
                 if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
                     decoder_warmup_recon_loss = sampled_decoder_reconstruction_loss(
@@ -4258,11 +5228,17 @@ def train_encoder(
                 compactness_mask = c0p_mask_epoch if compactness_mask_scope == "c0p" else cp_mask_epoch
                 rewrite_mask = c0p_mask_epoch if rewrite_endpoint_scope == "c0p" else cp_mask_epoch
 
-                z_edit = direct_pull_latent_per_cluster(
+                z_edit, pull_push_diag_epoch = direct_pull_latent_per_cluster(
                     edit_seed,
                     edit_labels_epoch,
                     pull_mask,
                     pull_strength=editor_pull_strength,
+                    c0p_mask=c0p_mask_epoch,
+                    push_scope=editor_push_scope,
+                    noncompact_push_strength=editor_noncompact_push_strength,
+                    noise_push_strength=editor_noise_push_strength,
+                    push_preserve_norm=editor_push_preserve_norm,
+                    return_diagnostics=True,
                 )
                 _set_struct_decoder_context(None, edit_labels_epoch, c0p_mask_epoch)
                 pairwise_decoder_training = isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder))
@@ -4308,6 +5284,7 @@ def train_encoder(
                             same_cluster_only=decoded_same_cluster_only,
                             require_c0p_endpoint=decoded_require_c0p_endpoint,
                             require_both_c0p=decoded_require_both_c0p,
+                            require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
                             keep_weight=decoder_keep_weight,
                             add_rank_weight=decoder_add_rank_weight,
                             remove_rank_weight=decoder_remove_rank_weight,
@@ -4345,6 +5322,7 @@ def train_encoder(
                             same_cluster_only=decoded_same_cluster_only,
                             require_c0p_endpoint=decoded_require_c0p_endpoint,
                             require_both_c0p=decoded_require_both_c0p,
+                            require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
                             keep_weight=decoder_keep_weight,
                             add_rank_weight=decoder_add_rank_weight,
                             remove_rank_weight=decoder_remove_rank_weight,
@@ -4524,6 +5502,9 @@ def train_encoder(
             raise RuntimeError(
                 f"Non-finite loss at epoch {epoch}: total={float(loss.detach().cpu())}, "
                 f"recon={float(recon_loss.detach().cpu())}, aug={float(aug_loss.detach().cpu())}, intra={float(intra_CL.detach().cpu())}, "
+                f"maskgae_feat={float(maskgae_feat_loss.detach().cpu())}, maskgae_aug_feat={float(maskgae_aug_feat_loss.detach().cpu())}, "
+                f"cimage_factor={float(cimage_factor_loss.detach().cpu())}, cimage_cluster={float(cimage_cluster_loss.detach().cpu())}, "
+                f"cimage_aug_factor={float(cimage_aug_factor_loss.detach().cpu())}, cimage_aug_cluster={float(cimage_aug_cluster_loss.detach().cpu())}, "
                 f"edit_recon={float(edit_recon_loss.detach().cpu())}, keep={float(edit_keep_loss.detach().cpu())}, "
                 f"add_rank={float(edit_add_rank_loss.detach().cpu())}, remove_rank={float(edit_remove_rank_loss.detach().cpu())}, "
                 f"heart_rank={float(edit_heart_rank_loss.detach().cpu())}, "
@@ -4555,6 +5536,16 @@ def train_encoder(
         del encoder.Z
         del encoder.mean
         del encoder.logstd
+        for _cache_attr in (
+            "masked_feature_pred",
+            "masked_feature_target",
+            "masked_feature_mask",
+            "cimage_factor_mask",
+            "cimage_factor_scores",
+            "cimage_cluster_q",
+        ):
+            if hasattr(encoder, _cache_attr):
+                delattr(encoder, _cache_attr)
         del Z
         del hidden_repr
         torch.cuda.empty_cache()
@@ -4573,7 +5564,24 @@ def train_encoder(
         with torch.no_grad():
             inference_time_start = time.time()
             Z = encoder(features, edge_index) # Z = encoder(features, adj_norm)
-            if (score_source == "decoder" and use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
+            if is_heart:
+                should_eval = (epoch % max(1, heart_eval_every) == 0) or (epoch == num_epoch - 1)
+            else:
+                should_eval = (epoch % train_eval_every == 0) or (epoch == num_epoch - 1)
+            need_full_score = (should_eval and not edge_eval) or (not skip_train_acc)
+            score_needs_decoder_context = need_full_score and (
+                (score_source == "decoder" and use_edited_decoder and (graph_decoder is not None))
+                or (score_source == "pred_decoder" and prediction_decoder is not None)
+            )
+            score_needs_decoder_context = score_needs_decoder_context or (
+                should_eval
+                and edge_eval
+                and (
+                    (score_source == "decoder" and use_edited_decoder and (graph_decoder is not None))
+                    or (score_source == "pred_decoder" and prediction_decoder is not None)
+                )
+            )
+            if score_needs_decoder_context:
                 try:
                     score_labels, score_c0p_mask = resolve_edit_targets(
                         Z,
@@ -4592,7 +5600,15 @@ def train_encoder(
                         _set_prediction_decoder_context(None, score_labels, score_c0p_mask)
                 except Exception as e:
                     print(f"[DECODER-DIAG] score context failed at epoch {epoch}: {e}")
-            A_pred = _score_adjacency(Z)
+            A_pred = None
+            A_pred_np = None
+            train_acc = float("nan")
+            if need_full_score:
+                A_pred = _score_adjacency(Z)
+                if not skip_train_acc:
+                    train_acc = get_acc(A_pred.data.cpu(), adj_label.data.cpu())
+                if should_eval:
+                    A_pred_np = A_pred.data.cpu().numpy()
             radius_before = Z.new_tensor(0.0)
             radius_after = Z.new_tensor(0.0)
             c0p_radius_before = Z.new_tensor(0.0)
@@ -4605,7 +5621,27 @@ def train_encoder(
             noncompact_radius_p90_after = Z.new_tensor(0.0)
             noncompact_radius_max_before = Z.new_tensor(0.0)
             noncompact_radius_max_after = Z.new_tensor(0.0)
-            if use_edited_decoder and (graph_decoder is not None) and _decoded_edit_active(epoch):
+            edit_metrics_active = use_edited_decoder and (graph_decoder is not None) and _decoded_edit_active(epoch)
+            run_edit_metrics = (
+                edit_metrics_active
+                and edit_metric_every > 0
+                and ((epoch % max(1, edit_metric_every) == 0) or (epoch == num_epoch - 1))
+            )
+            if edit_metrics_active and not run_edit_metrics:
+                nan_metric = Z.new_tensor(float("nan"))
+                radius_before = nan_metric
+                radius_after = nan_metric
+                c0p_radius_before = nan_metric
+                c0p_radius_after = nan_metric
+                cp_radius_before = nan_metric
+                cp_radius_after = nan_metric
+                noncompact_radius_before = nan_metric
+                noncompact_radius_after = nan_metric
+                noncompact_radius_p90_before = nan_metric
+                noncompact_radius_p90_after = nan_metric
+                noncompact_radius_max_before = nan_metric
+                noncompact_radius_max_after = nan_metric
+            if run_edit_metrics:
                 try:
                     eval_labels, eval_c0p_mask = resolve_edit_targets(
                         Z,
@@ -4623,6 +5659,7 @@ def train_encoder(
                     eval_compactness_mask = eval_c0p_mask if compactness_mask_scope == "c0p" else eval_cp_mask
                     eval_rewrite_mask = eval_c0p_mask if rewrite_endpoint_scope == "c0p" else eval_cp_mask
                     eval_noncompact_mask = noncompact_node_mask(eval_cp_mask, eval_c0p_mask)
+                    _set_struct_decoder_context(None, eval_labels, eval_c0p_mask)
 
                     radius_before = cluster_compactness_loss(Z, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
                     c0p_radius_before = cluster_compactness_loss(Z, eval_labels, eval_c0p_mask, radius_metric=compactness_radius_metric)
@@ -4675,6 +5712,11 @@ def train_encoder(
                                     eval_labels,
                                     eval_pull_mask,
                                     pull_strength=editor_pull_strength,
+                                    c0p_mask=eval_c0p_mask,
+                                    push_scope=editor_push_scope,
+                                    noncompact_push_strength=editor_noncompact_push_strength,
+                                    noise_push_strength=editor_noise_push_strength,
+                                    push_preserve_norm=editor_push_preserve_norm,
                                 )
                                 decoded_degree_floor_eff = max(0, int(degree_threshold) - 1) if decoded_degree_floor is None else int(decoded_degree_floor)
                                 decoded_bound_eff = None if (decoded_graph_aug_bound is None or float(decoded_graph_aug_bound) <= 0) else float(decoded_graph_aug_bound)
@@ -4695,11 +5737,16 @@ def train_encoder(
                                         max_add=decoded_max_add_per_round,
                                         max_remove=decoded_max_remove_per_round,
                                         per_node_cap_frac=decoded_bound_eff,
+                                        add_degree_target=decoded_add_degree_target,
+                                        add_degree_target_scope=decoded_add_degree_target_scope,
+                                        add_degree_target_nodes=decoded_add_degree_target_nodes,
+                                        guarantee_degree_target=decoded_guarantee_degree_target,
                                         deg0_excl_self=None,
                                         degree_floor=decoded_degree_floor_eff,
                                         same_cluster_only=decoded_same_cluster_only,
                                         require_c0p_endpoint=decoded_require_c0p_endpoint,
                                         require_both_c0p=decoded_require_both_c0p,
+                                        require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
                                     )
                                 else:
                                     with torch.no_grad():
@@ -4719,11 +5766,16 @@ def train_encoder(
                                         max_add=decoded_max_add_per_round,
                                         max_remove=decoded_max_remove_per_round,
                                         per_node_cap_frac=decoded_bound_eff,
+                                        add_degree_target=decoded_add_degree_target,
+                                        add_degree_target_scope=decoded_add_degree_target_scope,
+                                        add_degree_target_nodes=decoded_add_degree_target_nodes,
+                                        guarantee_degree_target=decoded_guarantee_degree_target,
                                         deg0_excl_self=None,
                                         degree_floor=decoded_degree_floor_eff,
                                         same_cluster_only=decoded_same_cluster_only,
                                         require_c0p_endpoint=decoded_require_c0p_endpoint,
                                         require_both_c0p=decoded_require_both_c0p,
+                                        require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
                                     )
                                 Z_eval = encoder(features, g_eval.to_sparse().indices())
                             radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
@@ -4740,6 +5792,11 @@ def train_encoder(
                             eval_labels,
                             eval_pull_mask,
                             pull_strength=editor_pull_strength,
+                            c0p_mask=eval_c0p_mask,
+                            push_scope=editor_push_scope,
+                            noncompact_push_strength=editor_noncompact_push_strength,
+                            noise_push_strength=editor_noise_push_strength,
+                            push_preserve_norm=editor_push_preserve_norm,
                         )
                         radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
                         c0p_radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_c0p_mask, radius_metric=compactness_radius_metric)
@@ -4754,20 +5811,17 @@ def train_encoder(
         
         # A_pred = train_decoder(device, encoder.Z.clone().detach(), adj_label, weight_tensor, norm, train_mask)
         # print(A_pred.shape)
-        train_acc = get_acc(A_pred.data.cpu(), adj_label.data.cpu())
-        A_pred_np = A_pred.data.cpu().numpy()
+        if should_eval and (not edge_eval) and A_pred_np is None:
+            raise RuntimeError(f"Missing adjacency scores for evaluation at epoch {epoch}")
 
         if is_heart:
-            should_eval = (epoch % max(1, heart_eval_every) == 0) or (epoch == num_epoch - 1)
-
             if should_eval:
                 # cheap fixed-subset validation
-                val_roc_subset, val_ap_subset, val_hit_subset = get_scores(
-                    dataset_str,
+                val_roc_subset, val_ap_subset, val_hit_subset = _evaluate_edges_for_source(
+                    Z,
                     val_edges_eval,
                     val_edges_false_eval,
-                    A_pred_np,
-                    adj_orig,
+                    score_matrix_np=A_pred_np,
                 )
 
                 val_roc = val_roc_subset
@@ -4792,12 +5846,11 @@ def train_encoder(
                     ran_full_val = True
 
                     if heart_test_on_best_val:
-                        test_roc, test_ap, test_hit = get_scores(
-                            dataset_str,
+                        test_roc, test_ap, test_hit = _evaluate_edges_for_source(
+                            Z,
                             test_edges,
                             test_edges_false,
-                            A_pred_np,
-                            adj_orig,
+                            score_matrix_np=A_pred_np,
                         )
                 # only pay for full validation if the cheap subset improves on the selection metric
                 elif val_subset_checkpoint_score > best_subset_checkpoint_score:
@@ -4806,22 +5859,20 @@ def train_encoder(
                     best_val_ap_subset = val_ap_subset
                     best_subset_epoch = epoch
 
-                    val_roc, val_ap, val_hit = get_scores(
-                        dataset_str,
+                    val_roc, val_ap, val_hit = _evaluate_edges_for_source(
+                        Z,
                         val_edges,
                         val_edges_false,
-                        A_pred_np,
-                        adj_orig,
+                        score_matrix_np=A_pred_np,
                     )
                     ran_full_val = True
 
                     if heart_test_on_best_val:
-                        test_roc, test_ap, test_hit = get_scores(
-                            dataset_str,
+                        test_roc, test_ap, test_hit = _evaluate_edges_for_source(
+                            Z,
                             test_edges,
                             test_edges_false,
-                            A_pred_np,
-                            adj_orig,
+                            score_matrix_np=A_pred_np,
                         )
             else:
                 val_roc = float("nan")
@@ -4833,13 +5884,22 @@ def train_encoder(
                 ran_full_val = False
 
         else:
-            val_roc, val_ap, val_hit = get_scores(
-                dataset_str, val_edges, val_edges_false, A_pred_np, adj_orig
-            )
-            test_roc, test_ap, test_hit = get_scores(
-                dataset_str, test_edges, test_edges_false, A_pred_np, adj_orig
-            )
-            ran_full_val = True
+            if should_eval:
+                val_roc, val_ap, val_hit = _evaluate_edges_for_source(
+                    Z, val_edges, val_edges_false, score_matrix_np=A_pred_np
+                )
+                test_roc, test_ap, test_hit = _evaluate_edges_for_source(
+                    Z, test_edges, test_edges_false, score_matrix_np=A_pred_np
+                )
+                ran_full_val = True
+            else:
+                val_roc = float("nan")
+                val_ap = float("nan")
+                val_hit = [float("nan")] * 6
+                test_roc = float("nan")
+                test_ap = float("nan")
+                test_hit = [float("nan")] * 6
+                ran_full_val = False
 
         score_diag = _score_source_diagnostics(None, None, [], [])
         score_diag.update(
@@ -4851,7 +5911,17 @@ def train_encoder(
                 "diag_decoder_pred_corr": float("nan"),
             }
         )
-        if ((use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None)) and np.isfinite(val_roc):
+        run_decoder_diag = (
+            ((use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None))
+            and np.isfinite(val_roc)
+            and decoder_diag_every != 0
+            and (
+                decoder_diag_every < 0
+                or (epoch % max(1, decoder_diag_every) == 0)
+                or (epoch == num_epoch - 1)
+            )
+        )
+        if run_decoder_diag:
             try:
                 diag_labels, diag_c0p_mask = resolve_edit_targets(
                     Z,
@@ -4989,8 +6059,7 @@ def train_encoder(
         delta_from_prev_rewrite_hist.append(delta_from_prev_rewrite)
         rewrite_applied_hist.append(1 if rewrite_applied_now else 0)
 
-        if use_edited_decoder and ((not is_heart and (epoch % max(1, eval_log_every) == 0 or epoch == num_epoch - 1))
-                                   or (is_heart and ((epoch % max(1, heart_eval_every) == 0) or epoch == num_epoch - 1))):
+        if use_edited_decoder and should_eval and (epoch % max(1, eval_log_every) == 0 or epoch == num_epoch - 1):
             if is_heart:
                 if ran_full_val:
                     eval_tag = "heart_full_val"
@@ -5004,6 +6073,9 @@ def train_encoder(
             print(
                 f"[EDIT][E{epoch:04d}][{eval_tag}] loss={float(loss.detach().cpu()):.6f} "
                 f"recon={float(recon_loss.detach().cpu()):.6f} aug={float(aug_loss.detach().cpu()):.6f} "
+                f"maskgae_feat={float(maskgae_feat_loss.detach().cpu()):.6f} maskgae_aug_feat={float(maskgae_aug_feat_loss.detach().cpu()):.6f} "
+                f"cimage_factor={float(cimage_factor_loss.detach().cpu()):.6f} cimage_cluster={float(cimage_cluster_loss.detach().cpu()):.6f} "
+                f"cimage_aug_factor={float(cimage_aug_factor_loss.detach().cpu()):.6f} cimage_aug_cluster={float(cimage_aug_cluster_loss.detach().cpu()):.6f} "
                 f"warm_recon={float(decoder_warmup_recon_loss.detach().cpu()):.6f} "
                 f"edit_recon={float(edit_recon_loss.detach().cpu()):.6f} keep={float(edit_keep_loss.detach().cpu()):.6f} "
                 f"add_rank={float(edit_add_rank_loss.detach().cpu()):.6f} remove_rank={float(edit_remove_rank_loss.detach().cpu()):.6f} "
@@ -5022,6 +6094,12 @@ def train_encoder(
                 f"noncompact_radius_max_before={noncompact_radius_max_before_val:.6f} noncompact_radius_max_after={noncompact_radius_max_after_val:.6f} "
                 f"delta_anchor={delta_from_anchor:.6f} delta_prev_rewrite={delta_from_prev_rewrite:.6f} "
                 f"rewrite_applied={int(rewrite_applied_now)} "
+                f"push_noncompact_count={int(pull_push_diag_epoch.get('push_noncompact_count', 0.0))} "
+                f"push_noise_count={int(pull_push_diag_epoch.get('push_noise_count', 0.0))} "
+                f"push_noncompact_cosdist_before={float(pull_push_diag_epoch.get('push_noncompact_anchor_cosdist_before', float('nan'))):.6f} "
+                f"push_noncompact_cosdist_after={float(pull_push_diag_epoch.get('push_noncompact_anchor_cosdist_after', float('nan'))):.6f} "
+                f"push_noise_cosdist_before={float(pull_push_diag_epoch.get('push_noise_anchor_cosdist_before', float('nan'))):.6f} "
+                f"push_noise_cosdist_after={float(pull_push_diag_epoch.get('push_noise_anchor_cosdist_after', float('nan'))):.6f} "
                 f"rewrite_nodes={edit_decoder_debug['rewrite_nodes']} "
                 f"valid_pairs={edit_decoder_debug['valid_pairs']} "
                 f"add_pairs={edit_decoder_debug['add_pairs']} "
@@ -5141,6 +6219,15 @@ def train_encoder(
                 "noncompact_radius_p90_after": float(noncompact_radius_p90_after_val),
                 "noncompact_radius_max_before": float(noncompact_radius_max_before_val),
                 "noncompact_radius_max_after": float(noncompact_radius_max_after_val),
+                "editor_noncompact_push_strength": float(pull_push_diag_epoch.get("editor_noncompact_push_strength", float("nan"))),
+                "editor_noise_push_strength": float(pull_push_diag_epoch.get("editor_noise_push_strength", float("nan"))),
+                "editor_push_preserve_norm": float(pull_push_diag_epoch.get("editor_push_preserve_norm", float("nan"))),
+                "push_noncompact_count": float(pull_push_diag_epoch.get("push_noncompact_count", float("nan"))),
+                "push_noise_count": float(pull_push_diag_epoch.get("push_noise_count", float("nan"))),
+                "push_noncompact_anchor_cosdist_before": float(pull_push_diag_epoch.get("push_noncompact_anchor_cosdist_before", float("nan"))),
+                "push_noncompact_anchor_cosdist_after": float(pull_push_diag_epoch.get("push_noncompact_anchor_cosdist_after", float("nan"))),
+                "push_noise_anchor_cosdist_before": float(pull_push_diag_epoch.get("push_noise_anchor_cosdist_before", float("nan"))),
+                "push_noise_anchor_cosdist_after": float(pull_push_diag_epoch.get("push_noise_anchor_cosdist_after", float("nan"))),
                 "radius_anchor": float(radius_anchor_value) if radius_anchor_value is not None else float("nan"),
                 "delta_anchor": float(delta_from_anchor),
                 "delta_prev_rewrite": float(delta_from_prev_rewrite),
@@ -5150,6 +6237,25 @@ def train_encoder(
                 "edit_add_rank": float(edit_add_rank_loss.detach().cpu()),
                 "edit_remove_rank": float(edit_remove_rank_loss.detach().cpu()),
                 "edit_heart_rank": float(edit_heart_rank_loss.detach().cpu()),
+                "lp_full_graph": int(lp_full_graph_protocol),
+                "ae_backbone": ae_backbone,
+                "maskgae_mask_rate": float(maskgae_mask_rate),
+                "maskgae_feature_weight": float(maskgae_feature_weight),
+                "maskgae_feature_loss": float(maskgae_feat_loss.detach().cpu()),
+                "maskgae_aug_feature_loss": float(maskgae_aug_feat_loss.detach().cpu()),
+                "cimage_factor_weight": float(cimage_factor_weight),
+                "cimage_cluster_weight": float(cimage_cluster_weight),
+                "cimage_num_factors": int(cimage_num_factors),
+                "cimage_num_clusters": int(cimage_num_clusters),
+                "cimage_pseudo_label_threshold": float(cimage_pseudo_label_threshold),
+                "cimage_factor_select_ratio": float(cimage_factor_select_ratio),
+                "cimage_mrmr_redundancy_weight": float(cimage_mrmr_redundancy_weight),
+                "cimage_cluster_balance_weight": float(cimage_cluster_balance_weight),
+                "cimage_sce_power": float(cimage_sce_power),
+                "cimage_factor_loss": float(cimage_factor_loss.detach().cpu()),
+                "cimage_cluster_loss": float(cimage_cluster_loss.detach().cpu()),
+                "cimage_aug_factor_loss": float(cimage_aug_factor_loss.detach().cpu()),
+                "cimage_aug_cluster_loss": float(cimage_aug_cluster_loss.detach().cpu()),
                 "prediction_rank": float(prediction_rank_loss.detach().cpu()),
                 "prediction_bce": float(prediction_bce_loss.detach().cpu()),
                 "prediction_joint_rank": float(prediction_joint_rank_loss.detach().cpu()),
@@ -5274,6 +6380,12 @@ def train_encoder(
                 f'edit_add_rank = {best_meta_cpu.get("edit_add_rank", float("nan")):.6f}, '
                 f'edit_remove_rank = {best_meta_cpu.get("edit_remove_rank", float("nan")):.6f}, '
                 f'edit_heart_rank = {best_meta_cpu.get("edit_heart_rank", float("nan")):.6f}, '
+                f'maskgae_feature_loss = {best_meta_cpu.get("maskgae_feature_loss", float("nan")):.6f}, '
+                f'maskgae_aug_feature_loss = {best_meta_cpu.get("maskgae_aug_feature_loss", float("nan")):.6f}, '
+                f'cimage_factor_loss = {best_meta_cpu.get("cimage_factor_loss", float("nan")):.6f}, '
+                f'cimage_cluster_loss = {best_meta_cpu.get("cimage_cluster_loss", float("nan")):.6f}, '
+                f'cimage_aug_factor_loss = {best_meta_cpu.get("cimage_aug_factor_loss", float("nan")):.6f}, '
+                f'cimage_aug_cluster_loss = {best_meta_cpu.get("cimage_aug_cluster_loss", float("nan")):.6f}, '
                 f'heart_rank_pairs = {best_meta_cpu.get("heart_rank_pairs", float("nan")):.0f}, '
                 f'prediction_rank = {best_meta_cpu.get("prediction_rank", float("nan")):.6f}, '
                 f'prediction_bce = {best_meta_cpu.get("prediction_bce", float("nan")):.6f}, '
@@ -5378,34 +6490,65 @@ def train_encoder(
                     _set_prediction_decoder_context(None, final_labels, final_c0p_mask)
             except Exception as e:
                 print(f"[DECODER-DIAG] final score context failed: {e}")
-        A_pred_best = _score_adjacency(Z_best)
         if (use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
-            A_dot_final = dot_product_decode(Z_best).detach().cpu().numpy()
-            _, _, dot_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_dot_final, adj_orig)
+            dot_pos_final = _edge_score_values_from_dot(Z_best, test_edges)
+            dot_neg_final = _edge_score_values_from_dot(Z_best, test_edges_false)
+            _, _, dot_final_hit = get_scores_from_values(dot_pos_final, dot_neg_final)
+            if dot_pos_final.size > 0:
+                final_score_diag["diag_dot_pos_mean"] = float(np.mean(dot_pos_final.reshape(-1)))
+            if dot_neg_final.size > 0:
+                final_score_diag["diag_dot_neg_mean"] = float(np.mean(dot_neg_final.reshape(-1)))
             final_score_diag["diag_dot_test_hit10"] = float(dot_final_hit[2]) if len(dot_final_hit) > 2 else float("nan")
             if use_edited_decoder and (graph_decoder is not None):
-                A_decoder_final = graph_decoder(Z_best).detach().cpu().numpy()
-                _, _, decoder_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_decoder_final, adj_orig)
-                final_score_diag.update(_score_source_diagnostics(A_dot_final, A_decoder_final, test_edges, test_edges_false))
+                decoder_pos_final = _edge_score_values_from_decoder(graph_decoder, Z_best, test_edges)
+                decoder_neg_final = _edge_score_values_from_decoder(graph_decoder, Z_best, test_edges_false)
+                _, _, decoder_final_hit = get_scores_from_values(decoder_pos_final, decoder_neg_final)
+                final_score_diag.update(
+                    _score_source_diagnostics_from_values(
+                        dot_pos_final,
+                        dot_neg_final,
+                        decoder_pos_final,
+                        decoder_neg_final,
+                    )
+                )
                 final_score_diag["diag_dot_test_hit10"] = float(dot_final_hit[2]) if len(dot_final_hit) > 2 else float("nan")
                 final_score_diag["diag_decoder_test_hit10"] = float(decoder_final_hit[2]) if len(decoder_final_hit) > 2 else float("nan")
             if prediction_decoder is not None:
-                A_pred_decoder_final = prediction_decoder(Z_best).detach().cpu().numpy()
-                _, _, pred_decoder_final_hit = get_scores(dataset_str, test_edges, test_edges_false, A_pred_decoder_final, adj_orig)
-                pred_final_diag = _score_source_diagnostics(A_dot_final, A_pred_decoder_final, test_edges, test_edges_false)
+                pred_pos_final = _edge_score_values_from_decoder(prediction_decoder, Z_best, test_edges)
+                pred_neg_final = _edge_score_values_from_decoder(prediction_decoder, Z_best, test_edges_false)
+                _, _, pred_decoder_final_hit = get_scores_from_values(pred_pos_final, pred_neg_final)
+                pred_final_diag = _score_source_diagnostics_from_values(
+                    dot_pos_final,
+                    dot_neg_final,
+                    pred_pos_final,
+                    pred_neg_final,
+                )
                 final_score_diag["diag_pred_test_hit10"] = float(pred_decoder_final_hit[2]) if len(pred_decoder_final_hit) > 2 else float("nan")
                 final_score_diag["diag_pred_pos_mean"] = pred_final_diag.get("diag_decoder_pos_mean", float("nan"))
                 final_score_diag["diag_pred_neg_mean"] = pred_final_diag.get("diag_decoder_neg_mean", float("nan"))
                 final_score_diag["diag_dot_pred_corr"] = pred_final_diag.get("diag_dot_decoder_corr", float("nan"))
                 if use_edited_decoder and (graph_decoder is not None):
-                    dec_vals = _edge_score_values_np(A_decoder_final, np.concatenate([np.asarray(test_edges).reshape(-1, 2), np.asarray(test_edges_false).reshape(-1, 2)], axis=0))
-                    pred_vals = _edge_score_values_np(A_pred_decoder_final, np.concatenate([np.asarray(test_edges).reshape(-1, 2), np.asarray(test_edges_false).reshape(-1, 2)], axis=0))
+                    dec_vals = np.concatenate(
+                        [
+                            np.asarray(decoder_pos_final).reshape(-1),
+                            np.asarray(decoder_neg_final).reshape(-1),
+                        ]
+                    )
+                    pred_vals = np.concatenate(
+                        [
+                            np.asarray(pred_pos_final).reshape(-1),
+                            np.asarray(pred_neg_final).reshape(-1),
+                        ]
+                    )
                     if dec_vals.size > 1 and pred_vals.size > 1 and np.std(dec_vals) > 0 and np.std(pred_vals) > 0:
                         final_score_diag["diag_decoder_pred_corr"] = float(np.corrcoef(dec_vals, pred_vals)[0, 1])
 
     print(f"[SCORE] validation/test score_source={score_source}")
-    final_test_roc, final_test_ap, final_test_hit = get_scores(
-        dataset_str, test_edges, test_edges_false, A_pred_best.data.cpu().numpy(), adj_orig
+    final_test_roc, final_test_ap, final_test_hit = _evaluate_edges_for_source(
+        Z_best,
+        test_edges,
+        test_edges_false,
+        score_matrix_np=None,
     )
     final_ckpt_metric_label = heart_checkpoint_metric if is_heart else "roc"
     print(f"[BEST CHECKPOINT BY VAL {final_ckpt_metric_label.upper()}] epoch = {best_epoch+1}, "
@@ -5448,6 +6591,15 @@ def train_encoder(
             f"noncompact_radius_p90_after={float(best_meta_cpu.get('noncompact_radius_p90_after', float('nan'))):.6f} "
             f"noncompact_radius_max_before={float(best_meta_cpu.get('noncompact_radius_max_before', float('nan'))):.6f} "
             f"noncompact_radius_max_after={float(best_meta_cpu.get('noncompact_radius_max_after', float('nan'))):.6f} "
+            f"editor_noncompact_push_strength={float(best_meta_cpu.get('editor_noncompact_push_strength', float('nan'))):.6f} "
+            f"editor_noise_push_strength={float(best_meta_cpu.get('editor_noise_push_strength', float('nan'))):.6f} "
+            f"editor_push_preserve_norm={float(best_meta_cpu.get('editor_push_preserve_norm', float('nan'))):.0f} "
+            f"push_noncompact_count={float(best_meta_cpu.get('push_noncompact_count', float('nan'))):.0f} "
+            f"push_noise_count={float(best_meta_cpu.get('push_noise_count', float('nan'))):.0f} "
+            f"push_noncompact_anchor_cosdist_before={float(best_meta_cpu.get('push_noncompact_anchor_cosdist_before', float('nan'))):.6f} "
+            f"push_noncompact_anchor_cosdist_after={float(best_meta_cpu.get('push_noncompact_anchor_cosdist_after', float('nan'))):.6f} "
+            f"push_noise_anchor_cosdist_before={float(best_meta_cpu.get('push_noise_anchor_cosdist_before', float('nan'))):.6f} "
+            f"push_noise_anchor_cosdist_after={float(best_meta_cpu.get('push_noise_anchor_cosdist_after', float('nan'))):.6f} "
             f"radius_anchor={float(best_meta_cpu['radius_anchor']):.6f} "
             f"delta_anchor={float(best_meta_cpu['delta_anchor']):.6f} "
             f"delta_prev_rewrite={float(best_meta_cpu['delta_prev_rewrite']):.6f} "
@@ -5457,6 +6609,22 @@ def train_encoder(
             f"edit_add_rank={float(best_meta_cpu.get('edit_add_rank', float('nan'))):.6f} "
             f"edit_remove_rank={float(best_meta_cpu.get('edit_remove_rank', float('nan'))):.6f} "
             f"edit_heart_rank={float(best_meta_cpu.get('edit_heart_rank', float('nan'))):.6f} "
+            f"lp_full_graph={float(best_meta_cpu.get('lp_full_graph', float('nan'))):.0f} "
+            f"maskgae_feature_loss={float(best_meta_cpu.get('maskgae_feature_loss', float('nan'))):.6f} "
+            f"maskgae_aug_feature_loss={float(best_meta_cpu.get('maskgae_aug_feature_loss', float('nan'))):.6f} "
+            f"cimage_factor_loss={float(best_meta_cpu.get('cimage_factor_loss', float('nan'))):.6f} "
+            f"cimage_cluster_loss={float(best_meta_cpu.get('cimage_cluster_loss', float('nan'))):.6f} "
+            f"cimage_aug_factor_loss={float(best_meta_cpu.get('cimage_aug_factor_loss', float('nan'))):.6f} "
+            f"cimage_aug_cluster_loss={float(best_meta_cpu.get('cimage_aug_cluster_loss', float('nan'))):.6f} "
+            f"cimage_factor_weight={float(best_meta_cpu.get('cimage_factor_weight', float('nan'))):.6f} "
+            f"cimage_cluster_weight={float(best_meta_cpu.get('cimage_cluster_weight', float('nan'))):.6f} "
+            f"cimage_num_factors={float(best_meta_cpu.get('cimage_num_factors', float('nan'))):.0f} "
+            f"cimage_num_clusters={float(best_meta_cpu.get('cimage_num_clusters', float('nan'))):.0f} "
+            f"cimage_pseudo_label_threshold={float(best_meta_cpu.get('cimage_pseudo_label_threshold', float('nan'))):.6f} "
+            f"cimage_factor_select_ratio={float(best_meta_cpu.get('cimage_factor_select_ratio', float('nan'))):.6f} "
+            f"cimage_mrmr_redundancy_weight={float(best_meta_cpu.get('cimage_mrmr_redundancy_weight', float('nan'))):.6f} "
+            f"cimage_cluster_balance_weight={float(best_meta_cpu.get('cimage_cluster_balance_weight', float('nan'))):.6f} "
+            f"cimage_sce_power={float(best_meta_cpu.get('cimage_sce_power', float('nan'))):.6f} "
             f"heart_rank_pairs={float(best_meta_cpu.get('heart_rank_pairs', float('nan'))):.0f} "
             f"prediction_rank={float(best_meta_cpu.get('prediction_rank', float('nan'))):.6f} "
             f"prediction_bce={float(best_meta_cpu.get('prediction_bce', float('nan'))):.6f} "

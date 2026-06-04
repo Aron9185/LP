@@ -76,8 +76,11 @@ parser.add_argument(
     "--split_mode",
     type=str,
     default="random",
-    choices=["random", "heart"],
-    help="random = old mask_test_edges path, heart = official HeaRT split path",
+    choices=["random", "heart", "cimage_paper"],
+    help=(
+        "random = old mask_test_edges path, heart = official HeaRT split path, "
+        "cimage_paper = PyG RandomLinkSplit(num_val=0.1, num_test=0.05)"
+    ),
 )
 parser.add_argument(
     "--heart_data_dir",
@@ -109,6 +112,17 @@ parser.add_argument(
     default="roc",
     choices=["roc", "ap", "hit1", "hit3", "hit10", "hit20", "hit50", "hit100"],
     help="Validation metric used to select HeaRT checkpoints.",
+)
+parser.add_argument(
+    "--lp_train_graph",
+    type=str,
+    default="train",
+    choices=["train", "full"],
+    help=(
+        "Graph used for link-prediction training tensors. "
+        "train = no-leak split graph; full = CIMAGE-style leakage protocol where "
+        "the encoder/reconstruction see all observed edges while eval still uses the held-out split."
+    ),
 )
 
 # Aron
@@ -184,6 +198,25 @@ parser.add_argument(
 parser.add_argument("--run_tag", type=str, default="", help="Optional run identifier tag (used for log naming)")
 parser.add_argument("--sweep_mode", action="store_true",
     help="Do NOT hijack stdout/stderr; print metrics to stdout so external runners can capture. Also disables tqdm.")
+parser.add_argument(
+    "--ae_backbone",
+    type=str,
+    default="vgnae",
+    choices=["vgnae", "vgae", "maskgae", "cimage", "cimage_lite", "cimage_full"],
+    help="Autoencoder backbone. vgae aliases VGNAE; cimage aliases cimage_full.",
+)
+parser.add_argument("--maskgae_mask_rate", type=float, default=0.3, help="Node-feature mask rate used when --ae_backbone maskgae.")
+parser.add_argument("--maskgae_feature_weight", type=float, default=1.0, help="Weight for MaskGAE masked-feature reconstruction.")
+parser.add_argument("--cimage_factor_weight", type=float, default=0.1, help="Weight for CIMAGE latent factor reconstruction.")
+parser.add_argument("--cimage_cluster_weight", type=float, default=0.1, help="Weight for CIMAGE clustering loss.")
+parser.add_argument("--cimage_num_factors", type=int, default=8, help="Number of CIMAGE latent factors.")
+parser.add_argument("--cimage_num_clusters", type=int, default=16, help="Number of CIMAGE pseudo-label clusters.")
+parser.add_argument("--cimage_cluster_alpha", type=float, default=1.0, help="Student-t cluster assignment alpha for CIMAGE-lite.")
+parser.add_argument("--cimage_pseudo_label_threshold", type=float, default=0.90, help="Confidence threshold for CIMAGE full pseudo-label factor scoring.")
+parser.add_argument("--cimage_factor_select_ratio", type=float, default=0.50, help="Fraction of CIMAGE full factors used as the visible context.")
+parser.add_argument("--cimage_mrmr_redundancy_weight", type=float, default=0.20, help="Redundancy penalty used by CIMAGE full factor selection.")
+parser.add_argument("--cimage_cluster_balance_weight", type=float, default=0.05, help="Balance penalty used by CIMAGE full modularity clustering.")
+parser.add_argument("--cimage_sce_power", type=float, default=2.0, help="Power for CIMAGE full scaled cosine error factor reconstruction.")
 
 # Edited decoder / decoded-graph augmentation
 parser.add_argument("--use_edited_decoder", action="store_true", help="Enable the edited decoder branch.")
@@ -221,7 +254,13 @@ parser.add_argument("--heart_rank_weight", type=float, default=0.0, help="Weight
 parser.add_argument("--heart_rank_margin", type=float, default=0.2, help="Margin for HeaRT-style decoder ranking.")
 parser.add_argument("--heart_rank_neg_k", type=int, default=8, help="Hard negatives per train positive for HeaRT-style decoder ranking.")
 parser.add_argument("--heart_rank_pool_factor", type=int, default=4, help="Hard-negative pool multiplier for HeaRT-style decoder ranking.")
-parser.add_argument("--prediction_decoder_type", type=str, default="none", choices=["none", "pair_residual_struct"], help="Optional prediction decoder trained separately from the edit decoder.")
+parser.add_argument(
+    "--prediction_decoder_type",
+    type=str,
+    default="none",
+    choices=["none", "pair_residual_struct", "pair_residual_struct_ncnc"],
+    help="Optional prediction decoder trained separately from the edit decoder.",
+)
 parser.add_argument("--prediction_rank_weight", type=float, default=1.0, help="Weight for prediction-decoder HeaRT ranking loss.")
 parser.add_argument("--prediction_bce_weight", type=float, default=0.1, help="Weight for sampled train-edge BCE on prediction-decoder logits.")
 parser.add_argument("--prediction_rank_margin", type=float, default=0.2, help="Margin for prediction-decoder ranking loss.")
@@ -248,11 +287,29 @@ parser.add_argument(
     help="Weight of edit_total_loss when --phase2_task_main_loss is enabled.",
 )
 parser.add_argument("--editor_pull_strength", type=float, default=0.10, help="Direct latent pulling strength (the augmentation trigger).")
+parser.add_argument(
+    "--editor_push_scope",
+    type=str,
+    default="none",
+    choices=["none", "noncompact_cp", "noise", "noncompact_cp_and_noise"],
+    help="Optional direct latent push-away scope applied after pulling.",
+)
+parser.add_argument("--editor_noncompact_push_strength", type=float, default=0.0, help="Push strength for non-C0p non-noise CP nodes.")
+parser.add_argument("--editor_noise_push_strength", type=float, default=0.0, help="Push strength for GMM noise nodes.")
+parser.add_argument("--editor_push_preserve_norm", dest="editor_push_preserve_norm", action="store_true", help="Rescale pushed embeddings back to their original norm.")
+parser.add_argument("--no_editor_push_preserve_norm", dest="editor_push_preserve_norm", action="store_false", help="Do not preserve embedding norms after push-away edits.")
 parser.add_argument("--editor_edit_scale", type=float, default=0.0)
 parser.add_argument("--edit_start_epoch", type=int, default=10)
 parser.add_argument("--edit_train_start_epoch", type=int, default=-1, help="Epoch to start edit-decoder training. -1 follows edit_start_epoch for backward compatibility.")
 parser.add_argument("--decoded_rewrite_start_epoch", type=int, default=-1, help="Epoch to start applying decoded graph rewrites. -1 follows edit_start_epoch for backward compatibility.")
+parser.add_argument("--decoded_rewrite_every", type=int, default=1, help="Apply decoded graph rewrites every N epochs after rewrite start. Default keeps every-epoch rewrites.")
 parser.add_argument("--eval_log_every", type=int, default=5)
+parser.add_argument("--train_eval_every", type=int, default=1, help="Run non-HeaRT validation/test evaluation every N epochs. Default keeps per-epoch evaluation.")
+parser.add_argument("--skip_train_acc", action="store_true", help="Skip per-epoch full-matrix train accuracy during training evaluation.")
+parser.add_argument("--decoder_diag_every", type=int, default=-1, help="Run decoder score diagnostics every N epochs; -1 means every evaluated epoch, 0 disables training-time diagnostics.")
+parser.add_argument("--edit_metric_every", type=int, default=1, help="Run edit compactness/radius diagnostics every N epochs; 0 disables training-time edit metrics.")
+parser.add_argument("--edge_eval", dest="edge_eval", action="store_true", help="Evaluate validation/test edges with edge-only scoring instead of materializing a full score matrix.")
+parser.add_argument("--full_matrix_eval", dest="edge_eval", action="store_false", help="Materialize a full score matrix for validation/test evaluation.")
 parser.add_argument("--freeze_c0p_at_edit_start", dest="freeze_c0p_at_edit_start", action="store_true", help="Freeze GMM/C0p targets once editing starts.")
 parser.add_argument("--dynamic_c0p_targets", dest="freeze_c0p_at_edit_start", action="store_false", help="Recompute GMM/C0p targets every time instead of freezing them.")
 parser.add_argument("--use_decoded_graph_augment", action="store_true", help="Decode the pulled latent into a rewritten graph, then re-encode on that graph.")
@@ -265,11 +322,16 @@ parser.add_argument("--decoded_remove_quantile", type=float, default=None, help=
 parser.add_argument("--decoded_max_add_per_round", type=int, default=None, help="Hard cap on decoded edge additions per rewrite round.")
 parser.add_argument("--decoded_max_remove_per_round", type=int, default=None, help="Hard cap on decoded edge removals per rewrite round.")
 parser.add_argument("--decoded_graph_aug_bound", type=float, default=-1.0, help="Per-node cap fraction for decoded graph additions. Set <= 0 to disable the cap entirely.")
+parser.add_argument("--decoded_add_degree_target", type=int, default=-1, help="If >0, prioritize decoded additions that lift rewrite-mask nodes toward this minimum degree.")
+parser.add_argument("--decoded_add_degree_target_scope", type=str, default="total", choices=["total", "intra_cluster"], help="Degree used by --decoded_add_degree_target: total graph degree or same-cluster induced degree.")
+parser.add_argument("--decoded_add_degree_target_nodes", type=str, default="rewrite", choices=["rewrite", "cp", "cluster_deficit", "rewrite_or_cluster_deficit"], help="Nodes repaired by --decoded_add_degree_target: rewrite mask, all non-noise CP nodes, CP nodes below target, or rewrite mask plus CP deficits.")
+parser.add_argument("--decoded_guarantee_degree_target", action="store_true", help="Let the degree-target repair pass exceed add_ratio and per-node caps so target nodes reach the requested degree whenever valid candidates exist.")
 parser.add_argument("--decoded_degree_floor", type=int, default=None, help="Minimum degree floor (excluding self-loops) when removing decoded edges. Defaults to the run's degree threshold floor.")
 parser.add_argument("--decoded_allow_cross_cluster", dest="decoded_same_cluster_only", action="store_false", help="Allow decoded rewrites across clusters.")
 parser.add_argument("--decoded_same_cluster_only", dest="decoded_same_cluster_only", action="store_true", help="Restrict decoded rewrites to same-cluster pairs only.")
 parser.add_argument("--decoded_require_c0p_endpoint", dest="decoded_require_c0p_endpoint", action="store_true", help="Require at least one endpoint of a rewritten edge to be in C0p.")
 parser.add_argument("--decoded_no_c0p_endpoint", dest="decoded_require_c0p_endpoint", action="store_false", help="Do not require C0p membership for rewritten edges.")
+parser.add_argument("--decoded_require_c0p_noncompact_endpoint", action="store_true", help="Require decoded rewritten edges to connect one C0p endpoint to one non-C0p CP endpoint.")
 parser.add_argument("--decoded_accumulate_into_base", dest="decoded_accumulate_into_base", action="store_true", help="Persist decoded graph rewrites into the base training graph across epochs.")
 parser.add_argument("--decoded_temporary_view_only", dest="decoded_accumulate_into_base", action="store_false", help="Use the decoded rewritten graph only for the current augmented view; do not persist it into the base graph.")
 parser.add_argument("--decoded_require_both_c0p", action="store_true", help="Require both endpoints of a rewritten edge to be in C0p.")
@@ -296,6 +358,8 @@ parser.set_defaults(
     decoder_warmup_in_phase1=True,
     phase2_decoder_inference_only=True,
     decoder_normalize_input=True,
+    editor_push_preserve_norm=True,
+    edge_eval=True,
 )
 
 # also use: --ver aron_desc or --ver aron_asc
@@ -368,12 +432,26 @@ def main():
         pretrain_epochs=args.pretrain_epochs,
         frozen_scores_path=args.frozen_scores,
         pretrained_ckpt_path=args.pretrained_ckpt,
+        ae_backbone=args.ae_backbone,
+        maskgae_mask_rate=args.maskgae_mask_rate,
+        maskgae_feature_weight=args.maskgae_feature_weight,
+        cimage_factor_weight=args.cimage_factor_weight,
+        cimage_cluster_weight=args.cimage_cluster_weight,
+        cimage_num_factors=args.cimage_num_factors,
+        cimage_num_clusters=args.cimage_num_clusters,
+        cimage_cluster_alpha=args.cimage_cluster_alpha,
+        cimage_pseudo_label_threshold=args.cimage_pseudo_label_threshold,
+        cimage_factor_select_ratio=args.cimage_factor_select_ratio,
+        cimage_mrmr_redundancy_weight=args.cimage_mrmr_redundancy_weight,
+        cimage_cluster_balance_weight=args.cimage_cluster_balance_weight,
+        cimage_sce_power=args.cimage_sce_power,
         split_mode=args.split_mode,
         heart_data_dir=args.heart_data_dir,
         heart_filename=args.heart_filename,
         heart_eval_every=args.heart_eval_every,
         heart_val_frac=args.heart_val_frac,
         heart_checkpoint_metric=args.heart_checkpoint_metric,
+        lp_train_graph=args.lp_train_graph,
         # NEW
         dbscan_eps=args.dbscan_eps,
         dbscan_min_samples=args.dbscan_min_samples,
@@ -431,11 +509,21 @@ def main():
         phase2_task_main_loss=args.phase2_task_main_loss,
         edit_phase_edit_weight=args.edit_phase_edit_weight,
         editor_pull_strength=args.editor_pull_strength,
+        editor_push_scope=args.editor_push_scope,
+        editor_noncompact_push_strength=args.editor_noncompact_push_strength,
+        editor_noise_push_strength=args.editor_noise_push_strength,
+        editor_push_preserve_norm=args.editor_push_preserve_norm,
         editor_edit_scale=args.editor_edit_scale,
         edit_start_epoch=args.edit_start_epoch,
         edit_train_start_epoch=args.edit_train_start_epoch,
         decoded_rewrite_start_epoch=args.decoded_rewrite_start_epoch,
+        decoded_rewrite_every=args.decoded_rewrite_every,
         eval_log_every=args.eval_log_every,
+        train_eval_every=args.train_eval_every,
+        skip_train_acc=args.skip_train_acc,
+        decoder_diag_every=args.decoder_diag_every,
+        edit_metric_every=args.edit_metric_every,
+        edge_eval=args.edge_eval,
         freeze_c0p_at_edit_start=args.freeze_c0p_at_edit_start,
         use_decoded_graph_augment=args.use_decoded_graph_augment,
         decoded_add_ratio=args.decoded_add_ratio,
@@ -449,7 +537,12 @@ def main():
         decoded_same_cluster_only=args.decoded_same_cluster_only,
         decoded_require_c0p_endpoint=args.decoded_require_c0p_endpoint,
         decoded_require_both_c0p=args.decoded_require_both_c0p,
+        decoded_require_c0p_noncompact_endpoint=args.decoded_require_c0p_noncompact_endpoint,
         decoded_graph_aug_bound=args.decoded_graph_aug_bound,
+        decoded_add_degree_target=args.decoded_add_degree_target,
+        decoded_add_degree_target_scope=args.decoded_add_degree_target_scope,
+        decoded_add_degree_target_nodes=args.decoded_add_degree_target_nodes,
+        decoded_guarantee_degree_target=args.decoded_guarantee_degree_target,
         decoded_degree_floor=args.decoded_degree_floor,
         decoded_accumulate_into_base=args.decoded_accumulate_into_base,
         decoded_edit_end_epoch=args.decoded_edit_end_epoch,
@@ -574,7 +667,11 @@ if __name__ == "__main__":
         if args.use_decoded_graph_augment:
             rewrite_mode = "accum" if args.decoded_accumulate_into_base else "temp"
             cluster_scope = "samecl" if args.decoded_same_cluster_only else "crosscl"
-            endpoint_scope = "bothc0p" if args.decoded_require_both_c0p else ("onec0p" if args.decoded_require_c0p_endpoint else "noc0p")
+            endpoint_scope = (
+                "c0p-noncompact" if args.decoded_require_c0p_noncompact_endpoint else
+                "bothc0p" if args.decoded_require_both_c0p else
+                ("onec0p" if args.decoded_require_c0p_endpoint else "noc0p")
+            )
             add_tag = (
                 f"aq{_fmt_num(args.decoded_add_quantile)}" if args.decoded_add_quantile is not None else
                 f"at{_fmt_num(args.decoded_add_threshold)}" if args.decoded_add_threshold is not None else
@@ -593,6 +690,14 @@ if __name__ == "__main__":
                 add_tag,
                 remove_tag,
             ])
+            if int(args.decoded_add_degree_target) > 0:
+                extra_tags.append(f"dtarget{args.decoded_add_degree_target}")
+                if args.decoded_add_degree_target_scope != "total":
+                    extra_tags.append(f"dtargetscope-{args.decoded_add_degree_target_scope}")
+                if args.decoded_add_degree_target_nodes != "rewrite":
+                    extra_tags.append(f"dtargetnodes-{args.decoded_add_degree_target_nodes}")
+                if args.decoded_guarantee_degree_target:
+                    extra_tags.append("dtarget-guarantee")
         else:
             extra_tags.append("norewrite")
 
@@ -603,6 +708,12 @@ if __name__ == "__main__":
         ])
         if args.run_tag:
             extra_tags.append(f"tag-{args.run_tag}")
+        if args.ae_backbone != "vgnae":
+            extra_tags.append(f"ae-{args.ae_backbone}")
+        if args.editor_push_scope != "none":
+            extra_tags.append(f"push-{args.editor_push_scope}")
+            extra_tags.append(f"ncpush{_fmt_num(args.editor_noncompact_push_strength)}")
+            extra_tags.append(f"noisepush{_fmt_num(args.editor_noise_push_strength)}")
 
         fname_parts = [
             args.dataset,
@@ -633,6 +744,9 @@ if __name__ == "__main__":
         print(f"date={args.date} time={time.strftime('%F %T')}")
         print(f"dataset={args.dataset} ver={args.ver} mode={args.cluster_mode} method={args.cluster_method}")
         print(f"seed={args.seed} idx={args.idx} run_tag={args.run_tag or '<none>'}")
+        print(f"ae_backbone={args.ae_backbone} maskgae_mask_rate={args.maskgae_mask_rate} maskgae_feature_weight={args.maskgae_feature_weight}")
+        print(f"cimage_factor_weight={args.cimage_factor_weight} cimage_cluster_weight={args.cimage_cluster_weight} cimage_num_factors={args.cimage_num_factors} cimage_num_clusters={args.cimage_num_clusters} cimage_cluster_alpha={args.cimage_cluster_alpha}")
+        print(f"cimage_pseudo_label_threshold={args.cimage_pseudo_label_threshold} cimage_factor_select_ratio={args.cimage_factor_select_ratio} cimage_mrmr_redundancy_weight={args.cimage_mrmr_redundancy_weight} cimage_cluster_balance_weight={args.cimage_cluster_balance_weight} cimage_sce_power={args.cimage_sce_power}")
         print(f"aug_ratio={args.aug_ratio} aug_bound={args.aug_bound} degree_thr={args.degree_threshold}")
         print(f"topk_per_node={args.topk_per_node} aug_ratio_epoch={args.aug_ratio_epoch}")
         if args.restricted:
@@ -644,9 +758,10 @@ if __name__ == "__main__":
         print(f"phase2_task_main_loss={int(args.phase2_task_main_loss)} edit_phase_edit_weight={args.edit_phase_edit_weight}")
         print(f"phase2_freeze_encoder={int(args.phase2_freeze_encoder)} edit_phase_encoder_lr_scale={args.edit_phase_encoder_lr_scale}")
         print(f"compactness_objective={args.compactness_objective} compactness_radius_metric={args.compactness_radius_metric} compactness_weight={args.compactness_weight}")
+        print(f"editor_push_scope={args.editor_push_scope} noncompact_push={args.editor_noncompact_push_strength} noise_push={args.editor_noise_push_strength} push_preserve_norm={int(args.editor_push_preserve_norm)}")
         print(f"decoded_edit_end_epoch={args.decoded_edit_end_epoch} decoder_warmup_in_phase1={int(args.decoder_warmup_in_phase1)} decoder_warmup_recon_weight={args.decoder_warmup_recon_weight} decoder_warmup_use_pulled_latent={int(args.decoder_warmup_use_pulled_latent)} phase2_decoder_inference_only={int(args.phase2_decoder_inference_only)}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} add_thr={args.decoded_add_threshold} remove_thr={args.decoded_remove_threshold} add_q={args.decoded_add_quantile} remove_q={args.decoded_remove_quantile} max_add={args.decoded_max_add_per_round} max_remove={args.decoded_max_remove_per_round}")
-        print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} per_node_cap={args.decoded_graph_aug_bound}")
+        print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} c0p_noncompact_endpoint={int(args.decoded_require_c0p_noncompact_endpoint)} per_node_cap={args.decoded_graph_aug_bound} add_degree_target={args.decoded_add_degree_target} add_degree_target_scope={args.decoded_add_degree_target_scope} add_degree_target_nodes={args.decoded_add_degree_target_nodes} guarantee_degree_target={int(args.decoded_guarantee_degree_target)}")
         print("====================")
 
         try:

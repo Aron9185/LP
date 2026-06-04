@@ -7,7 +7,9 @@ Their preprocessing source was used as-is.
 '''
 import numpy as np
 import scipy.sparse as sp
-from torch_geometric.utils.convert import to_scipy_sparse_matrix
+from torch_geometric.data import Data
+from torch_geometric.utils.convert import from_scipy_sparse_matrix, to_scipy_sparse_matrix
+import torch_geometric.transforms as T
 import torch
 
 import os
@@ -45,6 +47,65 @@ def save_data(filename, data):
 def load_data(filename):
     with open(filename, 'rb') as f:
         return pickle.load(f)
+
+
+def _edge_label_index_to_numpy(edge_label_index):
+    return edge_label_index.t().detach().cpu().numpy().astype(np.int64)
+
+
+def mask_test_edges_cimage_paper(adj, dataset_str, split_seed=None):
+    """Build the CIMAGE paper/default RandomLinkSplit protocol.
+
+    CIMAGE's link-prediction entry point uses PyG RandomLinkSplit with
+    num_val=0.1 and num_test=0.05. The training graph leakage is controlled
+    separately by ARON's lp_train_graph flag; this function only defines the
+    held-out validation/test edges and their negatives.
+    """
+    seed_token = "default" if split_seed is None else str(int(split_seed))
+    filename = f'/home/retro/ARON/mask_edge/{dataset_str}_cimagepaper_splitseed{seed_token}_mask_edge.pkl'
+    if os.path.exists(filename):
+        return load_data(filename)
+
+    adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+    adj.eliminate_zeros()
+    assert np.diag(adj.todense()).sum() == 0
+
+    edge_index = from_scipy_sparse_matrix(adj.tocoo())[0]
+    data = Data(edge_index=edge_index, num_nodes=adj.shape[0])
+    transform = T.RandomLinkSplit(
+        num_val=0.1,
+        num_test=0.05,
+        is_undirected=True,
+        split_labels=True,
+        add_negative_train_samples=True,
+    )
+
+    with torch.random.fork_rng(devices=[]):
+        if split_seed is not None:
+            torch.manual_seed(int(split_seed))
+        train_data, val_data, test_data = transform(data)
+
+    train_edge_index = train_data.edge_index.detach().cpu()
+    adj_train = sp.csr_matrix(
+        (
+            np.ones(train_edge_index.shape[1], dtype=np.float32),
+            (train_edge_index[0].numpy(), train_edge_index[1].numpy()),
+        ),
+        shape=adj.shape,
+    )
+    adj_train = adj_train.maximum(adj_train.T)
+    adj_train.setdiag(0)
+    adj_train.eliminate_zeros()
+
+    train_edges = sparse_to_tuple(sp.triu(adj_train))[0].astype(np.int64)
+    val_edges = _edge_label_index_to_numpy(val_data.pos_edge_label_index)
+    val_edges_false = _edge_label_index_to_numpy(val_data.neg_edge_label_index)
+    test_edges = _edge_label_index_to_numpy(test_data.pos_edge_label_index)
+    test_edges_false = _edge_label_index_to_numpy(test_data.neg_edge_label_index)
+
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    save_data(filename, (adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false))
+    return adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false
 
 
 def mask_test_edges(adj, dataset_str, split_seed=None):
