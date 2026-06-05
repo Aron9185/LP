@@ -265,7 +265,13 @@ parser.add_argument(
     "--prediction_decoder_type",
     type=str,
     default="none",
-    choices=["none", "pair_residual_struct", "pair_residual_struct_ncnc", "pair_residual_struct_ocn"],
+    choices=[
+        "none",
+        "pair_residual_struct",
+        "pair_residual_struct_ncnc",
+        "pair_residual_struct_ncnc_multi",
+        "pair_residual_struct_ocn",
+    ],
     help="Optional prediction decoder trained separately from the edit decoder.",
 )
 parser.add_argument("--prediction_rank_weight", type=float, default=1.0, help="Weight for prediction-decoder HeaRT ranking loss.")

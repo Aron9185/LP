@@ -822,6 +822,148 @@ class NCNCResidualStructuralPairPredictionDecoder(ResidualStructuralPairPredicti
         return [residual_cn[src, dst].view(-1, 1)]
 
 
+class MultiOrderNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructuralPairPredictionDecoder):
+    """NCNC residual decoder with gated higher-order completed-CN aggregation."""
+
+    scalar_dim = 18
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        normalize_input: bool = True,
+        max_pair_rows: int = 16,
+    ):
+        super().__init__(
+            dim,
+            hidden_dim,
+            normalize_input=normalize_input,
+            max_pair_rows=max_pair_rows,
+        )
+        self.multi_order_gate_logits = nn.Parameter(torch.tensor([-2.0, -3.0], dtype=torch.float32))
+
+    @staticmethod
+    def _positive_logmax_pair_feature(feature: torch.Tensor) -> torch.Tensor:
+        out = torch.log1p(feature.clamp_min(0.0))
+        out.fill_diagonal_(0.0)
+        max_val = out.max()
+        if bool(torch.isfinite(max_val)) and float(max_val.item()) > 0.0:
+            out = out / max_val.clamp_min(1e-12)
+        return out
+
+    @staticmethod
+    def _center_and_scale_pair_feature(feature: torch.Tensor) -> torch.Tensor:
+        out = feature.clone()
+        out.fill_diagonal_(0.0)
+        out = out - out.mean()
+        out.fill_diagonal_(0.0)
+        max_abs = out.abs().max()
+        if bool(torch.isfinite(max_abs)) and float(max_abs.item()) > 0.0:
+            out = out / max_abs.clamp_min(1e-12)
+        return out
+
+    @staticmethod
+    def _orthogonalize_pair_feature(feature: torch.Tensor, bases: list[torch.Tensor]) -> torch.Tensor:
+        flat = feature.reshape(-1)
+        for base in bases:
+            base_flat = base.reshape(-1)
+            denom = torch.dot(base_flat, base_flat).clamp_min(1e-12)
+            flat = flat - torch.dot(flat, base_flat) / denom * base_flat
+        return flat.view_as(feature)
+
+    def _ncnc_multi_order_matrices(
+        self,
+        Z: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        adj_dense = self._pair_matrix(self.adj_feat, n_nodes, dtype, device)
+        if adj_dense.numel() == 0 or tuple(adj_dense.shape) != (n_nodes, n_nodes):
+            return [torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device) for _ in range(3)]
+        if self.adj_sparse_feat.numel() == 0 or tuple(self.adj_sparse_feat.shape) != (n_nodes, n_nodes):
+            return [torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device) for _ in range(3)]
+
+        key = ("ncnc_multi",) + self._completion_cache_key(Z)
+        if self._pair_feature_cache_key == key and "ncnc_multi_features" in self._pair_feature_cache:
+            return [feat.to(device=device, dtype=dtype) for feat in self._pair_feature_cache["ncnc_multi_features"]]
+
+        with torch.no_grad():
+            z_detached = Z.detach()
+            raw_prob = torch.sigmoid(z_detached @ z_detached.t()).to(dtype=dtype, device=device)
+            missing_mask = (1.0 - adj_dense).clamp_min(0.0)
+            missing_mask.fill_diagonal_(0.0)
+            prob_missing = raw_prob * missing_mask
+            prob_missing.fill_diagonal_(0.0)
+
+            adj_sparse = self.adj_sparse_feat.to(device=device, dtype=dtype).coalesce()
+            ap = torch.sparse.mm(adj_sparse, prob_missing)
+            a2p = torch.sparse.mm(adj_sparse, ap)
+            a3p = torch.sparse.mm(adj_sparse, a2p)
+
+            order2 = ap + ap.t()
+            order3 = a2p + a2p.t()
+            order4 = a3p + a3p.t()
+            for feature in (order2, order3, order4):
+                feature.fill_diagonal_(0.0)
+
+            order2_norm = self._positive_logmax_pair_feature(order2)
+            order3_norm = self._positive_logmax_pair_feature(order3)
+            order4_norm = self._positive_logmax_pair_feature(order4)
+
+            order2_base = self._center_and_scale_pair_feature(order2_norm)
+            order3_centered = self._center_and_scale_pair_feature(order3_norm)
+            order3_orth = self._orthogonalize_pair_feature(order3_centered, [order2_base])
+            order3_orth = self._center_and_scale_pair_feature(order3_orth)
+
+            order4_centered = self._center_and_scale_pair_feature(order4_norm)
+            order4_orth = self._orthogonalize_pair_feature(order4_centered, [order2_base, order3_orth])
+            order4_orth = self._center_and_scale_pair_feature(order4_orth)
+
+            features = [
+                order2_norm.to(device=device, dtype=dtype),
+                order3_orth.to(device=device, dtype=dtype),
+                order4_orth.to(device=device, dtype=dtype),
+            ]
+
+        self._pair_feature_cache_key = key
+        self._pair_feature_cache = {"ncnc_multi_features": features}
+        return features
+
+    def _gated_multi_order_features(
+        self,
+        Z: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        order2, order3, order4 = self._ncnc_multi_order_matrices(Z, n_nodes, dtype, device)
+        gates = torch.sigmoid(self.multi_order_gate_logits).to(device=device, dtype=dtype)
+        return [order2, order3 * gates[0], order4 * gates[1]]
+
+    def _extra_pair_matrix_scalar_features(
+        self,
+        Z: torch.Tensor,
+        start: int,
+        end: int,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        return [feat[start:end] for feat in self._gated_multi_order_features(Z, n_nodes, dtype, device)]
+
+    def _extra_pair_scalar_features(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        return [feat[src, dst].view(-1, 1) for feat in self._gated_multi_order_features(Z, n_nodes, dtype, device)]
+
+
 class OCNResidualStructuralPairPredictionDecoder(ResidualStructuralPairPredictionDecoder):
     """Residual prediction decoder with OCN-style higher-order CN features."""
 
@@ -3215,6 +3357,13 @@ def train_encoder(
             normalize_input=decoder_normalize_input,
             max_pair_rows=mlp_pair_max_rows,
         ).to(device)
+    elif prediction_decoder_type == "pair_residual_struct_ncnc_multi":
+        prediction_decoder = MultiOrderNCNCResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+        ).to(device)
     elif prediction_decoder_type == "pair_residual_struct_ocn":
         prediction_decoder = OCNResidualStructuralPairPredictionDecoder(
             hidden2,
@@ -3224,7 +3373,7 @@ def train_encoder(
         ).to(device)
     else:
         raise ValueError(
-            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', or 'pair_residual_struct_ocn'."
+            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', 'pair_residual_struct_ncnc_multi', or 'pair_residual_struct_ocn'."
         )
 
     def _set_struct_decoder_context(
