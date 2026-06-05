@@ -3129,6 +3129,19 @@ def train_encoder(
                 prediction_decoder.set_graph_context(graph_dense)
             prediction_decoder.set_cluster_context(labels_np, core_mask_t)
 
+    def _decoded_graph_scorer():
+        return graph_decoder if graph_decoder is not None else prediction_decoder
+
+    def _set_decoded_graph_scorer_context(
+        graph_dense=None,
+        labels_np: np.ndarray | None = None,
+        core_mask_t: torch.Tensor | None = None,
+    ) -> None:
+        if graph_decoder is not None:
+            _set_struct_decoder_context(graph_dense, labels_np, core_mask_t)
+        elif prediction_decoder is not None:
+            _set_prediction_decoder_context(graph_dense, labels_np, core_mask_t)
+
     if isinstance(graph_decoder, StructuralPairGraphDecoder):
         _set_struct_decoder_context(adj_train, None, None)
         print("[DECODER] pair_mlp_struct edit graph context initialized from train graph")
@@ -3318,7 +3331,7 @@ def train_encoder(
         return ep >= edit_train_start_epoch and _edit_allowed_before_end(ep)
 
     def _decoded_edit_active(ep: int) -> bool:
-        if not (use_edited_decoder and (graph_decoder is not None)):
+        if _decoded_graph_scorer() is None:
             return False
         return ep >= decoded_rewrite_start_epoch and _edit_allowed_before_end(ep)
 
@@ -4872,10 +4885,13 @@ def train_encoder(
                             f"noise_cosdist_after={pull_push_diag_epoch['push_noise_anchor_cosdist_after']:.6f}"
                         )
                         decoder_graph_context = None if ((not decoded_accumulate_into_base) and ver == "no") else g
-                        _set_struct_decoder_context(decoder_graph_context, decoded_labels_epoch, decoded_c0p_mask_epoch)
-                        if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
+                        decoded_scorer = _decoded_graph_scorer()
+                        if decoded_scorer is None:
+                            raise RuntimeError("decoded graph augment requires an edit decoder or prediction decoder scorer")
+                        _set_decoded_graph_scorer_context(decoder_graph_context, decoded_labels_epoch, decoded_c0p_mask_epoch)
+                        if isinstance(decoded_scorer, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
                             g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph_from_decoder(
-                                graph_decoder,
+                                decoded_scorer,
                                 z_pull_seed,
                                 g,
                                 decoded_labels_epoch,
@@ -4903,7 +4919,7 @@ def train_encoder(
                             )
                         else:
                             with torch.no_grad():
-                                decoded_scores = graph_decoder(z_pull_seed).detach()
+                                decoded_scores = decoded_scorer(z_pull_seed).detach()
                             g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph(
                                 decoded_scores,
                                 g,
@@ -5659,7 +5675,7 @@ def train_encoder(
                     eval_compactness_mask = eval_c0p_mask if compactness_mask_scope == "c0p" else eval_cp_mask
                     eval_rewrite_mask = eval_c0p_mask if rewrite_endpoint_scope == "c0p" else eval_cp_mask
                     eval_noncompact_mask = noncompact_node_mask(eval_cp_mask, eval_c0p_mask)
-                    _set_struct_decoder_context(None, eval_labels, eval_c0p_mask)
+                    _set_decoded_graph_scorer_context(None, eval_labels, eval_c0p_mask)
 
                     radius_before = cluster_compactness_loss(Z, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
                     c0p_radius_before = cluster_compactness_loss(Z, eval_labels, eval_c0p_mask, radius_metric=compactness_radius_metric)
@@ -5720,9 +5736,12 @@ def train_encoder(
                                 )
                                 decoded_degree_floor_eff = max(0, int(degree_threshold) - 1) if decoded_degree_floor is None else int(decoded_degree_floor)
                                 decoded_bound_eff = None if (decoded_graph_aug_bound is None or float(decoded_graph_aug_bound) <= 0) else float(decoded_graph_aug_bound)
-                                if isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
+                                decoded_eval_scorer = _decoded_graph_scorer()
+                                if decoded_eval_scorer is None:
+                                    raise RuntimeError("decoded graph augment eval requires an edit decoder or prediction decoder scorer")
+                                if isinstance(decoded_eval_scorer, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
                                     g_eval, _, _ = build_decoded_augmented_graph_from_decoder(
-                                        graph_decoder,
+                                        decoded_eval_scorer,
                                         Z_pull_eval,
                                         _to_dense(adj_label),
                                         eval_labels,
@@ -5750,7 +5769,7 @@ def train_encoder(
                                     )
                                 else:
                                     with torch.no_grad():
-                                        decoded_scores_eval = graph_decoder(Z_pull_eval)
+                                        decoded_scores_eval = decoded_eval_scorer(Z_pull_eval)
                                     g_eval, _, _ = build_decoded_augmented_graph(
                                         decoded_scores_eval,
                                         _to_dense(adj_label),

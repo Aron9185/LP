@@ -1,11 +1,7 @@
 """Run the two-decoder editor matrix.
 
-This runner keeps pair_mlp_struct as the edit decoder and adds a residual
-structural prediction decoder trained with HeaRT-style ranking/BCE:
-  1. edit decoder + dot final scorer
-  2. edit decoder + prediction decoder final scorer
-  3. edit decoder + dot final scorer + removal
-  4. edit decoder + prediction decoder final scorer + removal
+This runner supports edit-decoder, prediction-decoder, and shared-scorer
+ablation variants trained with HeaRT-style ranking/BCE.
 """
 
 import argparse
@@ -23,34 +19,90 @@ from run_research_matrix import extract_metrics, flatten_summary_columns, merge_
 
 PAIR_SCORER_CONFIGS = [
     {
+        "name": "one_decoder_dot",
+        "family": "one_decoder",
+        "score_source": "dot",
+        "prediction_decoder_type": "none",
+        "use_edit_decoder": True,
+        "remove": False,
+    },
+    {
+        "name": "one_decoder_ncnc",
+        "family": "one_decoder_ncnc",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ncnc",
+        "use_edit_decoder": False,
+        "remove": False,
+    },
+    {
         "name": "two_decoder_dot",
         "family": "two_decoder",
         "score_source": "dot",
+        "prediction_decoder_type": "pair_residual_struct",
+        "use_edit_decoder": True,
         "remove": False,
     },
     {
         "name": "two_decoder_pred",
         "family": "two_decoder",
         "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct",
+        "use_edit_decoder": True,
         "remove": False,
+    },
+    {
+        "name": "two_decoder_ncnc_pred",
+        "family": "two_decoder_ncnc",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ncnc",
+        "use_edit_decoder": True,
+        "remove": False,
+    },
+    {
+        "name": "one_decoder_dot_remove",
+        "family": "one_decoder_remove",
+        "score_source": "dot",
+        "prediction_decoder_type": "none",
+        "use_edit_decoder": True,
+        "remove": True,
+    },
+    {
+        "name": "one_decoder_ncnc_remove",
+        "family": "one_decoder_ncnc_remove",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ncnc",
+        "use_edit_decoder": False,
+        "remove": True,
     },
     {
         "name": "two_decoder_dot_remove",
         "family": "two_decoder_remove",
         "score_source": "dot",
+        "prediction_decoder_type": "pair_residual_struct",
+        "use_edit_decoder": True,
         "remove": True,
     },
     {
         "name": "two_decoder_pred_remove",
         "family": "two_decoder_remove",
         "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct",
+        "use_edit_decoder": True,
+        "remove": True,
+    },
+    {
+        "name": "two_decoder_ncnc_pred_remove",
+        "family": "two_decoder_ncnc_remove",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ncnc",
+        "use_edit_decoder": True,
         "remove": True,
     },
 ]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run two-decoder editor experiments.")
+    parser = argparse.ArgumentParser(description="Run pair-scorer editor experiments.")
     parser.add_argument("--prefix", type=str, default="heart_two_decoder_editor_smoke")
     parser.add_argument("--datasets", nargs="+", default=["cora", "citeseer"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -203,7 +255,6 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--edit_metric_every", str(args.edit_metric_every),
         "--run_tag", cfg["name"],
         "--ver", "no",
-        "--use_edited_decoder",
         "--use_decoded_graph_augment",
         "--dynamic_c0p_targets",
         "--no_decoder_warmup_in_phase1",
@@ -229,7 +280,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--heart_rank_margin", str(args.heart_rank_margin),
         "--heart_rank_neg_k", str(args.heart_rank_neg_k),
         "--heart_rank_pool_factor", str(args.heart_rank_pool_factor),
-        "--prediction_decoder_type", "pair_residual_struct",
+        "--prediction_decoder_type", str(cfg.get("prediction_decoder_type", "pair_residual_struct")),
         "--prediction_rank_weight", str(args.prediction_rank_weight),
         "--prediction_bce_weight", str(args.prediction_bce_weight),
         "--prediction_rank_margin", str(args.prediction_rank_margin),
@@ -239,6 +290,8 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
+    if cfg.get("use_edit_decoder", True):
+        cmd.append("--use_edited_decoder")
     if args.skip_train_acc:
         cmd.append("--skip_train_acc")
     if args.full_matrix_eval:
@@ -305,7 +358,7 @@ def main():
     tasks = [(idx, len(task_specs), cfg, dataset, seed) for idx, (cfg, dataset, seed) in enumerate(task_specs, start=1)]
 
     print(
-        f"Two-decoder editor matrix: {len(tasks)} runs "
+        f"Pair-scorer editor matrix: {len(tasks)} runs "
         f"(split={args.split_mode}, datasets={args.datasets}, seeds={args.seeds}, workers={args.max_workers})",
         flush=True,
     )
@@ -422,7 +475,7 @@ def main():
     summary_path = artifact_path(f"{args.prefix}_summary.csv")
     summary_df.to_csv(summary_path, index=False)
 
-    print("\n=== HeaRT Two-Decoder Editor Summary ===")
+    print("\n=== Pair-Scorer Editor Summary ===")
     print(summary_df.to_string(index=False))
     print(f"\nRaw runs saved to {raw_path}")
     print(f"Summary saved to {summary_path}")
