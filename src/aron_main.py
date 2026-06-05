@@ -114,6 +114,13 @@ parser.add_argument(
     help="Validation metric used to select HeaRT checkpoints.",
 )
 parser.add_argument(
+    "--random_checkpoint_metric",
+    type=str,
+    default="roc",
+    choices=["roc", "ap", "hit1", "hit3", "hit10", "hit20", "hit50", "hit100"],
+    help="Validation metric used to select random/cimage-paper split checkpoints.",
+)
+parser.add_argument(
     "--lp_train_graph",
     type=str,
     default="train",
@@ -258,7 +265,7 @@ parser.add_argument(
     "--prediction_decoder_type",
     type=str,
     default="none",
-    choices=["none", "pair_residual_struct", "pair_residual_struct_ncnc"],
+    choices=["none", "pair_residual_struct", "pair_residual_struct_ncnc", "pair_residual_struct_ocn"],
     help="Optional prediction decoder trained separately from the edit decoder.",
 )
 parser.add_argument("--prediction_rank_weight", type=float, default=1.0, help="Weight for prediction-decoder HeaRT ranking loss.")
@@ -451,6 +458,7 @@ def main():
         heart_eval_every=args.heart_eval_every,
         heart_val_frac=args.heart_val_frac,
         heart_checkpoint_metric=args.heart_checkpoint_metric,
+        random_checkpoint_metric=args.random_checkpoint_metric,
         lp_train_graph=args.lp_train_graph,
         # NEW
         dbscan_eps=args.dbscan_eps,

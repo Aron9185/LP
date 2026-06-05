@@ -59,6 +59,14 @@ PAIR_SCORER_CONFIGS = [
         "remove": False,
     },
     {
+        "name": "two_decoder_ocn_pred",
+        "family": "two_decoder_ocn",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ocn",
+        "use_edit_decoder": True,
+        "remove": False,
+    },
+    {
         "name": "one_decoder_dot_remove",
         "family": "one_decoder_remove",
         "score_source": "dot",
@@ -95,6 +103,14 @@ PAIR_SCORER_CONFIGS = [
         "family": "two_decoder_ncnc_remove",
         "score_source": "pred_decoder",
         "prediction_decoder_type": "pair_residual_struct_ncnc",
+        "use_edit_decoder": True,
+        "remove": True,
+    },
+    {
+        "name": "two_decoder_ocn_pred_remove",
+        "family": "two_decoder_ocn_remove",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ocn",
         "use_edit_decoder": True,
         "remove": True,
     },
@@ -149,6 +165,13 @@ def parse_args():
     parser.add_argument("--heart-eval-every", type=int, default=5)
     parser.add_argument("--heart-val-frac", type=float, default=1.0)
     parser.add_argument("--heart-checkpoint-metric", type=str, default="hit10")
+    parser.add_argument(
+        "--random-checkpoint-metric",
+        type=str,
+        choices=["roc", "ap", "hit1", "hit3", "hit10", "hit20", "hit50", "hit100"],
+        default="roc",
+        help="Validation metric used by random/cimage-paper split checkpoint selection.",
+    )
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -245,6 +268,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--seed", str(seed),
         "--epochs", str(args.epochs),
         "--split_mode", args.split_mode,
+        "--random_checkpoint_metric", args.random_checkpoint_metric,
         "--edit_start_epoch", str(args.edit_start_epoch),
         "--edit_train_start_epoch", str(args.edit_train_start_epoch),
         "--decoded_rewrite_start_epoch", str(args.decoded_rewrite_start_epoch),
@@ -446,6 +470,7 @@ def main():
         "heart_rank_weight",
         "heart_rank_margin",
         "heart_rank_neg_k",
+        "selection_score",
         "diag_dot_val_hit10",
         "diag_decoder_val_hit10",
         "diag_pred_val_hit10",

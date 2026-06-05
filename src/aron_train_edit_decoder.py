@@ -822,6 +822,108 @@ class NCNCResidualStructuralPairPredictionDecoder(ResidualStructuralPairPredicti
         return [residual_cn[src, dst].view(-1, 1)]
 
 
+class OCNResidualStructuralPairPredictionDecoder(ResidualStructuralPairPredictionDecoder):
+    """Residual prediction decoder with OCN-style higher-order CN features."""
+
+    scalar_dim = 18
+
+    def _ocn_cache_key(self, n_nodes: int, dtype: torch.dtype, device: torch.device) -> tuple:
+        adj_ptr = int(self.adj_feat.data_ptr()) if self.adj_feat.numel() else 0
+        adj_version = int(getattr(self.adj_feat, "_version", 0)) if self.adj_feat.numel() else 0
+        return (
+            "ocn",
+            adj_ptr,
+            adj_version,
+            int(n_nodes),
+            str(device),
+            str(dtype),
+        )
+
+    @staticmethod
+    def _center_and_scale_pair_feature(feature: torch.Tensor) -> torch.Tensor:
+        out = feature.clone()
+        out.fill_diagonal_(0.0)
+        out = out - out.mean()
+        out.fill_diagonal_(0.0)
+        max_abs = out.abs().max()
+        if bool(torch.isfinite(max_abs)) and float(max_abs.item()) > 0.0:
+            out = out / max_abs.clamp_min(1e-12)
+        return out
+
+    @staticmethod
+    def _orthogonalize_pair_feature(feature: torch.Tensor, bases: list[torch.Tensor]) -> torch.Tensor:
+        flat = feature.reshape(-1)
+        for base in bases:
+            base_flat = base.reshape(-1)
+            denom = torch.dot(base_flat, base_flat).clamp_min(1e-12)
+            flat = flat - torch.dot(flat, base_flat) / denom * base_flat
+        return flat.view_as(feature)
+
+    def _ocn_feature_matrices(
+        self,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        adj_dense = self._pair_matrix(self.adj_feat, n_nodes, dtype, device)
+        if adj_dense.numel() == 0 or tuple(adj_dense.shape) != (n_nodes, n_nodes):
+            return [torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device) for _ in range(3)]
+
+        key = self._ocn_cache_key(n_nodes, dtype, device)
+        if self._pair_feature_cache_key == key and "ocn_features" in self._pair_feature_cache:
+            return [feat.to(device=device, dtype=dtype) for feat in self._pair_feature_cache["ocn_features"]]
+
+        with torch.no_grad():
+            adj_binary = (adj_dense > 0).to(device=device, dtype=dtype).clone()
+            adj_binary.fill_diagonal_(0.0)
+            deg = adj_binary.sum(dim=1).clamp_min(1.0)
+            inv_sqrt_deg = deg.rsqrt()
+            norm_adj = adj_binary * inv_sqrt_deg.view(-1, 1) * inv_sqrt_deg.view(1, -1)
+
+            h2 = norm_adj @ norm_adj
+            h3 = h2 @ norm_adj
+            h4 = h3 @ norm_adj
+            h5 = h4 @ norm_adj
+
+            bases: list[torch.Tensor] = []
+            h2_base = self._center_and_scale_pair_feature(torch.log1p(h2.clamp_min(0.0)))
+            bases.append(h2_base)
+
+            ocn_features: list[torch.Tensor] = []
+            for raw_feature in (h3, h4, h5):
+                scaled = self._center_and_scale_pair_feature(torch.log1p(raw_feature.clamp_min(0.0)))
+                orthogonalized = self._orthogonalize_pair_feature(scaled, bases)
+                normalized = self._center_and_scale_pair_feature(orthogonalized)
+                bases.append(normalized)
+                ocn_features.append(normalized.to(device=device, dtype=dtype))
+
+        self._pair_feature_cache_key = key
+        self._pair_feature_cache = {"ocn_features": ocn_features}
+        return ocn_features
+
+    def _extra_pair_matrix_scalar_features(
+        self,
+        Z: torch.Tensor,
+        start: int,
+        end: int,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        return [feat[start:end] for feat in self._ocn_feature_matrices(n_nodes, dtype, device)]
+
+    def _extra_pair_scalar_features(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        return [feat[src, dst].view(-1, 1) for feat in self._ocn_feature_matrices(n_nodes, dtype, device)]
+
+
 def reconstruction_bce_loss(
     adj_pred: torch.Tensor,
     adj_label: torch.Tensor,
@@ -2857,20 +2959,27 @@ def train_encoder(
     if heart_val_frac <= 0.0 or heart_val_frac > 1.0:
         raise ValueError(f"heart_val_frac must be in (0, 1], got {heart_val_frac}")
     heart_test_on_best_val = bool(kwargs.get("heart_test_on_best_val", HEART_TEST_ON_BEST_VAL_DEFAULT))
+    checkpoint_hit_index = {"hit1": 0, "hit3": 1, "hit10": 2, "hit20": 3, "hit50": 4, "hit100": 5}
+    checkpoint_metric_choices = {"roc", "ap", *checkpoint_hit_index.keys()}
     heart_checkpoint_metric = str(kwargs.get("heart_checkpoint_metric", "roc")).lower()
-    heart_hit_index = {"hit1": 0, "hit3": 1, "hit10": 2, "hit20": 3, "hit50": 4, "hit100": 5}
-    if heart_checkpoint_metric not in {"roc", "ap", *heart_hit_index.keys()}:
+    random_checkpoint_metric = str(kwargs.get("random_checkpoint_metric", "roc")).lower()
+    if heart_checkpoint_metric not in checkpoint_metric_choices:
         raise ValueError(f"Unsupported heart_checkpoint_metric: {heart_checkpoint_metric}")
+    if random_checkpoint_metric not in checkpoint_metric_choices:
+        raise ValueError(f"Unsupported random_checkpoint_metric: {random_checkpoint_metric}")
 
-    def _heart_checkpoint_score(val_roc_value, val_ap_value, val_hit_values):
-        if heart_checkpoint_metric == "roc":
+    def _checkpoint_score(metric_name: str, val_roc_value, val_ap_value, val_hit_values):
+        if metric_name == "roc":
             return float(val_roc_value)
-        if heart_checkpoint_metric == "ap":
+        if metric_name == "ap":
             return float(val_ap_value)
-        hit_idx = heart_hit_index[heart_checkpoint_metric]
+        hit_idx = checkpoint_hit_index[metric_name]
         if val_hit_values is None or len(val_hit_values) <= hit_idx:
             return float("nan")
         return float(val_hit_values[hit_idx])
+
+    def _heart_checkpoint_score(val_roc_value, val_ap_value, val_hit_values):
+        return _checkpoint_score(heart_checkpoint_metric, val_roc_value, val_ap_value, val_hit_values)
 
     num_nodes = adj.shape[0]
     
@@ -2940,6 +3049,8 @@ def train_encoder(
     heart_full_val_during_training = bool(is_heart and len(val_edges_eval) == len(val_edges))
     if is_heart:
         print(f"[HeaRT-EVAL] checkpoint_metric=val_{heart_checkpoint_metric}")
+    else:
+        print(f"[EVAL] checkpoint_metric=val_{random_checkpoint_metric}")
 
     if lp_full_graph_protocol:
         full_adj_train = adj_orig.copy().tocsr()
@@ -3104,9 +3215,16 @@ def train_encoder(
             normalize_input=decoder_normalize_input,
             max_pair_rows=mlp_pair_max_rows,
         ).to(device)
+    elif prediction_decoder_type == "pair_residual_struct_ocn":
+        prediction_decoder = OCNResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+        ).to(device)
     else:
         raise ValueError(
-            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', or 'pair_residual_struct_ncnc'."
+            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', or 'pair_residual_struct_ocn'."
         )
 
     def _set_struct_decoder_context(
@@ -3315,7 +3433,7 @@ def train_encoder(
         f"[EVAL-POLICY] eval_log_every={eval_log_every} train_eval_every={train_eval_every} "
         f"skip_train_acc={int(skip_train_acc)} decoder_diag_every={decoder_diag_every} "
         f"edit_metric_every={edit_metric_every} edge_eval={int(edge_eval)} heart_eval_every={heart_eval_every} "
-        f"heart_val_frac={heart_val_frac}"
+        f"heart_val_frac={heart_val_frac} random_checkpoint_metric={random_checkpoint_metric}"
     )
 
     def _edit_allowed_before_end(ep: int) -> bool:
@@ -6189,7 +6307,8 @@ def train_encoder(
         #print('-' * 100)
         
         # --------- SELECT BEST BY VALIDATION METRIC (NO TEST LEAKAGE) ---------
-        checkpoint_score = val_roc if not is_heart else _heart_checkpoint_score(val_roc, val_ap, val_hit)
+        checkpoint_metric_label = heart_checkpoint_metric if is_heart else random_checkpoint_metric
+        checkpoint_score = _checkpoint_score(checkpoint_metric_label, val_roc, val_ap, val_hit)
         if ((not is_heart) or ran_full_val) and np.isfinite(checkpoint_score) and (checkpoint_score > best_checkpoint_score):
             best_checkpoint_score = checkpoint_score
             best_val_roc = val_roc
@@ -6312,7 +6431,7 @@ def train_encoder(
                 "edit_compact_radius": float(edit_compact_radius_loss.detach().cpu()),
                 "edit_compact_proto": float(edit_compact_proto_loss.detach().cpu()),
                 "edit_preserve": float(edit_preserve_loss.detach().cpu()),
-                "selection_metric": heart_checkpoint_metric if is_heart else "roc",
+                "selection_metric": checkpoint_metric_label,
                 "selection_score": float(checkpoint_score),
             }
 
@@ -6321,8 +6440,7 @@ def train_encoder(
                 state_to_save = dict(best_state_cpu)
                 state_to_save["best_meta"] = best_meta_cpu
                 torch.save(state_to_save, best_ckpt_path_runtime)
-                ckpt_metric_label = heart_checkpoint_metric if is_heart else "roc"
-                print(f"[CKPT] Saved best-by-val {ckpt_metric_label} at epoch {epoch} -> {best_ckpt_path_runtime}")
+                print(f"[CKPT] Saved best-by-val {checkpoint_metric_label} at epoch {epoch} -> {best_ckpt_path_runtime}")
             except Exception as e:
                 print(f"[CKPT] Warning: failed to save best checkpoint: {e}")
                 
@@ -6445,7 +6563,7 @@ def train_encoder(
             else:
                 enc_state = best_state_cpu
             encoder.load_state_dict(enc_state, strict=True)
-        ckpt_metric_label = heart_checkpoint_metric if is_heart else "roc"
+        ckpt_metric_label = heart_checkpoint_metric if is_heart else random_checkpoint_metric
         print(f"[CKPT] Reloaded best weights (by val {ckpt_metric_label}) from epoch {best_epoch+1}")
     elif os.path.exists(best_ckpt_path_runtime):
         # fallback if only on-disk exists
@@ -6569,7 +6687,7 @@ def train_encoder(
         test_edges_false,
         score_matrix_np=None,
     )
-    final_ckpt_metric_label = heart_checkpoint_metric if is_heart else "roc"
+    final_ckpt_metric_label = heart_checkpoint_metric if is_heart else random_checkpoint_metric
     print(f"[BEST CHECKPOINT BY VAL {final_ckpt_metric_label.upper()}] epoch = {best_epoch+1}, "
         f"val_roc = {best_val_roc:.3f}, val_ap = {best_val_ap:.3f}, selection_score = {best_checkpoint_score:.6f}")
     print(f"[FINAL TEST] test_roc = {final_test_roc:.5f}, test_ap = {final_test_ap:.5f}")
@@ -6657,6 +6775,7 @@ def train_encoder(
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
             f"heart_rank_margin={float(best_meta_cpu.get('heart_rank_margin', float('nan'))):.6f} "
             f"heart_rank_neg_k={float(best_meta_cpu.get('heart_rank_neg_k', float('nan'))):.0f} "
+            f"selection_score={float(best_meta_cpu.get('selection_score', float('nan'))):.6f} "
             f"diag_dot_val_hit10={float(best_meta_cpu.get('diag_dot_val_hit10', float('nan'))):.6f} "
             f"diag_decoder_val_hit10={float(best_meta_cpu.get('diag_decoder_val_hit10', float('nan'))):.6f} "
             f"diag_pred_val_hit10={float(best_meta_cpu.get('diag_pred_val_hit10', float('nan'))):.6f} "
