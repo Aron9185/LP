@@ -964,6 +964,189 @@ class MultiOrderNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructur
         return [feat[src, dst].view(-1, 1) for feat in self._gated_multi_order_features(Z, n_nodes, dtype, device)]
 
 
+class H3DeltaNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructuralPairPredictionDecoder):
+    """NCNC decoder plus a zero-initialized gated h3 completed-CN delta branch."""
+
+    scalar_dim = 16
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        normalize_input: bool = True,
+        max_pair_rows: int = 16,
+    ):
+        super().__init__(
+            dim,
+            hidden_dim,
+            normalize_input=normalize_input,
+            max_pair_rows=max_pair_rows,
+        )
+        self.h3_delta_gate_logit = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32))
+        self.h3_delta_net = nn.Sequential(
+            nn.Linear(dim * 4 + 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.h3_delta_net[-1].weight)
+        nn.init.zeros_(self.h3_delta_net[-1].bias)
+
+    def _h3_delta_cache_key(self, Z: torch.Tensor) -> tuple:
+        return ("ncnc_h3_delta",) + self._completion_cache_key(Z)
+
+    def _ncnc_h3_delta_matrices(
+        self,
+        Z: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        adj_dense = self._pair_matrix(self.adj_feat, n_nodes, dtype, device)
+        empty = torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device)
+        if adj_dense.numel() == 0 or tuple(adj_dense.shape) != (n_nodes, n_nodes):
+            return empty, empty
+        if self.adj_sparse_feat.numel() == 0 or tuple(self.adj_sparse_feat.shape) != (n_nodes, n_nodes):
+            return empty, empty
+
+        key = self._h3_delta_cache_key(Z)
+        if self._pair_feature_cache_key == key and "ncnc_h3_delta_features" in self._pair_feature_cache:
+            order2, h3 = self._pair_feature_cache["ncnc_h3_delta_features"]
+            return order2.to(device=device, dtype=dtype), h3.to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            z_detached = Z.detach()
+            raw_prob = torch.sigmoid(z_detached @ z_detached.t()).to(dtype=dtype, device=device)
+            missing_mask = (1.0 - adj_dense).clamp_min(0.0)
+            missing_mask.fill_diagonal_(0.0)
+            prob_missing = raw_prob * missing_mask
+            prob_missing.fill_diagonal_(0.0)
+
+            adj_sparse = self.adj_sparse_feat.to(device=device, dtype=dtype).coalesce()
+            ap = torch.sparse.mm(adj_sparse, prob_missing)
+            a2p = torch.sparse.mm(adj_sparse, ap)
+
+            order2 = ap + ap.t()
+            h3 = a2p + a2p.t()
+            order2.fill_diagonal_(0.0)
+            h3.fill_diagonal_(0.0)
+
+            order2_norm = MultiOrderNCNCResidualStructuralPairPredictionDecoder._positive_logmax_pair_feature(order2)
+            h3_norm = MultiOrderNCNCResidualStructuralPairPredictionDecoder._positive_logmax_pair_feature(h3)
+            order2_base = MultiOrderNCNCResidualStructuralPairPredictionDecoder._center_and_scale_pair_feature(order2_norm)
+            h3_centered = MultiOrderNCNCResidualStructuralPairPredictionDecoder._center_and_scale_pair_feature(h3_norm)
+            h3_orth = MultiOrderNCNCResidualStructuralPairPredictionDecoder._orthogonalize_pair_feature(
+                h3_centered,
+                [order2_base],
+            )
+            h3_orth = MultiOrderNCNCResidualStructuralPairPredictionDecoder._center_and_scale_pair_feature(h3_orth)
+
+            features = (
+                order2_norm.to(device=device, dtype=dtype),
+                h3_orth.to(device=device, dtype=dtype),
+            )
+
+        self._pair_feature_cache_key = key
+        self._pair_feature_cache = {"ncnc_h3_delta_features": features}
+        return features
+
+    def _h3_delta_gate(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        return torch.sigmoid(self.h3_delta_gate_logit).to(device=device, dtype=dtype)
+
+    def extra_regularization_loss(self) -> torch.Tensor:
+        return torch.sigmoid(self.h3_delta_gate_logit).abs()
+
+    def extra_diagnostics(self) -> dict[str, float]:
+        return {
+            "prediction_h3_gate": float(torch.sigmoid(self.h3_delta_gate_logit).detach().cpu()),
+        }
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:
+        logits = super().forward(Z)
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        n_nodes = X.size(0)
+        row_chunk = max(1, min(self.max_pair_rows, int(max(1, 131072 // max(1, n_nodes)))))
+        order2, h3 = self._ncnc_h3_delta_matrices(Z, n_nodes, X.dtype, X.device)
+        gate = self._h3_delta_gate(X.dtype, X.device)
+
+        row_deltas = []
+        for start in range(0, n_nodes, row_chunk):
+            end = min(n_nodes, start + row_chunk)
+            rows = end - start
+            zi = X[start:end].unsqueeze(1).expand(-1, n_nodes, -1)
+            zj = X.unsqueeze(0).expand(rows, -1, -1)
+            raw_dot = (Z[start:end] @ Z.t()).unsqueeze(-1)
+            scalar_feats = torch.stack(
+                [
+                    raw_dot.squeeze(-1),
+                    order2[start:end],
+                    h3[start:end],
+                ],
+                dim=-1,
+            )
+            pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
+            row_deltas.append(self.h3_delta_net(pair_feats.reshape(-1, pair_feats.size(-1))).view(rows, n_nodes))
+        delta = torch.cat(row_deltas, dim=0)
+        delta = 0.5 * (delta + delta.t())
+        delta.fill_diagonal_(0.0)
+        logits = logits + gate * delta
+        logits.fill_diagonal_(0.0)
+        return logits
+
+    def _h3_delta_score_pairs_one_way(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
+        n_nodes = X.size(0)
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        if src.numel() == 0:
+            return Z.new_empty((0,))
+
+        order2, h3 = self._ncnc_h3_delta_matrices(Z, n_nodes, X.dtype, X.device)
+        step = max(1, int(batch_size or 32768))
+        outs = []
+        for start in range(0, src.numel(), step):
+            end = min(src.numel(), start + step)
+            u = src[start:end]
+            v = dst[start:end]
+            zi = X.index_select(0, u)
+            zj = X.index_select(0, v)
+            raw_dot = (Z.index_select(0, u) * Z.index_select(0, v)).sum(dim=1, keepdim=True)
+            scalar_feats = torch.cat(
+                [
+                    raw_dot,
+                    order2[u, v].view(-1, 1),
+                    h3[u, v].view(-1, 1),
+                ],
+                dim=-1,
+            )
+            pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
+            outs.append(self.h3_delta_net(pair_feats).view(-1))
+        return torch.cat(outs, dim=0)
+
+    def score_pairs(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        src = src.to(device=Z.device, dtype=torch.long).view(-1)
+        dst = dst.to(device=Z.device, dtype=torch.long).view(-1)
+        base_logits = super().score_pairs(Z, src, dst, batch_size=batch_size)
+        delta_logits = 0.5 * (
+            self._h3_delta_score_pairs_one_way(Z, src, dst, batch_size=batch_size)
+            + self._h3_delta_score_pairs_one_way(Z, dst, src, batch_size=batch_size)
+        )
+        gate = self._h3_delta_gate(base_logits.dtype, base_logits.device)
+        logits = base_logits + gate * delta_logits
+        return torch.where(src == dst, torch.zeros_like(logits), logits)
+
+
 class OCNResidualStructuralPairPredictionDecoder(ResidualStructuralPairPredictionDecoder):
     """Residual prediction decoder with OCN-style higher-order CN features."""
 
@@ -2969,6 +3152,7 @@ def train_encoder(
     prediction_rank_pool_factor = int(kwargs.get("prediction_rank_pool_factor", 8))
     prediction_joint_start_epoch = int(kwargs.get("prediction_joint_start_epoch", -1))
     prediction_encoder_weight = float(kwargs.get("prediction_encoder_weight", 0.0))
+    prediction_gate_l1_weight = float(kwargs.get("prediction_gate_l1_weight", 0.0))
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
@@ -3357,6 +3541,13 @@ def train_encoder(
             normalize_input=decoder_normalize_input,
             max_pair_rows=mlp_pair_max_rows,
         ).to(device)
+    elif prediction_decoder_type == "pair_residual_struct_ncnc_h3_delta":
+        prediction_decoder = H3DeltaNCNCResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+        ).to(device)
     elif prediction_decoder_type == "pair_residual_struct_ncnc_multi":
         prediction_decoder = MultiOrderNCNCResidualStructuralPairPredictionDecoder(
             hidden2,
@@ -3373,7 +3564,7 @@ def train_encoder(
         ).to(device)
     else:
         raise ValueError(
-            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', 'pair_residual_struct_ncnc_multi', or 'pair_residual_struct_ocn'."
+            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', 'pair_residual_struct_ncnc_h3_delta', 'pair_residual_struct_ncnc_multi', or 'pair_residual_struct_ocn'."
         )
 
     def _set_struct_decoder_context(
@@ -3395,6 +3586,14 @@ def train_encoder(
             if graph_dense is not None:
                 prediction_decoder.set_graph_context(graph_dense)
             prediction_decoder.set_cluster_context(labels_np, core_mask_t)
+
+    def _prediction_decoder_extra_diagnostics() -> dict[str, float]:
+        if prediction_decoder is None or not hasattr(prediction_decoder, "extra_diagnostics"):
+            return {}
+        try:
+            return prediction_decoder.extra_diagnostics()
+        except Exception:
+            return {}
 
     def _decoded_graph_scorer():
         return graph_decoder if graph_decoder is not None else prediction_decoder
@@ -3566,7 +3765,8 @@ def train_encoder(
             f"[PRED-DECODER] active | type={prediction_decoder_type} | score_source={score_source} | "
             f"rank_w={prediction_rank_weight} bce_w={prediction_bce_weight} margin={prediction_rank_margin} "
             f"neg_k={prediction_rank_neg_k} pool_factor={prediction_rank_pool_factor} | "
-            f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight}"
+            f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight} "
+            f"gate_l1_w={prediction_gate_l1_weight}"
         )
     if not use_edited_decoder and prediction_decoder is None:
         print(
@@ -5674,6 +5874,7 @@ def train_encoder(
         prediction_bce_loss = bias_Z.new_tensor(0.0)
         prediction_joint_rank_loss = bias_Z.new_tensor(0.0)
         prediction_joint_bce_loss = bias_Z.new_tensor(0.0)
+        prediction_extra_reg_loss = bias_Z.new_tensor(0.0)
         prediction_total_loss = bias_Z.sum() * 0.0
         prediction_debug = {
             "heart_rank_pairs": 0,
@@ -5739,6 +5940,20 @@ def train_encoder(
                 ) = _prediction_objective(Z)
                 prediction_total_loss = prediction_total_loss + prediction_encoder_weight * prediction_joint_total_loss
 
+        if (
+            prediction_decoder is not None
+            and prediction_gate_l1_weight != 0.0
+            and hasattr(prediction_decoder, "extra_regularization_loss")
+        ):
+            try:
+                prediction_extra_reg_loss = prediction_decoder.extra_regularization_loss()
+                prediction_extra_reg_loss = prediction_extra_reg_loss.to(device=bias_Z.device, dtype=bias_Z.dtype)
+                if prediction_extra_reg_loss.dim() > 0:
+                    prediction_extra_reg_loss = prediction_extra_reg_loss.sum()
+                prediction_total_loss = prediction_total_loss + prediction_gate_l1_weight * prediction_extra_reg_loss
+            except Exception as e:
+                print(f"[PRED-DECODER][TRAIN] extra regularization failed at epoch {epoch}: {e}")
+
         # if(loss_ver=="nei"):
             # intra_CL = inter_view_CL_loss(device, bias_Z, bias_Z, adj_label, gamma, temperature)
         # else:
@@ -5793,6 +6008,7 @@ def train_encoder(
                 f"heart_rank={float(edit_heart_rank_loss.detach().cpu())}, "
                 f"pred_rank={float(prediction_rank_loss.detach().cpu())}, pred_bce={float(prediction_bce_loss.detach().cpu())}, "
                 f"pred_joint_rank={float(prediction_joint_rank_loss.detach().cpu())}, pred_joint_bce={float(prediction_joint_bce_loss.detach().cpu())}, "
+                f"pred_extra_reg={float(prediction_extra_reg_loss.detach().cpu())}, "
                 f"edit_compact={float(edit_compact_loss.detach().cpu())}, compact_radius={float(edit_compact_radius_loss.detach().cpu())}, "
                 f"compact_proto={float(edit_compact_proto_loss.detach().cpu())}, edit_preserve={float(edit_preserve_loss.detach().cpu())}, "
                 f"rewrite_nodes={edit_decoder_debug['rewrite_nodes']}, valid_pairs={edit_decoder_debug['valid_pairs']}, "
@@ -6262,10 +6478,12 @@ def train_encoder(
                         if dec_vals.size > 1 and pred_vals.size > 1 and np.std(dec_vals) > 0 and np.std(pred_vals) > 0:
                             score_diag["diag_decoder_pred_corr"] = float(np.corrcoef(dec_vals, pred_vals)[0, 1])
 
+                prediction_extra_diag = _prediction_decoder_extra_diagnostics()
                 print(
                     f"[DECODER-DIAG][E{epoch:04d}] "
                     f"decoder_type={decoder_type} pred_decoder_type={prediction_decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
                     f"heart_rank_weight={heart_rank_weight:.6f} prediction_rank_weight={prediction_rank_weight:.6f} "
+                    f"prediction_h3_gate={prediction_extra_diag.get('prediction_h3_gate', float('nan')):.6f} "
                     f"dot_val_hit10={score_diag['diag_dot_val_hit10']:.6f} "
                     f"decoder_val_hit10={score_diag['diag_decoder_val_hit10']:.6f} "
                     f"pred_val_hit10={score_diag['diag_pred_val_hit10']:.6f} "
@@ -6368,6 +6586,7 @@ def train_encoder(
                 f"heart_rank={float(edit_heart_rank_loss.detach().cpu()):.6f} "
                 f"pred_rank={float(prediction_rank_loss.detach().cpu()):.6f} pred_bce={float(prediction_bce_loss.detach().cpu()):.6f} "
                 f"pred_joint_rank={float(prediction_joint_rank_loss.detach().cpu()):.6f} pred_joint_bce={float(prediction_joint_bce_loss.detach().cpu()):.6f} "
+                f"pred_extra_reg={float(prediction_extra_reg_loss.detach().cpu()):.6f} "
                 f"compact={float(edit_compact_loss.detach().cpu()):.6f} compact_radius={float(edit_compact_radius_loss.detach().cpu()):.6f} "
                 f"compact_proto={float(edit_compact_proto_loss.detach().cpu()):.6f} "
                 f"preserve={float(edit_preserve_loss.detach().cpu()):.6f} "
@@ -6482,6 +6701,7 @@ def train_encoder(
 
             # Keep the best-by-val edit-side metadata together with the checkpoint.
             # Without this, no-rewrite runs can end up printing stale / default compactness stats.
+            prediction_extra_diag = _prediction_decoder_extra_diagnostics()
             best_meta_cpu = {
                 "epoch": int(epoch),
                 "val_roc": float(val_roc),
@@ -6547,6 +6767,7 @@ def train_encoder(
                 "prediction_bce": float(prediction_bce_loss.detach().cpu()),
                 "prediction_joint_rank": float(prediction_joint_rank_loss.detach().cpu()),
                 "prediction_joint_bce": float(prediction_joint_bce_loss.detach().cpu()),
+                "prediction_extra_reg": float(prediction_extra_reg_loss.detach().cpu()),
                 "prediction_rank_pairs": int(prediction_debug.get("heart_rank_pairs", 0)),
                 "prediction_rank_pos": int(prediction_debug.get("heart_rank_pos", 0)),
                 "prediction_rank_neg_pool": int(prediction_debug.get("heart_rank_neg_pool", 0)),
@@ -6563,7 +6784,9 @@ def train_encoder(
                 "prediction_rank_weight": float(prediction_rank_weight),
                 "prediction_bce_weight": float(prediction_bce_weight),
                 "prediction_encoder_weight": float(prediction_encoder_weight),
+                "prediction_gate_l1_weight": float(prediction_gate_l1_weight),
                 "prediction_joint_start_epoch": int(prediction_joint_start_epoch),
+                "prediction_h3_gate": float(prediction_extra_diag.get("prediction_h3_gate", float("nan"))),
                 "diag_dot_val_hit10": float(score_diag.get("diag_dot_val_hit10", float("nan"))),
                 "diag_decoder_val_hit10": float(score_diag.get("diag_decoder_val_hit10", float("nan"))),
                 "diag_pred_val_hit10": float(score_diag.get("diag_pred_val_hit10", float("nan"))),
@@ -6675,6 +6898,8 @@ def train_encoder(
                 f'heart_rank_pairs = {best_meta_cpu.get("heart_rank_pairs", float("nan")):.0f}, '
                 f'prediction_rank = {best_meta_cpu.get("prediction_rank", float("nan")):.6f}, '
                 f'prediction_bce = {best_meta_cpu.get("prediction_bce", float("nan")):.6f}, '
+                f'prediction_extra_reg = {best_meta_cpu.get("prediction_extra_reg", float("nan")):.6f}, '
+                f'prediction_h3_gate = {best_meta_cpu.get("prediction_h3_gate", float("nan")):.6f}, '
                 f'prediction_rank_pairs = {best_meta_cpu.get("prediction_rank_pairs", float("nan")):.0f}, '
                 f'dot_val_hit10 = {best_meta_cpu.get("diag_dot_val_hit10", float("nan")):.6f}, '
                 f'decoder_val_hit10 = {best_meta_cpu.get("diag_decoder_val_hit10", float("nan")):.6f}, '
@@ -6843,10 +7068,12 @@ def train_encoder(
     print(f"[FINAL TEST] Hit@K: 1={final_test_hit[0]}, 3={final_test_hit[1]}, 10={final_test_hit[2]}, "
         f"20={final_test_hit[3]}, 50={final_test_hit[4]}, 100={final_test_hit[5]}")
     if (use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
+        final_prediction_extra_diag = _prediction_decoder_extra_diagnostics()
         print(
             f"[DECODER-DIAG][FINAL] "
             f"decoder_type={decoder_type} pred_decoder_type={prediction_decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
             f"heart_rank_weight={heart_rank_weight:.6f} prediction_rank_weight={prediction_rank_weight:.6f} "
+            f"prediction_h3_gate={final_prediction_extra_diag.get('prediction_h3_gate', float('nan')):.6f} "
             f"dot_test_hit10={final_score_diag.get('diag_dot_test_hit10', float('nan')):.6f} "
             f"decoder_test_hit10={final_score_diag.get('diag_decoder_test_hit10', float('nan')):.6f} "
             f"pred_test_hit10={final_score_diag.get('diag_pred_test_hit10', float('nan')):.6f} "
@@ -6916,10 +7143,13 @@ def train_encoder(
             f"prediction_bce={float(best_meta_cpu.get('prediction_bce', float('nan'))):.6f} "
             f"prediction_joint_rank={float(best_meta_cpu.get('prediction_joint_rank', float('nan'))):.6f} "
             f"prediction_joint_bce={float(best_meta_cpu.get('prediction_joint_bce', float('nan'))):.6f} "
+            f"prediction_extra_reg={float(best_meta_cpu.get('prediction_extra_reg', float('nan'))):.6f} "
             f"prediction_rank_pairs={float(best_meta_cpu.get('prediction_rank_pairs', float('nan'))):.0f} "
             f"prediction_rank_weight={float(best_meta_cpu.get('prediction_rank_weight', float('nan'))):.6f} "
             f"prediction_bce_weight={float(best_meta_cpu.get('prediction_bce_weight', float('nan'))):.6f} "
             f"prediction_encoder_weight={float(best_meta_cpu.get('prediction_encoder_weight', float('nan'))):.6f} "
+            f"prediction_gate_l1_weight={float(best_meta_cpu.get('prediction_gate_l1_weight', float('nan'))):.6f} "
+            f"prediction_h3_gate={float(best_meta_cpu.get('prediction_h3_gate', float('nan'))):.6f} "
             f"decoder_normalize_input={float(best_meta_cpu.get('decoder_normalize_input', float('nan'))):.0f} "
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
             f"heart_rank_margin={float(best_meta_cpu.get('heart_rank_margin', float('nan'))):.6f} "

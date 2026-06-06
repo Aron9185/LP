@@ -59,6 +59,14 @@ PAIR_SCORER_CONFIGS = [
         "remove": False,
     },
     {
+        "name": "two_decoder_ncnc_h3_delta_pred",
+        "family": "two_decoder_ncnc_h3_delta",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ncnc_h3_delta",
+        "use_edit_decoder": True,
+        "remove": False,
+    },
+    {
         "name": "two_decoder_ncnc_multi_pred",
         "family": "two_decoder_ncnc_multi",
         "score_source": "pred_decoder",
@@ -111,6 +119,14 @@ PAIR_SCORER_CONFIGS = [
         "family": "two_decoder_ncnc_remove",
         "score_source": "pred_decoder",
         "prediction_decoder_type": "pair_residual_struct_ncnc",
+        "use_edit_decoder": True,
+        "remove": True,
+    },
+    {
+        "name": "two_decoder_ncnc_h3_delta_pred_remove",
+        "family": "two_decoder_ncnc_h3_delta_remove",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_ncnc_h3_delta",
         "use_edit_decoder": True,
         "remove": True,
     },
@@ -170,6 +186,7 @@ def parse_args():
     parser.add_argument("--prediction-rank-pool-factor", type=int, default=8)
     parser.add_argument("--prediction-encoder-weight", type=float, default=0.05)
     parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
+    parser.add_argument("--prediction-gate-l1-weight", type=float, default=0.0)
     parser.add_argument("--compactness-radius-metric", choices=["cosine", "mahalanobis"], default="cosine")
     parser.add_argument("--decoder-normalize-input", action="store_true", help="Use normalized pair embeddings. Default uses raw pair embeddings.")
     parser.add_argument("--eval-log-every", type=int, default=5)
@@ -328,6 +345,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--prediction_rank_pool_factor", str(args.prediction_rank_pool_factor),
         "--prediction_encoder_weight", str(args.prediction_encoder_weight),
         "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
+        "--prediction_gate_l1_weight", str(args.prediction_gate_l1_weight),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
     if cfg.get("use_edit_decoder", True):
@@ -478,10 +496,13 @@ def main():
         "prediction_bce",
         "prediction_joint_rank",
         "prediction_joint_bce",
+        "prediction_extra_reg",
         "prediction_rank_pairs",
         "prediction_rank_weight",
         "prediction_bce_weight",
         "prediction_encoder_weight",
+        "prediction_gate_l1_weight",
+        "prediction_h3_gate",
         "decoder_normalize_input",
         "heart_rank_weight",
         "heart_rank_margin",
