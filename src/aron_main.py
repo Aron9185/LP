@@ -283,6 +283,7 @@ parser.add_argument("--prediction_rank_pool_factor", type=int, default=8, help="
 parser.add_argument("--prediction_joint_start_epoch", type=int, default=-1, help="Epoch when prediction-decoder loss may backpropagate into the encoder. -1 uses decoded rewrite start.")
 parser.add_argument("--prediction_encoder_weight", type=float, default=0.0, help="Weight for the late joint prediction-decoder loss on encoder embeddings.")
 parser.add_argument("--prediction_gate_l1_weight", type=float, default=0.0, help="Optional L1 penalty for gated prediction-decoder residual branches.")
+parser.add_argument("--prediction_h3_gate_init", type=float, default=-3.0, help="Initial logit for the h3-delta prediction-decoder gate.")
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
 parser.add_argument("--compactness_radius_metric", type=str, default="cosine", choices=["cosine", "mahalanobis"], help="Radius metric used by compactness diagnostics/objective.")
@@ -516,6 +517,7 @@ def main():
         prediction_joint_start_epoch=args.prediction_joint_start_epoch,
         prediction_encoder_weight=args.prediction_encoder_weight,
         prediction_gate_l1_weight=args.prediction_gate_l1_weight,
+        prediction_h3_gate_init=args.prediction_h3_gate_init,
         compactness_weight=args.compactness_weight,
         compactness_objective=args.compactness_objective,
         compactness_radius_metric=args.compactness_radius_metric,

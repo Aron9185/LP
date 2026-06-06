@@ -187,6 +187,7 @@ def parse_args():
     parser.add_argument("--prediction-encoder-weight", type=float, default=0.05)
     parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
     parser.add_argument("--prediction-gate-l1-weight", type=float, default=0.0)
+    parser.add_argument("--prediction-h3-gate-init", type=float, default=-3.0)
     parser.add_argument("--compactness-radius-metric", choices=["cosine", "mahalanobis"], default="cosine")
     parser.add_argument("--decoder-normalize-input", action="store_true", help="Use normalized pair embeddings. Default uses raw pair embeddings.")
     parser.add_argument("--eval-log-every", type=int, default=5)
@@ -346,6 +347,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--prediction_encoder_weight", str(args.prediction_encoder_weight),
         "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
         "--prediction_gate_l1_weight", str(args.prediction_gate_l1_weight),
+        "--prediction_h3_gate_init", str(args.prediction_h3_gate_init),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
     if cfg.get("use_edit_decoder", True):
@@ -502,6 +504,7 @@ def main():
         "prediction_bce_weight",
         "prediction_encoder_weight",
         "prediction_gate_l1_weight",
+        "prediction_h3_gate_init",
         "prediction_h3_gate",
         "decoder_normalize_input",
         "heart_rank_weight",

@@ -975,6 +975,7 @@ class H3DeltaNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructuralP
         hidden_dim: int,
         normalize_input: bool = True,
         max_pair_rows: int = 16,
+        gate_init_logit: float = -3.0,
     ):
         super().__init__(
             dim,
@@ -982,7 +983,7 @@ class H3DeltaNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructuralP
             normalize_input=normalize_input,
             max_pair_rows=max_pair_rows,
         )
-        self.h3_delta_gate_logit = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32))
+        self.h3_delta_gate_logit = nn.Parameter(torch.tensor(float(gate_init_logit), dtype=torch.float32))
         self.h3_delta_net = nn.Sequential(
             nn.Linear(dim * 4 + 3, hidden_dim),
             nn.ReLU(),
@@ -3161,6 +3162,7 @@ def train_encoder(
     prediction_joint_start_epoch = int(kwargs.get("prediction_joint_start_epoch", -1))
     prediction_encoder_weight = float(kwargs.get("prediction_encoder_weight", 0.0))
     prediction_gate_l1_weight = float(kwargs.get("prediction_gate_l1_weight", 0.0))
+    prediction_h3_gate_init = float(kwargs.get("prediction_h3_gate_init", -3.0))
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
@@ -3555,6 +3557,7 @@ def train_encoder(
             hidden_dim=max(hidden2, editor_hidden),
             normalize_input=decoder_normalize_input,
             max_pair_rows=mlp_pair_max_rows,
+            gate_init_logit=prediction_h3_gate_init,
         ).to(device)
     elif prediction_decoder_type == "pair_residual_struct_ncnc_multi":
         prediction_decoder = MultiOrderNCNCResidualStructuralPairPredictionDecoder(
@@ -3774,7 +3777,7 @@ def train_encoder(
             f"rank_w={prediction_rank_weight} bce_w={prediction_bce_weight} margin={prediction_rank_margin} "
             f"neg_k={prediction_rank_neg_k} pool_factor={prediction_rank_pool_factor} | "
             f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight} "
-            f"gate_l1_w={prediction_gate_l1_weight}"
+            f"gate_l1_w={prediction_gate_l1_weight} h3_gate_init={prediction_h3_gate_init}"
         )
     if not use_edited_decoder and prediction_decoder is None:
         print(
@@ -6793,6 +6796,7 @@ def train_encoder(
                 "prediction_bce_weight": float(prediction_bce_weight),
                 "prediction_encoder_weight": float(prediction_encoder_weight),
                 "prediction_gate_l1_weight": float(prediction_gate_l1_weight),
+                "prediction_h3_gate_init": float(prediction_h3_gate_init),
                 "prediction_joint_start_epoch": int(prediction_joint_start_epoch),
                 "prediction_h3_gate": float(prediction_extra_diag.get("prediction_h3_gate", float("nan"))),
                 "diag_dot_val_hit10": float(score_diag.get("diag_dot_val_hit10", float("nan"))),
@@ -7157,6 +7161,7 @@ def train_encoder(
             f"prediction_bce_weight={float(best_meta_cpu.get('prediction_bce_weight', float('nan'))):.6f} "
             f"prediction_encoder_weight={float(best_meta_cpu.get('prediction_encoder_weight', float('nan'))):.6f} "
             f"prediction_gate_l1_weight={float(best_meta_cpu.get('prediction_gate_l1_weight', float('nan'))):.6f} "
+            f"prediction_h3_gate_init={float(best_meta_cpu.get('prediction_h3_gate_init', float('nan'))):.6f} "
             f"prediction_h3_gate={float(best_meta_cpu.get('prediction_h3_gate', float('nan'))):.6f} "
             f"decoder_normalize_input={float(best_meta_cpu.get('decoder_normalize_input', float('nan'))):.0f} "
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
