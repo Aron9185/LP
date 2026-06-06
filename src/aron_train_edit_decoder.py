@@ -1476,9 +1476,17 @@ def heart_train_margin_ranking_loss_pairs(
     neg_u_t = torch.cat(neg_u, dim=0)
     neg_v_t = torch.cat(neg_v, dim=0)
     valid_pos_count = pos_u_t.numel()
-    neg_scores = _decoder_score_pairs(graph_decoder, Z, neg_u_t, neg_v_t).view(valid_pos_count, pool_k)
     hard_k = min(int(num_neg_per_pos), int(pool_k))
-    hard_neg = torch.topk(neg_scores, k=hard_k, dim=1, largest=True).values
+
+    neg_u_pool = neg_u_t.view(valid_pos_count, pool_k)
+    neg_v_pool = neg_v_t.view(valid_pos_count, pool_k)
+    with torch.no_grad():
+        neg_scores_for_mining = _decoder_score_pairs(graph_decoder, Z, neg_u_t, neg_v_t).view(valid_pos_count, pool_k)
+        hard_idx = torch.topk(neg_scores_for_mining, k=hard_k, dim=1, largest=True).indices
+
+    hard_neg_u = neg_u_pool.gather(1, hard_idx).reshape(-1)
+    hard_neg_v = neg_v_pool.gather(1, hard_idx).reshape(-1)
+    hard_neg = _decoder_score_pairs(graph_decoder, Z, hard_neg_u, hard_neg_v).view(valid_pos_count, hard_k)
     pos_scores = _decoder_score_pairs(graph_decoder, Z, pos_u_t, pos_v_t).view(-1, 1).expand_as(hard_neg)
     target = torch.ones_like(pos_scores.reshape(-1))
     loss = F.margin_ranking_loss(pos_scores.reshape(-1), hard_neg.reshape(-1), target, margin=float(margin))
