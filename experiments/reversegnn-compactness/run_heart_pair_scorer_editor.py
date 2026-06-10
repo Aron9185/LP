@@ -101,6 +101,16 @@ PAIR_SCORER_CONFIGS = [
         "prediction_dot_anchor_weight": 0.10,
     },
     {
+        "name": "two_decoder_compact_struct_full_pred_remove",
+        "family": "two_decoder_compact_struct_push_remove",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_compact_multi",
+        "use_edit_decoder": True,
+        "remove": True,
+        "decoded_require_structural_support": True,
+        "prediction_dot_anchor_weight": 0.10,
+    },
+    {
         "name": "two_decoder_compact_struct_hard_pred",
         "family": "two_decoder_compact_struct_hard",
         "score_source": "pred_decoder",
