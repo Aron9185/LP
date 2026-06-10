@@ -566,6 +566,9 @@ class StructuralPairGraphDecoder(nn.Module):
 class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
     """Structural pair scorer for final prediction: raw dot logit plus learned residual."""
 
+    def _combine_raw_dot_and_residual(self, raw_dot: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return raw_dot + residual
+
     def forward(self, Z: torch.Tensor) -> torch.Tensor:
         X = F.normalize(Z, p=2, dim=1) if self.normalize_input else Z
         X_cos = F.normalize(Z, p=2, dim=1)
@@ -636,7 +639,7 @@ class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
             )
             pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
             residual = self.net(pair_feats.reshape(-1, pair_feats.size(-1))).view(rows, n_nodes)
-            row_logits.append(raw_dot + residual)
+            row_logits.append(self._combine_raw_dot_and_residual(raw_dot, residual))
         logits = torch.cat(row_logits, dim=0)
         logits = 0.5 * (logits + logits.t())
         logits.fill_diagonal_(0.0)
@@ -724,7 +727,7 @@ class ResidualStructuralPairPredictionDecoder(StructuralPairGraphDecoder):
             )
             pair_feats = torch.cat([zi, zj, torch.abs(zi - zj), zi * zj, scalar_feats], dim=-1)
             residual = self.net(pair_feats).view(-1, 1)
-            outs.append((raw_dot + residual).view(-1))
+            outs.append(self._combine_raw_dot_and_residual(raw_dot, residual).view(-1))
         return torch.cat(outs, dim=0)
 
     def score_pairs(
@@ -962,6 +965,167 @@ class MultiOrderNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructur
         device: torch.device,
     ) -> list[torch.Tensor]:
         return [feat[src, dst].view(-1, 1) for feat in self._gated_multi_order_features(Z, n_nodes, dtype, device)]
+
+
+class CompactMultiOrderResidualStructuralPairPredictionDecoder(MultiOrderNCNCResidualStructuralPairPredictionDecoder):
+    """Multi-order residual decoder with explicit compactness-oriented pair features."""
+
+    scalar_dim = 23
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        normalize_input: bool = True,
+        max_pair_rows: int = 16,
+    ):
+        super().__init__(
+            dim,
+            hidden_dim,
+            normalize_input=normalize_input,
+            max_pair_rows=max_pair_rows,
+        )
+        self._compact_pair_feature_cache_key = None
+        self._compact_pair_feature_cache = {}
+
+    def _clear_pair_feature_cache(self) -> None:
+        super()._clear_pair_feature_cache()
+        self._compact_pair_feature_cache_key = None
+        self._compact_pair_feature_cache = {}
+
+    def _compact_feature_cache_key(self, Z: torch.Tensor) -> tuple:
+        label_ptr = int(self.label_ids.data_ptr()) if self.label_ids.numel() else 0
+        label_version = int(getattr(self.label_ids, "_version", 0)) if self.label_ids.numel() else 0
+        core_ptr = int(self.core_mask.data_ptr()) if self.core_mask.numel() else 0
+        core_version = int(getattr(self.core_mask, "_version", 0)) if self.core_mask.numel() else 0
+        return (
+            "compact_multi",
+            label_ptr,
+            label_version,
+            core_ptr,
+            core_version,
+        ) + self._completion_cache_key(Z)
+
+    def _compact_feature_matrices(
+        self,
+        Z: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        empty = [torch.zeros((n_nodes, n_nodes), dtype=dtype, device=device) for _ in range(5)]
+        if self.label_ids.numel() != n_nodes:
+            return empty
+
+        key = self._compact_feature_cache_key(Z)
+        if self._compact_pair_feature_cache_key == key and "compact_features" in self._compact_pair_feature_cache:
+            return [feat.to(device=device, dtype=dtype) for feat in self._compact_pair_feature_cache["compact_features"]]
+
+        with torch.no_grad():
+            labels = self.label_ids.to(device=device)
+            non_noise = labels != -1
+            same_cluster = (labels[:, None] == labels[None, :]) & non_noise[:, None] & non_noise[None, :]
+            core = self.core_mask.to(device=device).bool() if self.core_mask.numel() == n_nodes else torch.zeros((n_nodes,), dtype=torch.bool, device=device)
+            noncompact = non_noise & (~core)
+
+            X_cos = F.normalize(Z.detach(), p=2, dim=1)
+            proto_dist = self._prototype_distances(X_cos).to(device=device, dtype=dtype)
+            proto_u = proto_dist.view(-1, 1).expand(-1, n_nodes)
+            proto_v = proto_dist.view(1, -1).expand(n_nodes, -1)
+
+            same_f = same_cluster.to(dtype=dtype)
+            core_bridge = same_cluster & (
+                (core[:, None] & noncompact[None, :]) | (noncompact[:, None] & core[None, :])
+            )
+            noncompact_pair = same_cluster & noncompact[:, None] & noncompact[None, :]
+            cross_cluster = (~same_cluster) & non_noise[:, None] & non_noise[None, :]
+
+            compact_max = same_f * torch.maximum(proto_u, proto_v)
+            compact_mean = same_f * (0.5 * (proto_u + proto_v))
+            compact_gap = same_f * torch.abs(proto_u - proto_v)
+            features = [
+                compact_max,
+                compact_mean,
+                compact_gap,
+                core_bridge.to(dtype=dtype),
+                noncompact_pair.to(dtype=dtype) - cross_cluster.to(dtype=dtype),
+            ]
+            for feature in features:
+                feature.fill_diagonal_(0.0)
+            features = [feature.to(device=device, dtype=dtype) for feature in features]
+
+        self._compact_pair_feature_cache_key = key
+        self._compact_pair_feature_cache = {"compact_features": features}
+        return features
+
+    def _extra_pair_matrix_scalar_features(
+        self,
+        Z: torch.Tensor,
+        start: int,
+        end: int,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        features = super()._extra_pair_matrix_scalar_features(Z, start, end, n_nodes, dtype, device)
+        features.extend(feat[start:end] for feat in self._compact_feature_matrices(Z, n_nodes, dtype, device))
+        return features
+
+    def _extra_pair_scalar_features(
+        self,
+        Z: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        n_nodes: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        features = super()._extra_pair_scalar_features(Z, src, dst, n_nodes, dtype, device)
+        features.extend(feat[src, dst].view(-1, 1) for feat in self._compact_feature_matrices(Z, n_nodes, dtype, device))
+        return features
+
+
+class GatedCompactMultiOrderResidualStructuralPairPredictionDecoder(CompactMultiOrderResidualStructuralPairPredictionDecoder):
+    """Conservative compact-multi decoder: dot logit plus a gated bounded residual."""
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        normalize_input: bool = True,
+        max_pair_rows: int = 16,
+        gate_init_logit: float = -4.0,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__(
+            dim,
+            hidden_dim,
+            normalize_input=normalize_input,
+            max_pair_rows=max_pair_rows,
+        )
+        self.compact_residual_gate_logit = nn.Parameter(torch.tensor(float(gate_init_logit), dtype=torch.float32))
+        self.compact_residual_scale = float(residual_scale)
+        last = self.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def _compact_residual_gate(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        return torch.sigmoid(self.compact_residual_gate_logit).to(device=device, dtype=dtype)
+
+    def _combine_raw_dot_and_residual(self, raw_dot: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        gate = self._compact_residual_gate(raw_dot.dtype, raw_dot.device)
+        bounded_residual = torch.tanh(residual) * float(self.compact_residual_scale)
+        return raw_dot + gate * bounded_residual
+
+    def extra_regularization_loss(self) -> torch.Tensor:
+        return torch.sigmoid(self.compact_residual_gate_logit).abs()
+
+    def extra_diagnostics(self) -> dict[str, float]:
+        return {
+            "prediction_compact_gate": float(torch.sigmoid(self.compact_residual_gate_logit).detach().cpu()),
+            "prediction_compact_residual_scale": float(self.compact_residual_scale),
+        }
 
 
 class H3DeltaNCNCResidualStructuralPairPredictionDecoder(NCNCResidualStructuralPairPredictionDecoder):
@@ -1400,6 +1564,36 @@ def sampled_prediction_bce_logits_loss(
     return _sampled_pair_bce_logits_loss(scorer, Z, edges[:, 0], edges[:, 1], neg_u, neg_v)
 
 
+def _structural_endpoint_scores(
+    graph_decoder: nn.Module,
+    Z: torch.Tensor,
+    endpoint: int,
+    candidates: torch.Tensor,
+) -> torch.Tensor | None:
+    if not isinstance(graph_decoder, StructuralPairGraphDecoder) or candidates.numel() == 0:
+        return None
+    n_nodes = int(Z.size(0))
+    dtype = Z.dtype
+    device = Z.device
+    endpoint_t = torch.tensor(int(endpoint), dtype=torch.long, device=device)
+    try:
+        score = Z.new_zeros((candidates.numel(),))
+        used = False
+        for weight, buf in (
+            (1.0, graph_decoder.cn_feat),
+            (0.5, graph_decoder.ra_feat),
+            (0.5, graph_decoder.aa_feat),
+        ):
+            mat = graph_decoder._pair_matrix(buf, n_nodes, dtype, device)
+            if mat.numel() == 0 or tuple(mat.shape) != (n_nodes, n_nodes):
+                continue
+            score = score + float(weight) * mat[endpoint_t, candidates]
+            used = True
+        return score if used else None
+    except Exception:
+        return None
+
+
 def heart_train_margin_ranking_loss_pairs(
     graph_decoder: nn.Module,
     Z: torch.Tensor,
@@ -1409,6 +1603,8 @@ def heart_train_margin_ranking_loss_pairs(
     num_neg_per_pos: int,
     pool_factor: int,
     margin: float,
+    neg_strategy: str = "random",
+    struct_frac: float = 0.5,
     max_pos_edges: int = 8192,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     debug = {
@@ -1433,6 +1629,36 @@ def heart_train_margin_ranking_loss_pairs(
     forbidden = forbidden_mask.to(device=Z.device).bool()
     n_nodes = Z.size(0)
     pool_k = max(int(num_neg_per_pos), int(pool_factor) * max(1, int(num_neg_per_pos)))
+    neg_strategy = str(neg_strategy or "random").lower()
+    if neg_strategy not in {"random", "struct"}:
+        neg_strategy = "random"
+    struct_frac = max(0.0, min(1.0, float(struct_frac)))
+
+    def _sample_endpoint_negatives(anchor: int, candidates: torch.Tensor, take: int) -> tuple[torch.Tensor, torch.Tensor]:
+        take = int(take)
+        if candidates.numel() == 0 or take <= 0:
+            empty = torch.empty((0,), dtype=torch.long, device=Z.device)
+            return empty, empty
+        chosen_parts = []
+        if neg_strategy == "struct" and struct_frac > 0.0:
+            struct_scores = _structural_endpoint_scores(graph_decoder, Z, anchor, candidates)
+            if struct_scores is not None and struct_scores.numel() > 0:
+                struct_take = min(int(math.ceil(take * struct_frac)), int(candidates.numel()))
+                if struct_take > 0:
+                    top_idx = torch.topk(struct_scores, k=struct_take, largest=True).indices
+                    chosen_parts.append(candidates.index_select(0, top_idx))
+        chosen_count = sum(int(part.numel()) for part in chosen_parts)
+        random_take = max(0, take - chosen_count)
+        if random_take > 0:
+            idx = torch.randint(0, candidates.numel(), (random_take,), device=Z.device)
+            chosen_parts.append(candidates.index_select(0, idx))
+        if not chosen_parts:
+            empty = torch.empty((0,), dtype=torch.long, device=Z.device)
+            return empty, empty
+        chosen = torch.cat(chosen_parts, dim=0)[:take]
+        anchors = torch.full((chosen.numel(),), int(anchor), dtype=torch.long, device=Z.device)
+        return anchors, chosen
+
     pos_u = []
     pos_v = []
     neg_u = []
@@ -1449,15 +1675,19 @@ def heart_train_margin_ranking_loss_pairs(
         need = int(pool_k)
         if cand_u.numel() > 0:
             take = max(1, need // 2)
-            idx = torch.randint(0, cand_u.numel(), (take,), device=Z.device)
-            cur_u.append(torch.full((take,), u, dtype=torch.long, device=Z.device))
-            cur_v.append(cand_u.index_select(0, idx))
+            uu, vv = _sample_endpoint_negatives(u, cand_u, take)
+            if uu.numel() > 0:
+                cur_u.append(uu)
+                cur_v.append(vv)
         if cand_v.numel() > 0:
             take = need - sum(x.numel() for x in cur_u)
             take = max(1, take)
-            idx = torch.randint(0, cand_v.numel(), (take,), device=Z.device)
-            cur_u.append(torch.full((take,), v, dtype=torch.long, device=Z.device))
-            cur_v.append(cand_v.index_select(0, idx))
+            uu, vv = _sample_endpoint_negatives(v, cand_v, take)
+            if uu.numel() > 0:
+                cur_u.append(uu)
+                cur_v.append(vv)
+        if not cur_u:
+            continue
         cu = torch.cat(cur_u, dim=0)[:need]
         cv = torch.cat(cur_v, dim=0)[:need]
         if cu.numel() < need:
@@ -1498,6 +1728,7 @@ def heart_train_margin_ranking_loss_pairs(
             "heart_rank_neg_pool": int(neg_u_t.numel()),
             "heart_rank_pos_mean": float(pos_scores.detach().mean().cpu()),
             "heart_rank_neg_mean": float(hard_neg.detach().mean().cpu()),
+            "heart_rank_neg_strategy": neg_strategy,
         }
     )
     return loss, debug
@@ -3159,10 +3390,16 @@ def train_encoder(
     prediction_rank_margin = float(kwargs.get("prediction_rank_margin", 0.2))
     prediction_rank_neg_k = int(kwargs.get("prediction_rank_neg_k", 16))
     prediction_rank_pool_factor = int(kwargs.get("prediction_rank_pool_factor", 8))
+    prediction_rank_neg_strategy = str(kwargs.get("prediction_rank_neg_strategy", "random") or "random").lower()
+    if prediction_rank_neg_strategy not in {"random", "struct"}:
+        raise ValueError("prediction_rank_neg_strategy must be one of: random, struct")
+    prediction_rank_struct_frac = float(kwargs.get("prediction_rank_struct_frac", 0.5))
     prediction_joint_start_epoch = int(kwargs.get("prediction_joint_start_epoch", -1))
     prediction_encoder_weight = float(kwargs.get("prediction_encoder_weight", 0.0))
     prediction_gate_l1_weight = float(kwargs.get("prediction_gate_l1_weight", 0.0))
     prediction_h3_gate_init = float(kwargs.get("prediction_h3_gate_init", -3.0))
+    prediction_residual_gate_init = float(kwargs.get("prediction_residual_gate_init", -4.0))
+    prediction_residual_scale = float(kwargs.get("prediction_residual_scale", 1.0))
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
@@ -3218,6 +3455,8 @@ def train_encoder(
     skip_train_acc = bool(kwargs.get("skip_train_acc", False))
     decoder_diag_every = int(kwargs.get("decoder_diag_every", -1))
     edit_metric_every = int(kwargs.get("edit_metric_every", 1))
+    decoded_audit_every = int(kwargs.get("decoded_audit_every", 0))
+    decoded_audit_max_edges = max(0, int(kwargs.get("decoded_audit_max_edges", 4096)))
     edge_eval = bool(kwargs.get("edge_eval", True))
     separate_edit_training = bool(kwargs.get("separate_edit_training", False))
     edit_phase_retain_recon_weight = float(kwargs.get("edit_phase_retain_recon_weight", 0.0))
@@ -3387,6 +3626,130 @@ def train_encoder(
         print(f"[HeaRT-EVAL] checkpoint_metric=val_{heart_checkpoint_metric}")
     else:
         print(f"[EVAL] checkpoint_metric=val_{random_checkpoint_metric}")
+
+    def _edge_key_array(edges) -> np.ndarray:
+        arr = np.asarray(edges)
+        if arr.size == 0:
+            return np.empty((0,), dtype=np.int64)
+        arr = arr.reshape(-1, arr.shape[-1])
+        if arr.shape[1] < 2:
+            return np.empty((0,), dtype=np.int64)
+        u = np.minimum(arr[:, 0], arr[:, 1]).astype(np.int64, copy=False)
+        v = np.maximum(arr[:, 0], arr[:, 1]).astype(np.int64, copy=False)
+        return u * int(num_nodes) + v
+
+    decoded_audit_edge_sets: dict[str, set[int]] = {}
+    if decoded_audit_every > 0:
+        decoded_audit_edge_sets = {
+            "train_pos": set(_edge_key_array(train_edges).tolist()),
+            "val_pos": set(_edge_key_array(val_edges).tolist()),
+            "test_pos": set(_edge_key_array(test_edges).tolist()),
+            "val_neg": set(_edge_key_array(val_edges_false).tolist()),
+            "test_neg": set(_edge_key_array(test_edges_false).tolist()),
+        }
+
+    def _audit_decoded_rewrite_quality(
+        epoch_value: int,
+        pre_graph_dense: torch.Tensor,
+        post_graph_dense: torch.Tensor,
+        labels_np,
+        c0p_mask_t: torch.Tensor | None,
+        z_for_scores: torch.Tensor | None,
+        scorer: nn.Module | None,
+    ) -> None:
+        if decoded_audit_every <= 0:
+            return
+        if epoch_value != decoded_rewrite_start_epoch and epoch_value != num_epoch - 1:
+            if (epoch_value - decoded_rewrite_start_epoch) % max(1, decoded_audit_every) != 0:
+                return
+        try:
+            pre_bool = (pre_graph_dense.detach() > 0)
+            post_bool = (post_graph_dense.detach() > 0)
+            upper = torch.triu(torch.ones_like(pre_bool, dtype=torch.bool), diagonal=1)
+            added_idx = ((post_bool & (~pre_bool)) & upper).nonzero(as_tuple=False)
+            removed_idx = ((pre_bool & (~post_bool)) & upper).nonzero(as_tuple=False)
+
+            def _pair_stats(pairs_t: torch.Tensor, prefix: str) -> dict[str, float]:
+                stats: dict[str, float] = {
+                    f"{prefix}_count": float(pairs_t.size(0)),
+                    f"{prefix}_train_pos": 0.0,
+                    f"{prefix}_val_pos": 0.0,
+                    f"{prefix}_test_pos": 0.0,
+                    f"{prefix}_val_neg": 0.0,
+                    f"{prefix}_test_neg": 0.0,
+                    f"{prefix}_cn_mean": float("nan"),
+                    f"{prefix}_cn_p90": float("nan"),
+                    f"{prefix}_deg_mean": float("nan"),
+                    f"{prefix}_same_cluster": float("nan"),
+                    f"{prefix}_c0p_touch": float("nan"),
+                    f"{prefix}_score_mean": float("nan"),
+                    f"{prefix}_dot_mean": float("nan"),
+                }
+                if pairs_t.numel() == 0:
+                    return stats
+
+                pairs_np = pairs_t.detach().cpu().numpy().astype(np.int64, copy=False)
+                keys = pairs_np[:, 0] * int(num_nodes) + pairs_np[:, 1]
+                for name in ("train_pos", "val_pos", "test_pos", "val_neg", "test_neg"):
+                    edge_set = decoded_audit_edge_sets.get(name, set())
+                    stats[f"{prefix}_{name}"] = float(sum(int(k) in edge_set for k in keys))
+
+                adj_np = pre_bool.detach().cpu().numpy().astype(np.float32, copy=False)
+                np.fill_diagonal(adj_np, 0.0)
+                u = pairs_np[:, 0]
+                v = pairs_np[:, 1]
+                deg = adj_np.sum(axis=1)
+                cn_vals = (adj_np[u] * adj_np[v]).sum(axis=1)
+                stats[f"{prefix}_cn_mean"] = float(np.mean(cn_vals)) if cn_vals.size else float("nan")
+                stats[f"{prefix}_cn_p90"] = float(np.percentile(cn_vals, 90)) if cn_vals.size else float("nan")
+                stats[f"{prefix}_deg_mean"] = float(np.mean((deg[u] + deg[v]) * 0.5)) if cn_vals.size else float("nan")
+
+                if labels_np is not None:
+                    labels_arr = np.asarray(labels_np, dtype=np.int64)
+                    if labels_arr.size == int(num_nodes):
+                        same = (labels_arr[u] == labels_arr[v]) & (labels_arr[u] != -1)
+                        stats[f"{prefix}_same_cluster"] = float(np.mean(same)) if same.size else float("nan")
+                if c0p_mask_t is not None and c0p_mask_t.numel() == int(num_nodes):
+                    c0p_np = c0p_mask_t.detach().cpu().numpy().astype(bool, copy=False)
+                    touch = c0p_np[u] | c0p_np[v]
+                    stats[f"{prefix}_c0p_touch"] = float(np.mean(touch)) if touch.size else float("nan")
+
+                if z_for_scores is not None and decoded_audit_max_edges > 0:
+                    score_pairs_np = pairs_np
+                    if score_pairs_np.shape[0] > decoded_audit_max_edges:
+                        rng = np.random.RandomState((int(seed or 0) + 1) * 1000003 + int(epoch_value))
+                        sel = rng.choice(score_pairs_np.shape[0], size=decoded_audit_max_edges, replace=False)
+                        score_pairs_np = score_pairs_np[np.sort(sel)]
+                    try:
+                        dot_vals = _edge_score_values_from_dot(z_for_scores, score_pairs_np)
+                        stats[f"{prefix}_dot_mean"] = float(np.mean(dot_vals.reshape(-1))) if dot_vals.size else float("nan")
+                    except Exception:
+                        pass
+                    if scorer is not None:
+                        try:
+                            score_vals = _edge_score_values_from_decoder(scorer, z_for_scores, score_pairs_np)
+                            stats[f"{prefix}_score_mean"] = float(np.mean(score_vals.reshape(-1))) if score_vals.size else float("nan")
+                        except Exception:
+                            pass
+                return stats
+
+            add_stats = _pair_stats(added_idx, "add")
+            rem_stats = _pair_stats(removed_idx, "rem")
+            print(
+                f"[REWRITE-AUDIT][E{epoch_value:04d}] "
+                f"add_count={add_stats['add_count']:.0f} rem_count={rem_stats['rem_count']:.0f} "
+                f"add_val_pos={add_stats['add_val_pos']:.0f} add_test_pos={add_stats['add_test_pos']:.0f} "
+                f"add_val_neg={add_stats['add_val_neg']:.0f} add_test_neg={add_stats['add_test_neg']:.0f} "
+                f"add_cn_mean={add_stats['add_cn_mean']:.6f} add_cn_p90={add_stats['add_cn_p90']:.6f} "
+                f"add_deg_mean={add_stats['add_deg_mean']:.6f} add_same_cluster={add_stats['add_same_cluster']:.6f} "
+                f"add_c0p_touch={add_stats['add_c0p_touch']:.6f} add_score_mean={add_stats['add_score_mean']:.6f} "
+                f"add_dot_mean={add_stats['add_dot_mean']:.6f} "
+                f"rem_train_pos={rem_stats['rem_train_pos']:.0f} rem_val_pos={rem_stats['rem_val_pos']:.0f} "
+                f"rem_test_pos={rem_stats['rem_test_pos']:.0f} rem_cn_mean={rem_stats['rem_cn_mean']:.6f} "
+                f"rem_score_mean={rem_stats['rem_score_mean']:.6f} rem_dot_mean={rem_stats['rem_dot_mean']:.6f}"
+            )
+        except Exception as e:
+            print(f"[REWRITE-AUDIT] failed at epoch {epoch_value}: {e}")
 
     if lp_full_graph_protocol:
         full_adj_train = adj_orig.copy().tocsr()
@@ -3566,6 +3929,22 @@ def train_encoder(
             normalize_input=decoder_normalize_input,
             max_pair_rows=mlp_pair_max_rows,
         ).to(device)
+    elif prediction_decoder_type == "pair_residual_struct_compact_multi":
+        prediction_decoder = CompactMultiOrderResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+        ).to(device)
+    elif prediction_decoder_type == "pair_residual_struct_compact_multi_gated":
+        prediction_decoder = GatedCompactMultiOrderResidualStructuralPairPredictionDecoder(
+            hidden2,
+            hidden_dim=max(hidden2, editor_hidden),
+            normalize_input=decoder_normalize_input,
+            max_pair_rows=mlp_pair_max_rows,
+            gate_init_logit=prediction_residual_gate_init,
+            residual_scale=prediction_residual_scale,
+        ).to(device)
     elif prediction_decoder_type == "pair_residual_struct_ocn":
         prediction_decoder = OCNResidualStructuralPairPredictionDecoder(
             hidden2,
@@ -3575,7 +3954,7 @@ def train_encoder(
         ).to(device)
     else:
         raise ValueError(
-            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', 'pair_residual_struct_ncnc_h3_delta', 'pair_residual_struct_ncnc_multi', or 'pair_residual_struct_ocn'."
+            f"Unsupported prediction_decoder_type={prediction_decoder_type}; use 'none', 'pair_residual_struct', 'pair_residual_struct_ncnc', 'pair_residual_struct_ncnc_h3_delta', 'pair_residual_struct_ncnc_multi', 'pair_residual_struct_compact_multi', 'pair_residual_struct_compact_multi_gated', or 'pair_residual_struct_ocn'."
         )
 
     def _set_struct_decoder_context(
@@ -3775,9 +4154,11 @@ def train_encoder(
         print(
             f"[PRED-DECODER] active | type={prediction_decoder_type} | score_source={score_source} | "
             f"rank_w={prediction_rank_weight} bce_w={prediction_bce_weight} margin={prediction_rank_margin} "
-            f"neg_k={prediction_rank_neg_k} pool_factor={prediction_rank_pool_factor} | "
+            f"neg_k={prediction_rank_neg_k} pool_factor={prediction_rank_pool_factor} "
+            f"neg_strategy={prediction_rank_neg_strategy} struct_frac={prediction_rank_struct_frac} | "
             f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight} "
-            f"gate_l1_w={prediction_gate_l1_weight} h3_gate_init={prediction_h3_gate_init}"
+            f"gate_l1_w={prediction_gate_l1_weight} h3_gate_init={prediction_h3_gate_init} "
+            f"residual_gate_init={prediction_residual_gate_init} residual_scale={prediction_residual_scale}"
         )
     if not use_edited_decoder and prediction_decoder is None:
         print(
@@ -3792,7 +4173,8 @@ def train_encoder(
     print(
         f"[EVAL-POLICY] eval_log_every={eval_log_every} train_eval_every={train_eval_every} "
         f"skip_train_acc={int(skip_train_acc)} decoder_diag_every={decoder_diag_every} "
-        f"edit_metric_every={edit_metric_every} edge_eval={int(edge_eval)} heart_eval_every={heart_eval_every} "
+        f"edit_metric_every={edit_metric_every} decoded_audit_every={decoded_audit_every} "
+        f"decoded_audit_max_edges={decoded_audit_max_edges} edge_eval={int(edge_eval)} heart_eval_every={heart_eval_every} "
         f"heart_val_frac={heart_val_frac} random_checkpoint_metric={random_checkpoint_metric}"
     )
 
@@ -5427,6 +5809,15 @@ def train_encoder(
                         g = g_decoded
                         aug_edge_index = g.to_sparse().indices()
                         decoded_rewrite_applied_this_epoch = True
+                        _audit_decoded_rewrite_quality(
+                            epoch,
+                            decoded_pre_rewrite_graph_dense_epoch,
+                            g,
+                            decoded_labels_epoch,
+                            decoded_c0p_mask_epoch,
+                            z_pull_seed,
+                            decoded_scorer,
+                        )
 
                         if decoded_static_view_enabled and not decoded_accumulate_into_base:
                             static_decoded_aug_graph_dense = g.detach().clone()
@@ -5921,6 +6312,8 @@ def train_encoder(
                         num_neg_per_pos=prediction_rank_neg_k,
                         pool_factor=prediction_rank_pool_factor,
                         margin=prediction_rank_margin,
+                        neg_strategy=prediction_rank_neg_strategy,
+                        struct_frac=prediction_rank_struct_frac,
                     )
                 if prediction_bce_weight != 0.0:
                     pred_bce = sampled_prediction_bce_logits_loss(
@@ -6495,6 +6888,7 @@ def train_encoder(
                     f"decoder_type={decoder_type} pred_decoder_type={prediction_decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
                     f"heart_rank_weight={heart_rank_weight:.6f} prediction_rank_weight={prediction_rank_weight:.6f} "
                     f"prediction_h3_gate={prediction_extra_diag.get('prediction_h3_gate', float('nan')):.6f} "
+                    f"prediction_compact_gate={prediction_extra_diag.get('prediction_compact_gate', float('nan')):.6f} "
                     f"dot_val_hit10={score_diag['diag_dot_val_hit10']:.6f} "
                     f"decoder_val_hit10={score_diag['diag_decoder_val_hit10']:.6f} "
                     f"pred_val_hit10={score_diag['diag_pred_val_hit10']:.6f} "
@@ -6795,10 +7189,16 @@ def train_encoder(
                 "prediction_rank_weight": float(prediction_rank_weight),
                 "prediction_bce_weight": float(prediction_bce_weight),
                 "prediction_encoder_weight": float(prediction_encoder_weight),
+                "prediction_rank_neg_strategy": prediction_rank_neg_strategy,
+                "prediction_rank_struct_frac": float(prediction_rank_struct_frac),
                 "prediction_gate_l1_weight": float(prediction_gate_l1_weight),
                 "prediction_h3_gate_init": float(prediction_h3_gate_init),
+                "prediction_residual_gate_init": float(prediction_residual_gate_init),
+                "prediction_residual_scale": float(prediction_residual_scale),
                 "prediction_joint_start_epoch": int(prediction_joint_start_epoch),
                 "prediction_h3_gate": float(prediction_extra_diag.get("prediction_h3_gate", float("nan"))),
+                "prediction_compact_gate": float(prediction_extra_diag.get("prediction_compact_gate", float("nan"))),
+                "prediction_compact_residual_scale": float(prediction_extra_diag.get("prediction_compact_residual_scale", float("nan"))),
                 "diag_dot_val_hit10": float(score_diag.get("diag_dot_val_hit10", float("nan"))),
                 "diag_decoder_val_hit10": float(score_diag.get("diag_decoder_val_hit10", float("nan"))),
                 "diag_pred_val_hit10": float(score_diag.get("diag_pred_val_hit10", float("nan"))),
@@ -6912,6 +7312,7 @@ def train_encoder(
                 f'prediction_bce = {best_meta_cpu.get("prediction_bce", float("nan")):.6f}, '
                 f'prediction_extra_reg = {best_meta_cpu.get("prediction_extra_reg", float("nan")):.6f}, '
                 f'prediction_h3_gate = {best_meta_cpu.get("prediction_h3_gate", float("nan")):.6f}, '
+                f'prediction_compact_gate = {best_meta_cpu.get("prediction_compact_gate", float("nan")):.6f}, '
                 f'prediction_rank_pairs = {best_meta_cpu.get("prediction_rank_pairs", float("nan")):.0f}, '
                 f'dot_val_hit10 = {best_meta_cpu.get("diag_dot_val_hit10", float("nan")):.6f}, '
                 f'decoder_val_hit10 = {best_meta_cpu.get("diag_decoder_val_hit10", float("nan")):.6f}, '
@@ -7086,6 +7487,7 @@ def train_encoder(
             f"decoder_type={decoder_type} pred_decoder_type={prediction_decoder_type} normalize_input={int(decoder_normalize_input)} score_source={score_source} "
             f"heart_rank_weight={heart_rank_weight:.6f} prediction_rank_weight={prediction_rank_weight:.6f} "
             f"prediction_h3_gate={final_prediction_extra_diag.get('prediction_h3_gate', float('nan')):.6f} "
+            f"prediction_compact_gate={final_prediction_extra_diag.get('prediction_compact_gate', float('nan')):.6f} "
             f"dot_test_hit10={final_score_diag.get('diag_dot_test_hit10', float('nan')):.6f} "
             f"decoder_test_hit10={final_score_diag.get('diag_decoder_test_hit10', float('nan')):.6f} "
             f"pred_test_hit10={final_score_diag.get('diag_pred_test_hit10', float('nan')):.6f} "
@@ -7160,9 +7562,14 @@ def train_encoder(
             f"prediction_rank_weight={float(best_meta_cpu.get('prediction_rank_weight', float('nan'))):.6f} "
             f"prediction_bce_weight={float(best_meta_cpu.get('prediction_bce_weight', float('nan'))):.6f} "
             f"prediction_encoder_weight={float(best_meta_cpu.get('prediction_encoder_weight', float('nan'))):.6f} "
+            f"prediction_rank_struct_frac={float(best_meta_cpu.get('prediction_rank_struct_frac', float('nan'))):.6f} "
             f"prediction_gate_l1_weight={float(best_meta_cpu.get('prediction_gate_l1_weight', float('nan'))):.6f} "
             f"prediction_h3_gate_init={float(best_meta_cpu.get('prediction_h3_gate_init', float('nan'))):.6f} "
             f"prediction_h3_gate={float(best_meta_cpu.get('prediction_h3_gate', float('nan'))):.6f} "
+            f"prediction_residual_gate_init={float(best_meta_cpu.get('prediction_residual_gate_init', float('nan'))):.6f} "
+            f"prediction_residual_scale={float(best_meta_cpu.get('prediction_residual_scale', float('nan'))):.6f} "
+            f"prediction_compact_gate={float(best_meta_cpu.get('prediction_compact_gate', float('nan'))):.6f} "
+            f"prediction_compact_residual_scale={float(best_meta_cpu.get('prediction_compact_residual_scale', float('nan'))):.6f} "
             f"decoder_normalize_input={float(best_meta_cpu.get('decoder_normalize_input', float('nan'))):.0f} "
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
             f"heart_rank_margin={float(best_meta_cpu.get('heart_rank_margin', float('nan'))):.6f} "

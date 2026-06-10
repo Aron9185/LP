@@ -75,6 +75,22 @@ PAIR_SCORER_CONFIGS = [
         "remove": False,
     },
     {
+        "name": "two_decoder_compact_multi_pred",
+        "family": "two_decoder_compact_multi",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_compact_multi",
+        "use_edit_decoder": True,
+        "remove": False,
+    },
+    {
+        "name": "two_decoder_compact_multi_gated_pred",
+        "family": "two_decoder_compact_multi_gated",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_compact_multi_gated",
+        "use_edit_decoder": True,
+        "remove": False,
+    },
+    {
         "name": "two_decoder_ocn_pred",
         "family": "two_decoder_ocn",
         "score_source": "pred_decoder",
@@ -184,10 +200,14 @@ def parse_args():
     parser.add_argument("--prediction-rank-margin", type=float, default=0.2)
     parser.add_argument("--prediction-rank-neg-k", type=int, default=16)
     parser.add_argument("--prediction-rank-pool-factor", type=int, default=8)
+    parser.add_argument("--prediction-rank-neg-strategy", choices=["random", "struct"], default="random")
+    parser.add_argument("--prediction-rank-struct-frac", type=float, default=0.5)
     parser.add_argument("--prediction-encoder-weight", type=float, default=0.05)
     parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
     parser.add_argument("--prediction-gate-l1-weight", type=float, default=0.0)
     parser.add_argument("--prediction-h3-gate-init", type=float, default=-3.0)
+    parser.add_argument("--prediction-residual-gate-init", type=float, default=-4.0)
+    parser.add_argument("--prediction-residual-scale", type=float, default=1.0)
     parser.add_argument("--compactness-radius-metric", choices=["cosine", "mahalanobis"], default="cosine")
     parser.add_argument("--decoder-normalize-input", action="store_true", help="Use normalized pair embeddings. Default uses raw pair embeddings.")
     parser.add_argument("--eval-log-every", type=int, default=5)
@@ -195,6 +215,8 @@ def parse_args():
     parser.add_argument("--skip-train-acc", action="store_true")
     parser.add_argument("--decoder-diag-every", type=int, default=-1)
     parser.add_argument("--edit-metric-every", type=int, default=1)
+    parser.add_argument("--decoded-audit-every", type=int, default=0)
+    parser.add_argument("--decoded-audit-max-edges", type=int, default=4096)
     parser.add_argument("--full-matrix-eval", action="store_true", help="Forward --full_matrix_eval instead of the default edge-only eval.")
     parser.add_argument("--heart-eval-every", type=int, default=5)
     parser.add_argument("--heart-val-frac", type=float, default=1.0)
@@ -276,6 +298,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
     task_idx, task_total, cfg, dataset, seed = task
     out_path = log_path(args.prefix, cfg["name"], dataset, seed)
     progress = f"{task_idx}/{task_total}"
+    run_id = f"{args.prefix}_{cfg['name']}_{dataset}_s{seed}"
 
     if is_complete_log(out_path) and not args.force:
         metrics = extract_metrics(out_path)
@@ -311,7 +334,10 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--train_eval_every", str(args.train_eval_every),
         "--decoder_diag_every", str(args.decoder_diag_every),
         "--edit_metric_every", str(args.edit_metric_every),
-        "--run_tag", cfg["name"],
+        "--decoded_audit_every", str(args.decoded_audit_every),
+        "--decoded_audit_max_edges", str(args.decoded_audit_max_edges),
+        "--idx", run_id,
+        "--run_tag", run_id,
         "--ver", "no",
         "--use_decoded_graph_augment",
         "--dynamic_c0p_targets",
@@ -344,10 +370,14 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--prediction_rank_margin", str(args.prediction_rank_margin),
         "--prediction_rank_neg_k", str(args.prediction_rank_neg_k),
         "--prediction_rank_pool_factor", str(args.prediction_rank_pool_factor),
+        "--prediction_rank_neg_strategy", str(args.prediction_rank_neg_strategy),
+        "--prediction_rank_struct_frac", str(args.prediction_rank_struct_frac),
         "--prediction_encoder_weight", str(args.prediction_encoder_weight),
         "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
         "--prediction_gate_l1_weight", str(args.prediction_gate_l1_weight),
         "--prediction_h3_gate_init", str(args.prediction_h3_gate_init),
+        "--prediction_residual_gate_init", str(args.prediction_residual_gate_init),
+        "--prediction_residual_scale", str(args.prediction_residual_scale),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
     if cfg.get("use_edit_decoder", True):
@@ -503,9 +533,14 @@ def main():
         "prediction_rank_weight",
         "prediction_bce_weight",
         "prediction_encoder_weight",
+        "prediction_rank_struct_frac",
         "prediction_gate_l1_weight",
         "prediction_h3_gate_init",
         "prediction_h3_gate",
+        "prediction_residual_gate_init",
+        "prediction_residual_scale",
+        "prediction_compact_gate",
+        "prediction_compact_residual_scale",
         "decoder_normalize_input",
         "heart_rank_weight",
         "heart_rank_margin",

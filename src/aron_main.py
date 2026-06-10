@@ -271,6 +271,8 @@ parser.add_argument(
         "pair_residual_struct_ncnc",
         "pair_residual_struct_ncnc_h3_delta",
         "pair_residual_struct_ncnc_multi",
+        "pair_residual_struct_compact_multi",
+        "pair_residual_struct_compact_multi_gated",
         "pair_residual_struct_ocn",
     ],
     help="Optional prediction decoder trained separately from the edit decoder.",
@@ -280,10 +282,14 @@ parser.add_argument("--prediction_bce_weight", type=float, default=0.1, help="We
 parser.add_argument("--prediction_rank_margin", type=float, default=0.2, help="Margin for prediction-decoder ranking loss.")
 parser.add_argument("--prediction_rank_neg_k", type=int, default=16, help="Hard negatives per train positive for prediction-decoder ranking.")
 parser.add_argument("--prediction_rank_pool_factor", type=int, default=8, help="Hard-negative pool multiplier for prediction-decoder ranking.")
+parser.add_argument("--prediction_rank_neg_strategy", type=str, default="random", choices=["random", "struct"], help="Negative-pool seeding strategy for prediction-decoder ranking.")
+parser.add_argument("--prediction_rank_struct_frac", type=float, default=0.5, help="Fraction of prediction ranking negative candidates seeded from structural CN/RA/AA hardness when strategy=struct.")
 parser.add_argument("--prediction_joint_start_epoch", type=int, default=-1, help="Epoch when prediction-decoder loss may backpropagate into the encoder. -1 uses decoded rewrite start.")
 parser.add_argument("--prediction_encoder_weight", type=float, default=0.0, help="Weight for the late joint prediction-decoder loss on encoder embeddings.")
 parser.add_argument("--prediction_gate_l1_weight", type=float, default=0.0, help="Optional L1 penalty for gated prediction-decoder residual branches.")
 parser.add_argument("--prediction_h3_gate_init", type=float, default=-3.0, help="Initial logit for the h3-delta prediction-decoder gate.")
+parser.add_argument("--prediction_residual_gate_init", type=float, default=-4.0, help="Initial logit for conservative gated prediction-decoder residuals.")
+parser.add_argument("--prediction_residual_scale", type=float, default=1.0, help="Maximum tanh-bounded residual scale for conservative gated prediction decoders.")
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
 parser.add_argument("--compactness_radius_metric", type=str, default="cosine", choices=["cosine", "mahalanobis"], help="Radius metric used by compactness diagnostics/objective.")
@@ -324,6 +330,8 @@ parser.add_argument("--train_eval_every", type=int, default=1, help="Run non-Hea
 parser.add_argument("--skip_train_acc", action="store_true", help="Skip per-epoch full-matrix train accuracy during training evaluation.")
 parser.add_argument("--decoder_diag_every", type=int, default=-1, help="Run decoder score diagnostics every N epochs; -1 means every evaluated epoch, 0 disables training-time diagnostics.")
 parser.add_argument("--edit_metric_every", type=int, default=1, help="Run edit compactness/radius diagnostics every N epochs; 0 disables training-time edit metrics.")
+parser.add_argument("--decoded_audit_every", type=int, default=0, help="Run decoded rewrite edge-quality audit every N rewrite epochs; 0 disables it.")
+parser.add_argument("--decoded_audit_max_edges", type=int, default=4096, help="Maximum rewritten edges sampled for decoded rewrite score audit.")
 parser.add_argument("--edge_eval", dest="edge_eval", action="store_true", help="Evaluate validation/test edges with edge-only scoring instead of materializing a full score matrix.")
 parser.add_argument("--full_matrix_eval", dest="edge_eval", action="store_false", help="Materialize a full score matrix for validation/test evaluation.")
 parser.add_argument("--freeze_c0p_at_edit_start", dest="freeze_c0p_at_edit_start", action="store_true", help="Freeze GMM/C0p targets once editing starts.")
@@ -475,7 +483,7 @@ def main():
         dbscan_metric=args.dbscan_metric,
         topk_per_node=args.topk_per_node,
         aug_ratio_epoch=args.aug_ratio_epoch,
-        run_tag=args.idx,
+        run_tag=args.run_tag or args.idx,
         # NEW cluster controls
         cluster_method=args.cluster_method,
         cluster_mode=args.cluster_mode,
@@ -514,10 +522,14 @@ def main():
         prediction_rank_margin=args.prediction_rank_margin,
         prediction_rank_neg_k=args.prediction_rank_neg_k,
         prediction_rank_pool_factor=args.prediction_rank_pool_factor,
+        prediction_rank_neg_strategy=args.prediction_rank_neg_strategy,
+        prediction_rank_struct_frac=args.prediction_rank_struct_frac,
         prediction_joint_start_epoch=args.prediction_joint_start_epoch,
         prediction_encoder_weight=args.prediction_encoder_weight,
         prediction_gate_l1_weight=args.prediction_gate_l1_weight,
         prediction_h3_gate_init=args.prediction_h3_gate_init,
+        prediction_residual_gate_init=args.prediction_residual_gate_init,
+        prediction_residual_scale=args.prediction_residual_scale,
         compactness_weight=args.compactness_weight,
         compactness_objective=args.compactness_objective,
         compactness_radius_metric=args.compactness_radius_metric,
@@ -542,6 +554,8 @@ def main():
         skip_train_acc=args.skip_train_acc,
         decoder_diag_every=args.decoder_diag_every,
         edit_metric_every=args.edit_metric_every,
+        decoded_audit_every=args.decoded_audit_every,
+        decoded_audit_max_edges=args.decoded_audit_max_edges,
         edge_eval=args.edge_eval,
         freeze_c0p_at_edit_start=args.freeze_c0p_at_edit_start,
         use_decoded_graph_augment=args.use_decoded_graph_augment,
@@ -762,7 +776,7 @@ if __name__ == "__main__":
         print("===== RUN META =====")
         print(f"date={args.date} time={time.strftime('%F %T')}")
         print(f"dataset={args.dataset} ver={args.ver} mode={args.cluster_mode} method={args.cluster_method}")
-        print(f"seed={args.seed} idx={args.idx} run_tag={args.run_tag or '<none>'}")
+        print(f"seed={args.seed} idx={args.idx} run_tag={args.run_tag or '<none>'} train_run_id={args.run_tag or args.idx}")
         print(f"ae_backbone={args.ae_backbone} maskgae_mask_rate={args.maskgae_mask_rate} maskgae_feature_weight={args.maskgae_feature_weight}")
         print(f"cimage_factor_weight={args.cimage_factor_weight} cimage_cluster_weight={args.cimage_cluster_weight} cimage_num_factors={args.cimage_num_factors} cimage_num_clusters={args.cimage_num_clusters} cimage_cluster_alpha={args.cimage_cluster_alpha}")
         print(f"cimage_pseudo_label_threshold={args.cimage_pseudo_label_threshold} cimage_factor_select_ratio={args.cimage_factor_select_ratio} cimage_mrmr_redundancy_weight={args.cimage_mrmr_redundancy_weight} cimage_cluster_balance_weight={args.cimage_cluster_balance_weight} cimage_sce_power={args.cimage_sce_power}")
