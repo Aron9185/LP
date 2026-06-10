@@ -1606,6 +1606,9 @@ def heart_train_margin_ranking_loss_pairs(
     neg_strategy: str = "random",
     struct_frac: float = 0.5,
     max_pos_edges: int = 8192,
+    hard_only: bool = False,
+    hard_margin: float = 0.2,
+    dot_anchor_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     debug = {
         "heart_rank_pairs": 0,
@@ -1613,6 +1616,11 @@ def heart_train_margin_ranking_loss_pairs(
         "heart_rank_neg_pool": 0,
         "heart_rank_pos_mean": float("nan"),
         "heart_rank_neg_mean": float("nan"),
+        "heart_rank_pairs_total": 0,
+        "heart_rank_hard_pairs": 0,
+        "heart_rank_easy_pairs": 0,
+        "heart_rank_dot_gap_mean": float("nan"),
+        "heart_rank_anchor_loss": float("nan"),
     }
     if train_edges_t.numel() == 0 or num_neg_per_pos <= 0:
         return Z.sum() * 0.0, debug
@@ -1719,16 +1727,53 @@ def heart_train_margin_ranking_loss_pairs(
     hard_neg_v = neg_v_pool.gather(1, hard_idx).reshape(-1)
     hard_neg = _decoder_score_pairs(graph_decoder, Z, hard_neg_u, hard_neg_v).view(valid_pos_count, hard_k)
     pos_scores = _decoder_score_pairs(graph_decoder, Z, pos_u_t, pos_v_t).view(-1, 1).expand_as(hard_neg)
-    target = torch.ones_like(pos_scores.reshape(-1))
-    loss = F.margin_ranking_loss(pos_scores.reshape(-1), hard_neg.reshape(-1), target, margin=float(margin))
+    pos_flat = pos_scores.reshape(-1)
+    neg_flat = hard_neg.reshape(-1)
+    target = torch.ones_like(pos_flat)
+
+    with torch.no_grad():
+        dot_pos = (Z.index_select(0, pos_u_t) * Z.index_select(0, pos_v_t)).sum(dim=1).view(-1, 1).expand_as(hard_neg)
+        dot_neg = (Z.index_select(0, hard_neg_u) * Z.index_select(0, hard_neg_v)).sum(dim=1).view(valid_pos_count, hard_k)
+        dot_pos_flat = dot_pos.reshape(-1)
+        dot_neg_flat = dot_neg.reshape(-1)
+        dot_gap = dot_pos_flat - dot_neg_flat
+        hard_mask = dot_gap < float(hard_margin)
+
+    rank_losses = F.margin_ranking_loss(pos_flat, neg_flat, target, margin=float(margin), reduction="none")
+    hard_only = bool(hard_only)
+    if hard_only:
+        if bool(hard_mask.any().item()):
+            loss = rank_losses[hard_mask].mean()
+        else:
+            loss = pos_flat.sum() * 0.0
+        used_rank_pairs = int(hard_mask.sum().item())
+    else:
+        loss = rank_losses.mean()
+        used_rank_pairs = int(rank_losses.numel())
+
+    anchor_loss = pos_flat.new_tensor(0.0)
+    dot_anchor_weight = max(0.0, float(dot_anchor_weight))
+    if dot_anchor_weight > 0.0:
+        anchor_mask = ~hard_mask if hard_only else torch.ones_like(hard_mask, dtype=torch.bool)
+        if bool(anchor_mask.any().item()):
+            pred_anchor = torch.cat([pos_flat[anchor_mask], neg_flat[anchor_mask]], dim=0)
+            dot_anchor = torch.cat([dot_pos_flat[anchor_mask], dot_neg_flat[anchor_mask]], dim=0)
+            anchor_loss = F.smooth_l1_loss(pred_anchor, dot_anchor.detach())
+            loss = loss + dot_anchor_weight * anchor_loss
+
     debug.update(
         {
-            "heart_rank_pairs": int(pos_scores.numel()),
+            "heart_rank_pairs": int(used_rank_pairs),
             "heart_rank_pos": int(valid_pos_count),
             "heart_rank_neg_pool": int(neg_u_t.numel()),
             "heart_rank_pos_mean": float(pos_scores.detach().mean().cpu()),
             "heart_rank_neg_mean": float(hard_neg.detach().mean().cpu()),
             "heart_rank_neg_strategy": neg_strategy,
+            "heart_rank_pairs_total": int(pos_scores.numel()),
+            "heart_rank_hard_pairs": int(hard_mask.sum().item()),
+            "heart_rank_easy_pairs": int((~hard_mask).sum().item()),
+            "heart_rank_dot_gap_mean": float(dot_gap.detach().mean().cpu()),
+            "heart_rank_anchor_loss": float(anchor_loss.detach().cpu()) if dot_anchor_weight > 0.0 else float("nan"),
         }
     )
     return loss, debug
@@ -1757,6 +1802,12 @@ def hybrid_decoder_structure_losses_pairwise(
     require_c0p_endpoint: bool,
     require_both_c0p: bool,
     require_c0p_noncompact_endpoint: bool,
+    require_structural_support: bool,
+    structural_support_mode: str,
+    structural_min_cn: float,
+    structural_min_ra: float,
+    structural_min_aa: float,
+    structural_support_mask: torch.Tensor | None,
     keep_weight: float,
     add_rank_weight: float,
     remove_rank_weight: float,
@@ -1775,6 +1826,12 @@ def hybrid_decoder_structure_losses_pairwise(
         require_c0p_endpoint=require_c0p_endpoint,
         require_both_c0p=require_both_c0p,
         require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
+        require_structural_support=require_structural_support,
+        structural_support_mode=structural_support_mode,
+        structural_min_cn=structural_min_cn,
+        structural_min_ra=structural_min_ra,
+        structural_min_aa=structural_min_aa,
+        structural_support_mask=structural_support_mask,
     )
     debug_info = _empty_decoder_debug_info()
     debug_info.update(
@@ -1782,6 +1839,8 @@ def hybrid_decoder_structure_losses_pairwise(
             "rewrite_nodes": int(ctx["core_mask"].sum().item()),
             "valid_pairs": int(ctx["valid_pairs"].triu(1).sum().item()),
             "add_pairs": int(ctx["add_pairs"].triu(1).sum().item()),
+            "add_pairs_pre_struct": int(ctx["add_pairs_pre_struct"].triu(1).sum().item()),
+            "struct_supported_add_pairs": int((ctx["add_pairs_pre_struct"] & ctx["structural_support"]).triu(1).sum().item()),
             "removable_pairs": int(ctx["removable_pairs"].triu(1).sum().item()),
         }
     )
@@ -1907,6 +1966,12 @@ def build_decoded_augmented_graph_from_decoder(
         require_both_c0p=bool(kwargs.get("require_both_c0p", False)),
         require_c0p_noncompact_endpoint=bool(kwargs.get("require_c0p_noncompact_endpoint", False)),
         deg0_excl_self=kwargs.get("deg0_excl_self", None),
+        require_structural_support=bool(kwargs.get("require_structural_support", False)),
+        structural_support_mode=str(kwargs.get("structural_support_mode", "cn_or_ra")),
+        structural_min_cn=float(kwargs.get("structural_min_cn", 1.0)),
+        structural_min_ra=float(kwargs.get("structural_min_ra", 0.0)),
+        structural_min_aa=float(kwargs.get("structural_min_aa", 0.0)),
+        structural_support_mask=kwargs.get("structural_support_mask", None),
     )
     cand = ctx["add_pairs"] | ctx["removable_pairs"]
     ii, jj = cand.triu(1).nonzero(as_tuple=True)
@@ -1994,6 +2059,69 @@ def _resolve_node_mask(node_mask: torch.Tensor | None, num_nodes: int, device: t
     return node_mask.to(device).bool()
 
 
+def _decoded_structural_support_mask(
+    graph_dense: torch.Tensor,
+    *,
+    mode: str = "cn_or_ra",
+    min_cn: float = 1.0,
+    min_ra: float = 0.0,
+    min_aa: float = 0.0,
+) -> torch.Tensor:
+    device = graph_dense.device
+    n_nodes = graph_dense.size(0)
+    mode = str(mode or "cn_or_ra").lower()
+    valid_modes = {"cn", "ra", "aa", "cn_or_ra", "cn_or_aa", "ra_or_aa", "any", "all"}
+    if mode not in valid_modes:
+        mode = "cn_or_ra"
+
+    g0 = (graph_dense > 0).to(torch.float32).clone()
+    g0.fill_diagonal_(0.0)
+    deg = g0.sum(dim=1).clamp_min(1.0)
+
+    def _passes(values: torch.Tensor, threshold: float) -> torch.Tensor:
+        threshold = float(threshold)
+        if threshold <= 0.0:
+            return values > 0.0
+        return values >= threshold
+
+    terms: dict[str, torch.Tensor] = {}
+    need_cn = mode in {"cn", "cn_or_ra", "cn_or_aa", "any", "all"}
+    need_ra = mode in {"ra", "cn_or_ra", "ra_or_aa", "any", "all"}
+    need_aa = mode in {"aa", "cn_or_aa", "ra_or_aa", "any", "all"}
+    if need_cn:
+        cn = g0 @ g0
+        terms["cn"] = _passes(cn, min_cn)
+    if need_ra:
+        ra = (g0 * deg.reciprocal().view(1, -1)) @ g0
+        terms["ra"] = _passes(ra, min_ra)
+    if need_aa:
+        log_deg = torch.log(deg.clamp_min(2.0))
+        inv_log_deg = torch.where(log_deg > 0, log_deg.reciprocal(), torch.zeros_like(log_deg))
+        aa = (g0 * inv_log_deg.view(1, -1)) @ g0
+        terms["aa"] = _passes(aa, min_aa)
+
+    if not terms:
+        support = torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device)
+    elif mode == "all":
+        support = torch.ones((n_nodes, n_nodes), dtype=torch.bool, device=device)
+        for term in terms.values():
+            support = support & term
+    elif mode == "cn_or_ra":
+        support = terms.get("cn", torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device)) | terms.get("ra", torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device))
+    elif mode == "cn_or_aa":
+        support = terms.get("cn", torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device)) | terms.get("aa", torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device))
+    elif mode == "ra_or_aa":
+        support = terms.get("ra", torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device)) | terms.get("aa", torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device))
+    elif mode == "any":
+        support = torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device)
+        for term in terms.values():
+            support = support | term
+    else:
+        support = terms[mode]
+    support.fill_diagonal_(False)
+    return support
+
+
 def _build_decoded_pair_context(
     adj_current_dense: torch.Tensor,
     labels: np.ndarray | None,
@@ -2005,6 +2133,12 @@ def _build_decoded_pair_context(
     require_both_c0p: bool = False,
     require_c0p_noncompact_endpoint: bool = False,
     deg0_excl_self: torch.Tensor | None = None,
+    require_structural_support: bool = False,
+    structural_support_mode: str = "cn_or_ra",
+    structural_min_cn: float = 1.0,
+    structural_min_ra: float = 0.0,
+    structural_min_aa: float = 0.0,
+    structural_support_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     device = adj_current_dense.device
     n_nodes = adj_current_dense.size(0)
@@ -2055,6 +2189,28 @@ def _build_decoded_pair_context(
     removable_pairs = removable_pairs & enough_degree[:, None] & enough_degree[None, :]
 
     add_pairs = valid_pairs & (~existing)
+    add_pairs_pre_struct = add_pairs.clone()
+    structural_support = torch.ones((n_nodes, n_nodes), dtype=torch.bool, device=device)
+    if require_structural_support:
+        if structural_support_mask is not None:
+            structural_support = structural_support_mask.to(device=device).bool()
+            if tuple(structural_support.shape) != (n_nodes, n_nodes):
+                structural_support = _decoded_structural_support_mask(
+                    g,
+                    mode=structural_support_mode,
+                    min_cn=structural_min_cn,
+                    min_ra=structural_min_ra,
+                    min_aa=structural_min_aa,
+                )
+        else:
+            structural_support = _decoded_structural_support_mask(
+                g,
+                mode=structural_support_mode,
+                min_cn=structural_min_cn,
+                min_ra=structural_min_ra,
+                min_aa=structural_min_aa,
+            )
+        add_pairs = add_pairs & structural_support
 
     return {
         "graph_dense": g,
@@ -2065,6 +2221,8 @@ def _build_decoded_pair_context(
         "non_noise": non_noise,
         "valid_pairs": valid_pairs,
         "add_pairs": add_pairs,
+        "add_pairs_pre_struct": add_pairs_pre_struct,
+        "structural_support": structural_support,
         "removable_pairs": removable_pairs,
         "deg0": deg0,
     }
@@ -2282,6 +2440,8 @@ def _empty_decoder_debug_info() -> dict[str, int]:
         "rewrite_nodes": 0,
         "valid_pairs": 0,
         "add_pairs": 0,
+        "add_pairs_pre_struct": 0,
+        "struct_supported_add_pairs": 0,
         "add_budget": 0,
         "add_selected": 0,
         "add_negatives": 0,
@@ -2320,6 +2480,12 @@ def hybrid_decoder_structure_losses(
     require_c0p_endpoint: bool,
     require_both_c0p: bool,
     require_c0p_noncompact_endpoint: bool,
+    require_structural_support: bool,
+    structural_support_mode: str,
+    structural_min_cn: float,
+    structural_min_ra: float,
+    structural_min_aa: float,
+    structural_support_mask: torch.Tensor | None,
     keep_weight: float,
     add_rank_weight: float,
     remove_rank_weight: float,
@@ -2338,6 +2504,12 @@ def hybrid_decoder_structure_losses(
         require_c0p_endpoint=require_c0p_endpoint,
         require_both_c0p=require_both_c0p,
         require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
+        require_structural_support=require_structural_support,
+        structural_support_mode=structural_support_mode,
+        structural_min_cn=structural_min_cn,
+        structural_min_ra=structural_min_ra,
+        structural_min_aa=structural_min_aa,
+        structural_support_mask=structural_support_mask,
     )
 
     keep_mask = ~ctx["valid_pairs"]
@@ -2466,6 +2638,8 @@ def hybrid_decoder_structure_losses(
             "rewrite_nodes": int(rewrite_mask.sum().item()) if rewrite_mask is not None else 0,
             "valid_pairs": int(add_scores.numel() + rem_scores.numel()),
             "add_pairs": int(add_scores.numel()),
+            "add_pairs_pre_struct": int(ctx["add_pairs_pre_struct"].triu(1).sum().item()),
+            "struct_supported_add_pairs": int((ctx["add_pairs_pre_struct"] & ctx["structural_support"]).triu(1).sum().item()),
             "add_budget": int(add_budget),
             "add_selected": int(add_sel.numel()),
             "add_negatives": int(add_neg_scores.numel()),
@@ -3021,6 +3195,12 @@ def build_decoded_augmented_graph(
     require_c0p_endpoint: bool = True,
     require_both_c0p: bool = False,
     require_c0p_noncompact_endpoint: bool = False,
+    require_structural_support: bool = False,
+    structural_support_mode: str = "cn_or_ra",
+    structural_min_cn: float = 1.0,
+    structural_min_ra: float = 0.0,
+    structural_min_aa: float = 0.0,
+    structural_support_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     """
     Rewrite the current graph using decoder scores from the pulled latent.
@@ -3048,6 +3228,12 @@ def build_decoded_augmented_graph(
         require_both_c0p=require_both_c0p,
         require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
         deg0_excl_self=deg0_excl_self,
+        require_structural_support=require_structural_support,
+        structural_support_mode=structural_support_mode,
+        structural_min_cn=structural_min_cn,
+        structural_min_ra=structural_min_ra,
+        structural_min_aa=structural_min_aa,
+        structural_support_mask=structural_support_mask,
     )
     g = ctx["graph_dense"].clone().to(score.dtype)
     eye = ctx["eye"]
@@ -3101,7 +3287,7 @@ def build_decoded_augmented_graph(
     added = 0
     removed = 0
 
-    cand_add = valid_pairs & (~existing)
+    cand_add = ctx["add_pairs"].clone()
     ii, jj = cand_add.triu(1).nonzero(as_tuple=True)
     if ii.numel() > 0:
         add_scores = score[ii, jj]
@@ -3400,6 +3586,9 @@ def train_encoder(
     prediction_h3_gate_init = float(kwargs.get("prediction_h3_gate_init", -3.0))
     prediction_residual_gate_init = float(kwargs.get("prediction_residual_gate_init", -4.0))
     prediction_residual_scale = float(kwargs.get("prediction_residual_scale", 1.0))
+    prediction_hard_residual_only = bool(kwargs.get("prediction_hard_residual_only", False))
+    prediction_hard_margin = float(kwargs.get("prediction_hard_margin", 0.2))
+    prediction_dot_anchor_weight = float(kwargs.get("prediction_dot_anchor_weight", 0.0))
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
@@ -3438,6 +3627,13 @@ def train_encoder(
     decoded_require_c0p_endpoint = bool(kwargs.get("decoded_require_c0p_endpoint", False))
     decoded_require_both_c0p = bool(kwargs.get("decoded_require_both_c0p", False))
     decoded_require_c0p_noncompact_endpoint = bool(kwargs.get("decoded_require_c0p_noncompact_endpoint", False))
+    decoded_require_structural_support = bool(kwargs.get("decoded_require_structural_support", False))
+    decoded_struct_support = str(kwargs.get("decoded_struct_support", "cn_or_ra") or "cn_or_ra").lower()
+    if decoded_struct_support not in {"cn", "ra", "aa", "cn_or_ra", "cn_or_aa", "ra_or_aa", "any", "all"}:
+        raise ValueError("decoded_struct_support must be one of: cn, ra, aa, cn_or_ra, cn_or_aa, ra_or_aa, any, all")
+    decoded_struct_min_cn = float(kwargs.get("decoded_struct_min_cn", 1.0))
+    decoded_struct_min_ra = float(kwargs.get("decoded_struct_min_ra", 0.0))
+    decoded_struct_min_aa = float(kwargs.get("decoded_struct_min_aa", 0.0))
     decoded_graph_aug_bound = kwargs.get("decoded_graph_aug_bound", None)
     decoded_add_degree_target = int(kwargs.get("decoded_add_degree_target", -1) or -1)
     decoded_add_degree_target_scope = str(kwargs.get("decoded_add_degree_target_scope", "total") or "total").lower()
@@ -4138,6 +4334,8 @@ def train_encoder(
             f"heart_neg_k={heart_rank_neg_k} heart_pool_factor={heart_rank_pool_factor} | "
             f"compactness_weight={compactness_weight} | preserve_weight={preserve_weight} | "
             f"c0p_noncompact_endpoint={int(decoded_require_c0p_noncompact_endpoint)} | "
+            f"decoded_struct_support={int(decoded_require_structural_support)}:{decoded_struct_support} "
+            f"min_cn={decoded_struct_min_cn} min_ra={decoded_struct_min_ra} min_aa={decoded_struct_min_aa} | "
             f"decoded_add_degree_target={decoded_add_degree_target} | "
             f"decoded_add_degree_target_scope={decoded_add_degree_target_scope} | "
             f"decoded_add_degree_target_nodes={decoded_add_degree_target_nodes} | "
@@ -4156,6 +4354,8 @@ def train_encoder(
             f"rank_w={prediction_rank_weight} bce_w={prediction_bce_weight} margin={prediction_rank_margin} "
             f"neg_k={prediction_rank_neg_k} pool_factor={prediction_rank_pool_factor} "
             f"neg_strategy={prediction_rank_neg_strategy} struct_frac={prediction_rank_struct_frac} | "
+            f"hard_only={int(prediction_hard_residual_only)} hard_margin={prediction_hard_margin} "
+            f"dot_anchor_w={prediction_dot_anchor_weight} | "
             f"joint_start={prediction_joint_start_epoch} encoder_w={prediction_encoder_weight} "
             f"gate_l1_w={prediction_gate_l1_weight} h3_gate_init={prediction_h3_gate_init} "
             f"residual_gate_init={prediction_residual_gate_init} residual_scale={prediction_residual_scale}"
@@ -4896,6 +5096,53 @@ def train_encoder(
     static_decoded_built_epoch = None
     if decoded_static_view_enabled:
         print("[EDIT-GRAPH] static decoded view cache enabled (freeze targets + freeze encoder + decoder inference-only + temporary view)")
+
+    decoded_structural_support_cache: dict[tuple, torch.Tensor] = {}
+    decoded_structural_support_cache_logged: set[tuple] = set()
+
+    def _decoded_structural_support_cached(adj_current_dense: torch.Tensor) -> torch.Tensor | None:
+        if not decoded_require_structural_support:
+            return None
+        shape = tuple(adj_current_dense.shape)
+        if len(shape) != 2 or shape[0] != shape[1]:
+            return None
+        mode_key = (
+            str(decoded_struct_support),
+            float(decoded_struct_min_cn),
+            float(decoded_struct_min_ra),
+            float(decoded_struct_min_aa),
+            str(adj_current_dense.device),
+            int(shape[0]),
+        )
+        if (not decoded_accumulate_into_base) and ver == "no":
+            graph_key = ("stable_base",)
+        else:
+            graph_key = (
+                "tensor",
+                int(adj_current_dense.data_ptr()) if adj_current_dense.device.type != "meta" else 0,
+                int(getattr(adj_current_dense, "_version", 0)),
+                float((adj_current_dense > 0).sum().detach().cpu().item()),
+            )
+        key = mode_key + graph_key
+        cached = decoded_structural_support_cache.get(key)
+        if cached is None:
+            cached = _decoded_structural_support_mask(
+                adj_current_dense,
+                mode=decoded_struct_support,
+                min_cn=decoded_struct_min_cn,
+                min_ra=decoded_struct_min_ra,
+                min_aa=decoded_struct_min_aa,
+            ).detach()
+            decoded_structural_support_cache[key] = cached
+            if key not in decoded_structural_support_cache_logged:
+                decoded_structural_support_cache_logged.add(key)
+                print(
+                    f"[DECODED-STRUCT] cached support mode={decoded_struct_support} "
+                    f"min_cn={decoded_struct_min_cn:.6f} min_ra={decoded_struct_min_ra:.6f} "
+                    f"min_aa={decoded_struct_min_aa:.6f} graph_key={graph_key[0]} "
+                    f"supported_pairs={int(cached.triu(1).sum().item())}"
+                )
+        return cached
 
     # optional: a convenient on-disk checkpoint path (safe default)
     ckpt_dir = os.path.join("checkpoints", dataset_str)
@@ -5776,6 +6023,12 @@ def train_encoder(
                                 require_c0p_endpoint=decoded_require_c0p_endpoint,
                                 require_both_c0p=decoded_require_both_c0p,
                                 require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+                                require_structural_support=decoded_require_structural_support,
+                                structural_support_mode=decoded_struct_support,
+                                structural_min_cn=decoded_struct_min_cn,
+                                structural_min_ra=decoded_struct_min_ra,
+                                structural_min_aa=decoded_struct_min_aa,
+                                structural_support_mask=_decoded_structural_support_cached(g),
                             )
                         else:
                             with torch.no_grad():
@@ -5805,6 +6058,12 @@ def train_encoder(
                                 require_c0p_endpoint=decoded_require_c0p_endpoint,
                                 require_both_c0p=decoded_require_both_c0p,
                                 require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+                                require_structural_support=decoded_require_structural_support,
+                                structural_support_mode=decoded_struct_support,
+                                structural_min_cn=decoded_struct_min_cn,
+                                structural_min_ra=decoded_struct_min_ra,
+                                structural_min_aa=decoded_struct_min_aa,
+                                structural_support_mask=_decoded_structural_support_cached(g),
                             )
                         g = g_decoded
                         aug_edge_index = g.to_sparse().indices()
@@ -6170,6 +6429,12 @@ def train_encoder(
                             require_c0p_endpoint=decoded_require_c0p_endpoint,
                             require_both_c0p=decoded_require_both_c0p,
                             require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+                            require_structural_support=decoded_require_structural_support,
+                            structural_support_mode=decoded_struct_support,
+                            structural_min_cn=decoded_struct_min_cn,
+                            structural_min_ra=decoded_struct_min_ra,
+                            structural_min_aa=decoded_struct_min_aa,
+                            structural_support_mask=_decoded_structural_support_cached(_to_dense(adj_label)),
                             keep_weight=decoder_keep_weight,
                             add_rank_weight=decoder_add_rank_weight,
                             remove_rank_weight=decoder_remove_rank_weight,
@@ -6208,6 +6473,12 @@ def train_encoder(
                             require_c0p_endpoint=decoded_require_c0p_endpoint,
                             require_both_c0p=decoded_require_both_c0p,
                             require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+                            require_structural_support=decoded_require_structural_support,
+                            structural_support_mode=decoded_struct_support,
+                            structural_min_cn=decoded_struct_min_cn,
+                            structural_min_ra=decoded_struct_min_ra,
+                            structural_min_aa=decoded_struct_min_aa,
+                            structural_support_mask=_decoded_structural_support_cached(_to_dense(adj_label)),
                             keep_weight=decoder_keep_weight,
                             add_rank_weight=decoder_add_rank_weight,
                             remove_rank_weight=decoder_remove_rank_weight,
@@ -6284,6 +6555,11 @@ def train_encoder(
             "heart_rank_neg_pool": 0,
             "heart_rank_pos_mean": float("nan"),
             "heart_rank_neg_mean": float("nan"),
+            "heart_rank_pairs_total": 0,
+            "heart_rank_hard_pairs": 0,
+            "heart_rank_easy_pairs": 0,
+            "heart_rank_dot_gap_mean": float("nan"),
+            "heart_rank_anchor_loss": float("nan"),
         }
 
         def _prediction_objective(pred_z: torch.Tensor):
@@ -6314,6 +6590,9 @@ def train_encoder(
                         margin=prediction_rank_margin,
                         neg_strategy=prediction_rank_neg_strategy,
                         struct_frac=prediction_rank_struct_frac,
+                        hard_only=prediction_hard_residual_only,
+                        hard_margin=prediction_hard_margin,
+                        dot_anchor_weight=prediction_dot_anchor_weight,
                     )
                 if prediction_bce_weight != 0.0:
                     pred_bce = sampled_prediction_bce_logits_loss(
@@ -6653,6 +6932,12 @@ def train_encoder(
                                         require_c0p_endpoint=decoded_require_c0p_endpoint,
                                         require_both_c0p=decoded_require_both_c0p,
                                         require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+                                        require_structural_support=decoded_require_structural_support,
+                                        structural_support_mode=decoded_struct_support,
+                                        structural_min_cn=decoded_struct_min_cn,
+                                        structural_min_ra=decoded_struct_min_ra,
+                                        structural_min_aa=decoded_struct_min_aa,
+                                        structural_support_mask=_decoded_structural_support_cached(_to_dense(adj_label)),
                                     )
                                 else:
                                     with torch.no_grad():
@@ -6682,6 +6967,12 @@ def train_encoder(
                                         require_c0p_endpoint=decoded_require_c0p_endpoint,
                                         require_both_c0p=decoded_require_both_c0p,
                                         require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+                                        require_structural_support=decoded_require_structural_support,
+                                        structural_support_mode=decoded_struct_support,
+                                        structural_min_cn=decoded_struct_min_cn,
+                                        structural_min_ra=decoded_struct_min_ra,
+                                        structural_min_aa=decoded_struct_min_aa,
+                                        structural_support_mask=_decoded_structural_support_cached(_to_dense(adj_label)),
                                     )
                                 Z_eval = encoder(features, g_eval.to_sparse().indices())
                             radius_after = cluster_compactness_loss(Z_eval, eval_labels, eval_compactness_mask, radius_metric=compactness_radius_metric)
@@ -7176,9 +7467,16 @@ def train_encoder(
                 "prediction_rank_pairs": int(prediction_debug.get("heart_rank_pairs", 0)),
                 "prediction_rank_pos": int(prediction_debug.get("heart_rank_pos", 0)),
                 "prediction_rank_neg_pool": int(prediction_debug.get("heart_rank_neg_pool", 0)),
+                "prediction_rank_pairs_total": int(prediction_debug.get("heart_rank_pairs_total", 0)),
+                "prediction_rank_hard_pairs": int(prediction_debug.get("heart_rank_hard_pairs", 0)),
+                "prediction_rank_easy_pairs": int(prediction_debug.get("heart_rank_easy_pairs", 0)),
+                "prediction_rank_dot_gap_mean": float(prediction_debug.get("heart_rank_dot_gap_mean", float("nan"))),
+                "prediction_rank_anchor_loss": float(prediction_debug.get("heart_rank_anchor_loss", float("nan"))),
                 "heart_rank_pairs": int(edit_decoder_debug.get("heart_rank_pairs", 0)),
                 "heart_rank_pos": int(edit_decoder_debug.get("heart_rank_pos", 0)),
                 "heart_rank_neg_pool": int(edit_decoder_debug.get("heart_rank_neg_pool", 0)),
+                "edit_add_pairs_pre_struct": int(edit_decoder_debug.get("add_pairs_pre_struct", 0)),
+                "edit_struct_supported_add_pairs": int(edit_decoder_debug.get("struct_supported_add_pairs", 0)),
                 "heart_rank_pos_mean": float(edit_heart_rank_debug.get("heart_rank_pos_mean", float("nan"))),
                 "heart_rank_neg_mean": float(edit_heart_rank_debug.get("heart_rank_neg_mean", float("nan"))),
                 "decoder_normalize_input": int(decoder_normalize_input),
@@ -7191,11 +7489,18 @@ def train_encoder(
                 "prediction_encoder_weight": float(prediction_encoder_weight),
                 "prediction_rank_neg_strategy": prediction_rank_neg_strategy,
                 "prediction_rank_struct_frac": float(prediction_rank_struct_frac),
+                "prediction_hard_residual_only": int(prediction_hard_residual_only),
+                "prediction_hard_margin": float(prediction_hard_margin),
+                "prediction_dot_anchor_weight": float(prediction_dot_anchor_weight),
                 "prediction_gate_l1_weight": float(prediction_gate_l1_weight),
                 "prediction_h3_gate_init": float(prediction_h3_gate_init),
                 "prediction_residual_gate_init": float(prediction_residual_gate_init),
                 "prediction_residual_scale": float(prediction_residual_scale),
                 "prediction_joint_start_epoch": int(prediction_joint_start_epoch),
+                "decoded_require_structural_support": int(decoded_require_structural_support),
+                "decoded_struct_min_cn": float(decoded_struct_min_cn),
+                "decoded_struct_min_ra": float(decoded_struct_min_ra),
+                "decoded_struct_min_aa": float(decoded_struct_min_aa),
                 "prediction_h3_gate": float(prediction_extra_diag.get("prediction_h3_gate", float("nan"))),
                 "prediction_compact_gate": float(prediction_extra_diag.get("prediction_compact_gate", float("nan"))),
                 "prediction_compact_residual_scale": float(prediction_extra_diag.get("prediction_compact_residual_scale", float("nan"))),
@@ -7314,6 +7619,9 @@ def train_encoder(
                 f'prediction_h3_gate = {best_meta_cpu.get("prediction_h3_gate", float("nan")):.6f}, '
                 f'prediction_compact_gate = {best_meta_cpu.get("prediction_compact_gate", float("nan")):.6f}, '
                 f'prediction_rank_pairs = {best_meta_cpu.get("prediction_rank_pairs", float("nan")):.0f}, '
+                f'prediction_rank_hard_pairs = {best_meta_cpu.get("prediction_rank_hard_pairs", float("nan")):.0f}, '
+                f'prediction_rank_easy_pairs = {best_meta_cpu.get("prediction_rank_easy_pairs", float("nan")):.0f}, '
+                f'prediction_rank_anchor_loss = {best_meta_cpu.get("prediction_rank_anchor_loss", float("nan")):.6f}, '
                 f'dot_val_hit10 = {best_meta_cpu.get("diag_dot_val_hit10", float("nan")):.6f}, '
                 f'decoder_val_hit10 = {best_meta_cpu.get("diag_decoder_val_hit10", float("nan")):.6f}, '
                 f'pred_val_hit10 = {best_meta_cpu.get("diag_pred_val_hit10", float("nan")):.6f}, '
@@ -7559,10 +7867,18 @@ def train_encoder(
             f"prediction_joint_bce={float(best_meta_cpu.get('prediction_joint_bce', float('nan'))):.6f} "
             f"prediction_extra_reg={float(best_meta_cpu.get('prediction_extra_reg', float('nan'))):.6f} "
             f"prediction_rank_pairs={float(best_meta_cpu.get('prediction_rank_pairs', float('nan'))):.0f} "
+            f"prediction_rank_pairs_total={float(best_meta_cpu.get('prediction_rank_pairs_total', float('nan'))):.0f} "
+            f"prediction_rank_hard_pairs={float(best_meta_cpu.get('prediction_rank_hard_pairs', float('nan'))):.0f} "
+            f"prediction_rank_easy_pairs={float(best_meta_cpu.get('prediction_rank_easy_pairs', float('nan'))):.0f} "
+            f"prediction_rank_dot_gap_mean={float(best_meta_cpu.get('prediction_rank_dot_gap_mean', float('nan'))):.6f} "
+            f"prediction_rank_anchor_loss={float(best_meta_cpu.get('prediction_rank_anchor_loss', float('nan'))):.6f} "
             f"prediction_rank_weight={float(best_meta_cpu.get('prediction_rank_weight', float('nan'))):.6f} "
             f"prediction_bce_weight={float(best_meta_cpu.get('prediction_bce_weight', float('nan'))):.6f} "
             f"prediction_encoder_weight={float(best_meta_cpu.get('prediction_encoder_weight', float('nan'))):.6f} "
             f"prediction_rank_struct_frac={float(best_meta_cpu.get('prediction_rank_struct_frac', float('nan'))):.6f} "
+            f"prediction_hard_residual_only={float(best_meta_cpu.get('prediction_hard_residual_only', float('nan'))):.0f} "
+            f"prediction_hard_margin={float(best_meta_cpu.get('prediction_hard_margin', float('nan'))):.6f} "
+            f"prediction_dot_anchor_weight={float(best_meta_cpu.get('prediction_dot_anchor_weight', float('nan'))):.6f} "
             f"prediction_gate_l1_weight={float(best_meta_cpu.get('prediction_gate_l1_weight', float('nan'))):.6f} "
             f"prediction_h3_gate_init={float(best_meta_cpu.get('prediction_h3_gate_init', float('nan'))):.6f} "
             f"prediction_h3_gate={float(best_meta_cpu.get('prediction_h3_gate', float('nan'))):.6f} "
@@ -7570,6 +7886,12 @@ def train_encoder(
             f"prediction_residual_scale={float(best_meta_cpu.get('prediction_residual_scale', float('nan'))):.6f} "
             f"prediction_compact_gate={float(best_meta_cpu.get('prediction_compact_gate', float('nan'))):.6f} "
             f"prediction_compact_residual_scale={float(best_meta_cpu.get('prediction_compact_residual_scale', float('nan'))):.6f} "
+            f"decoded_require_structural_support={float(best_meta_cpu.get('decoded_require_structural_support', float('nan'))):.0f} "
+            f"decoded_struct_min_cn={float(best_meta_cpu.get('decoded_struct_min_cn', float('nan'))):.6f} "
+            f"decoded_struct_min_ra={float(best_meta_cpu.get('decoded_struct_min_ra', float('nan'))):.6f} "
+            f"decoded_struct_min_aa={float(best_meta_cpu.get('decoded_struct_min_aa', float('nan'))):.6f} "
+            f"edit_add_pairs_pre_struct={float(best_meta_cpu.get('edit_add_pairs_pre_struct', float('nan'))):.0f} "
+            f"edit_struct_supported_add_pairs={float(best_meta_cpu.get('edit_struct_supported_add_pairs', float('nan'))):.0f} "
             f"decoder_normalize_input={float(best_meta_cpu.get('decoder_normalize_input', float('nan'))):.0f} "
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
             f"heart_rank_margin={float(best_meta_cpu.get('heart_rank_margin', float('nan'))):.6f} "

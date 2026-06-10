@@ -290,6 +290,9 @@ parser.add_argument("--prediction_gate_l1_weight", type=float, default=0.0, help
 parser.add_argument("--prediction_h3_gate_init", type=float, default=-3.0, help="Initial logit for the h3-delta prediction-decoder gate.")
 parser.add_argument("--prediction_residual_gate_init", type=float, default=-4.0, help="Initial logit for conservative gated prediction-decoder residuals.")
 parser.add_argument("--prediction_residual_scale", type=float, default=1.0, help="Maximum tanh-bounded residual scale for conservative gated prediction decoders.")
+parser.add_argument("--prediction_hard_residual_only", action="store_true", help="Train prediction residual ranking only on pairs where the edited-dot score is still hard.")
+parser.add_argument("--prediction_hard_margin", type=float, default=0.2, help="Edited-dot margin below which prediction pairs are treated as hard.")
+parser.add_argument("--prediction_dot_anchor_weight", type=float, default=0.0, help="Optional anchor weight that keeps prediction-decoder scores close to edited-dot scores on easy pairs.")
 parser.add_argument("--compactness_weight", type=float, default=0.2, help="Loss weight for cluster compactness (pull).")
 parser.add_argument("--compactness_objective", type=str, default="hybrid", choices=["radius", "prototype", "hybrid"], help="Compactness objective for edited latent training.")
 parser.add_argument("--compactness_radius_metric", type=str, default="cosine", choices=["cosine", "mahalanobis"], help="Radius metric used by compactness diagnostics/objective.")
@@ -356,6 +359,11 @@ parser.add_argument("--decoded_same_cluster_only", dest="decoded_same_cluster_on
 parser.add_argument("--decoded_require_c0p_endpoint", dest="decoded_require_c0p_endpoint", action="store_true", help="Require at least one endpoint of a rewritten edge to be in C0p.")
 parser.add_argument("--decoded_no_c0p_endpoint", dest="decoded_require_c0p_endpoint", action="store_false", help="Do not require C0p membership for rewritten edges.")
 parser.add_argument("--decoded_require_c0p_noncompact_endpoint", action="store_true", help="Require decoded rewritten edges to connect one C0p endpoint to one non-C0p CP endpoint.")
+parser.add_argument("--decoded_require_structural_support", action="store_true", help="Require decoded edge additions to have CN/RA/AA structural support.")
+parser.add_argument("--decoded_struct_support", type=str, default="cn_or_ra", choices=["cn", "ra", "aa", "cn_or_ra", "cn_or_aa", "ra_or_aa", "any", "all"], help="Structural signal used by --decoded_require_structural_support.")
+parser.add_argument("--decoded_struct_min_cn", type=float, default=1.0, help="Minimum common-neighbor score for structurally supported additions.")
+parser.add_argument("--decoded_struct_min_ra", type=float, default=0.0, help="Minimum resource-allocation score for structurally supported additions; <=0 means any positive RA.")
+parser.add_argument("--decoded_struct_min_aa", type=float, default=0.0, help="Minimum Adamic-Adar score for structurally supported additions; <=0 means any positive AA.")
 parser.add_argument("--decoded_accumulate_into_base", dest="decoded_accumulate_into_base", action="store_true", help="Persist decoded graph rewrites into the base training graph across epochs.")
 parser.add_argument("--decoded_temporary_view_only", dest="decoded_accumulate_into_base", action="store_false", help="Use the decoded rewritten graph only for the current augmented view; do not persist it into the base graph.")
 parser.add_argument("--decoded_require_both_c0p", action="store_true", help="Require both endpoints of a rewritten edge to be in C0p.")
@@ -530,6 +538,9 @@ def main():
         prediction_h3_gate_init=args.prediction_h3_gate_init,
         prediction_residual_gate_init=args.prediction_residual_gate_init,
         prediction_residual_scale=args.prediction_residual_scale,
+        prediction_hard_residual_only=args.prediction_hard_residual_only,
+        prediction_hard_margin=args.prediction_hard_margin,
+        prediction_dot_anchor_weight=args.prediction_dot_anchor_weight,
         compactness_weight=args.compactness_weight,
         compactness_objective=args.compactness_objective,
         compactness_radius_metric=args.compactness_radius_metric,
@@ -571,6 +582,11 @@ def main():
         decoded_require_c0p_endpoint=args.decoded_require_c0p_endpoint,
         decoded_require_both_c0p=args.decoded_require_both_c0p,
         decoded_require_c0p_noncompact_endpoint=args.decoded_require_c0p_noncompact_endpoint,
+        decoded_require_structural_support=args.decoded_require_structural_support,
+        decoded_struct_support=args.decoded_struct_support,
+        decoded_struct_min_cn=args.decoded_struct_min_cn,
+        decoded_struct_min_ra=args.decoded_struct_min_ra,
+        decoded_struct_min_aa=args.decoded_struct_min_aa,
         decoded_graph_aug_bound=args.decoded_graph_aug_bound,
         decoded_add_degree_target=args.decoded_add_degree_target,
         decoded_add_degree_target_scope=args.decoded_add_degree_target_scope,
@@ -795,6 +811,8 @@ if __name__ == "__main__":
         print(f"decoded_edit_end_epoch={args.decoded_edit_end_epoch} decoder_warmup_in_phase1={int(args.decoder_warmup_in_phase1)} decoder_warmup_recon_weight={args.decoder_warmup_recon_weight} decoder_warmup_use_pulled_latent={int(args.decoder_warmup_use_pulled_latent)} phase2_decoder_inference_only={int(args.phase2_decoder_inference_only)}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} add_thr={args.decoded_add_threshold} remove_thr={args.decoded_remove_threshold} add_q={args.decoded_add_quantile} remove_q={args.decoded_remove_quantile} max_add={args.decoded_max_add_per_round} max_remove={args.decoded_max_remove_per_round}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} c0p_noncompact_endpoint={int(args.decoded_require_c0p_noncompact_endpoint)} per_node_cap={args.decoded_graph_aug_bound} add_degree_target={args.decoded_add_degree_target} add_degree_target_scope={args.decoded_add_degree_target_scope} add_degree_target_nodes={args.decoded_add_degree_target_nodes} guarantee_degree_target={int(args.decoded_guarantee_degree_target)}")
+        print(f"decoded_struct_support_enabled={int(args.decoded_require_structural_support)} decoded_struct_support={args.decoded_struct_support} min_cn={args.decoded_struct_min_cn} min_ra={args.decoded_struct_min_ra} min_aa={args.decoded_struct_min_aa}")
+        print(f"prediction_hard_residual_only={int(args.prediction_hard_residual_only)} prediction_hard_margin={args.prediction_hard_margin} prediction_dot_anchor_weight={args.prediction_dot_anchor_weight}")
         print("====================")
 
         try:
