@@ -101,12 +101,34 @@ PAIR_SCORER_CONFIGS = [
         "prediction_dot_anchor_weight": 0.10,
     },
     {
+        "name": "edit_two_aug_pred_edit",
+        "family": "edit_two_aug_pred_edit",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_compact_multi",
+        "use_edit_decoder": True,
+        "remove": False,
+        "decoded_require_structural_support": True,
+        "prediction_dot_anchor_weight": 0.10,
+        "cl_mode": "edit_two_aug",
+        "prediction_graph": "edit",
+    },
+    {
         "name": "two_decoder_compact_struct_full_pred_remove",
         "family": "two_decoder_compact_struct_push_remove",
         "score_source": "pred_decoder",
         "prediction_decoder_type": "pair_residual_struct_compact_multi",
         "use_edit_decoder": True,
         "remove": True,
+        "decoded_require_structural_support": True,
+        "prediction_dot_anchor_weight": 0.10,
+    },
+    {
+        "name": "no_edit_compact_struct_pred",
+        "family": "no_edit_compact_struct",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_compact_multi",
+        "use_edit_decoder": False,
+        "remove": False,
         "decoded_require_structural_support": True,
         "prediction_dot_anchor_weight": 0.10,
     },
@@ -251,6 +273,37 @@ def parse_args():
     parser.add_argument("--edit-metric-every", type=int, default=1)
     parser.add_argument("--decoded-audit-every", type=int, default=0)
     parser.add_argument("--decoded-audit-max-edges", type=int, default=4096)
+    parser.add_argument(
+        "--disable-decoded-graph-augment",
+        action="store_true",
+        help="Do not apply decoded graph rewrites. Useful for no-edit pipeline ablations.",
+    )
+    parser.add_argument(
+        "--phase-cache-dir",
+        type=str,
+        default="",
+        help="Optional directory for per-dataset/seed/config phase checkpoints forwarded to src/aron_main.py.",
+    )
+    parser.add_argument(
+        "--shared-phase-cache",
+        action="store_true",
+        help=(
+            "Reuse one pre-rewrite VGNAE/phase cache per split/dataset/seed across configs. "
+            "With --phase-cache-load-mode auto, this loads encoder-only to avoid carrying decoder state across ablations."
+        ),
+    )
+    parser.add_argument(
+        "--phase-cache-load-mode",
+        choices=["auto", "full", "compatible", "encoder_only"],
+        default="auto",
+        help="How child runs load phase cache. auto = full for config cache, encoder_only for shared cache.",
+    )
+    parser.add_argument(
+        "--phase-cache-epoch",
+        type=int,
+        default=-1,
+        help="Epoch saved by --phase-cache-dir. -1 lets the child use decoded_rewrite_start_epoch - 1.",
+    )
     parser.add_argument("--decoded-require-structural-support", action="store_true")
     parser.add_argument("--decoded-struct-support", choices=["cn", "ra", "aa", "cn_or_ra", "cn_or_aa", "ra_or_aa", "any", "all"], default="cn_or_ra")
     parser.add_argument("--decoded-struct-min-cn", type=float, default=1.0)
@@ -378,7 +431,6 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--idx", run_id,
         "--run_tag", run_id,
         "--ver", "no",
-        "--use_decoded_graph_augment",
         "--dynamic_c0p_targets",
         "--no_decoder_warmup_in_phase1",
         "--decoder_type", "pair_mlp_struct",
@@ -387,6 +439,8 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--compactness_radius_metric", args.compactness_radius_metric,
         "--decoder_rank_strategy", "heart_like",
         "--score_source", cfg["score_source"],
+        "--cl_mode", str(cfg.get("cl_mode", "legacy")),
+        "--prediction_graph", str(cfg.get("prediction_graph", "train")),
         "--pull_mask_scope", args.pull_mask_scope,
         "--compactness_mask_scope", args.compactness_mask_scope,
         "--rewrite_endpoint_scope", args.rewrite_endpoint_scope,
@@ -425,6 +479,37 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--decoded_struct_min_aa", str(cfg.get("decoded_struct_min_aa", args.decoded_struct_min_aa)),
         "--mlp_pair_max_rows", str(args.mlp_pair_max_rows),
     ]
+    requires_decoded_graph = cfg.get("cl_mode") == "edit_two_aug" or cfg.get("prediction_graph") == "edit"
+    if requires_decoded_graph or not args.disable_decoded_graph_augment:
+        cmd.append("--use_decoded_graph_augment")
+    if args.phase_cache_dir:
+        if args.shared_phase_cache:
+            cache_path = (
+                Path(args.phase_cache_dir)
+                / "shared_vgnae"
+                / args.split_mode
+                / dataset
+                / f"seed{seed}_phase.pt"
+            )
+        else:
+            cache_path = (
+                Path(args.phase_cache_dir)
+                / args.prefix
+                / dataset
+                / cfg["name"]
+                / f"seed{seed}_phase.pt"
+            )
+        cache_load_mode = args.phase_cache_load_mode
+        if cache_load_mode == "auto":
+            cache_load_mode = "encoder_only" if args.shared_phase_cache else "full"
+        cache_epoch = args.phase_cache_epoch
+        if args.shared_phase_cache and cache_epoch < 0:
+            cache_epoch = max(0, int(args.edit_start_epoch) - 1)
+        cmd.extend([
+            "--phase_cache_path", str(cache_path),
+            "--phase_cache_epoch", str(cache_epoch),
+            "--phase_cache_load_mode", str(cache_load_mode),
+        ])
     if cfg.get("use_edit_decoder", True):
         cmd.append("--use_edited_decoder")
     if bool(cfg.get("prediction_hard_residual_only", False)) or args.prediction_hard_residual_only:

@@ -71,6 +71,20 @@ parser.add_argument(
 parser.add_argument(
     "--feat_mask_ratio", type=float, default=0.1, help="feature augmented ratio"
 )
+parser.add_argument(
+    "--cl_mode",
+    type=str,
+    default="legacy",
+    choices=["legacy", "edit_two_aug"],
+    help="Contrastive-learning mode. legacy keeps the inherited objective; edit_two_aug uses two constrained views sampled from G_edit.",
+)
+parser.add_argument(
+    "--prediction_graph",
+    type=str,
+    default="train",
+    choices=["train", "edit"],
+    help="Graph used for prediction embeddings. train uses the split train graph; edit uses active/best decoded G_edit when available.",
+)
 parser.add_argument("--scaling", type=float, default=1.0, help="scaling factor")
 parser.add_argument(
     "--split_mode",
@@ -150,6 +164,33 @@ parser.add_argument(
     type=str,
     default="",
     help="Path to save/load pretrained encoder state_dict (.pt).",
+)
+parser.add_argument(
+    "--phase_cache_path",
+    type=str,
+    default="",
+    help=(
+        "Optional checkpoint for resuming after the shared pre-rewrite phase. "
+        "If the path exists, model/optimizer/best-val state is loaded and training resumes "
+        "from the saved epoch + 1; otherwise it is saved at --phase_cache_epoch."
+    ),
+)
+parser.add_argument(
+    "--phase_cache_epoch",
+    type=int,
+    default=-1,
+    help="Epoch to save --phase_cache_path. -1 saves at decoded_rewrite_start_epoch - 1.",
+)
+parser.add_argument(
+    "--phase_cache_load_mode",
+    type=str,
+    default="full",
+    choices=["full", "compatible", "encoder_only"],
+    help=(
+        "How to load --phase_cache_path. full resumes model/optimizer/best state; "
+        "compatible reuses matching module weights; encoder_only reuses only the VGNAE "
+        "encoder plus phase anchors/cluster state."
+    ),
 )
 parser.add_argument(
     "--dbscan_eps", type=float, default=None, help="DBSCAN eps; None=auto"
@@ -368,6 +409,10 @@ parser.add_argument("--decoded_accumulate_into_base", dest="decoded_accumulate_i
 parser.add_argument("--decoded_temporary_view_only", dest="decoded_accumulate_into_base", action="store_false", help="Use the decoded rewritten graph only for the current augmented view; do not persist it into the base graph.")
 parser.add_argument("--decoded_require_both_c0p", action="store_true", help="Require both endpoints of a rewritten edge to be in C0p.")
 parser.add_argument("--pull_mask_scope", type=str, default="cp", choices=["cp", "c0p"], help="Scope for latent pulling.")
+parser.add_argument("--editor_pull_profile", type=str, default="linear", choices=["linear", "log_distance"], help="Latent pull strength profile.")
+parser.add_argument("--editor_pull_tau", type=float, default=0.25, help="Distance scale for --editor_pull_profile log_distance.")
+parser.add_argument("--editor_pull_deadzone", type=float, default=0.0, help="Cosine-distance deadzone for adaptive latent pulling.")
+parser.add_argument("--editor_pull_anchor", type=str, default="selected", choices=["selected", "core"], help="Centroid used by latent pulling.")
 parser.add_argument("--compactness_mask_scope", type=str, default="cp", choices=["cp", "c0p"], help="Scope for compactness mask computation.")
 parser.add_argument("--rewrite_endpoint_scope", type=str, default="c0p", choices=["cp", "c0p"], help="Scope for the rewriting endpoint restriction.")
 parser.add_argument("--phase2_freeze_encoder", dest="phase2_freeze_encoder", action="store_true", help="Freeze the encoder and train only the edited decoder in phase 2.")
@@ -453,6 +498,8 @@ def main():
         gamma=args.gamma,
         delta=args.delta,
         temperature=args.temperature,
+        cl_mode=args.cl_mode,
+        prediction_graph=args.prediction_graph,
         labels=labels,
         idx_train=idx_train,
         idx_val=idx_val,
@@ -464,6 +511,9 @@ def main():
         pretrain_epochs=args.pretrain_epochs,
         frozen_scores_path=args.frozen_scores,
         pretrained_ckpt_path=args.pretrained_ckpt,
+        phase_cache_path=args.phase_cache_path,
+        phase_cache_epoch=args.phase_cache_epoch,
+        phase_cache_load_mode=args.phase_cache_load_mode,
         ae_backbone=args.ae_backbone,
         maskgae_mask_rate=args.maskgae_mask_rate,
         maskgae_feature_weight=args.maskgae_feature_weight,
@@ -603,9 +653,13 @@ def main():
         phase2_decoder_inference_only=args.phase2_decoder_inference_only,
         skip_oom_epoch=args.skip_oom_epoch,
         pull_mask_scope=args.pull_mask_scope,
+        editor_pull_profile=args.editor_pull_profile,
+        editor_pull_tau=args.editor_pull_tau,
+        editor_pull_deadzone=args.editor_pull_deadzone,
+        editor_pull_anchor=args.editor_pull_anchor,
         compactness_mask_scope=args.compactness_mask_scope,
         rewrite_endpoint_scope=args.rewrite_endpoint_scope,
-)
+    )
 
     # Plot(args.dataset_str, roc_history, modification_ratio_history)
     gaussion_KDE(args.dataset, Z)
@@ -709,6 +763,10 @@ if __name__ == "__main__":
             extra_tags.append(f"score-{args.score_source}")
         if args.prediction_decoder_type != "none":
             extra_tags.append(f"pred-{args.prediction_decoder_type}")
+        if args.cl_mode != "legacy":
+            extra_tags.append(f"cl-{args.cl_mode}")
+        if args.prediction_graph != "train":
+            extra_tags.append(f"predgraph-{args.prediction_graph}")
         if args.separate_edit_training:
             extra_tags.append(f"rr{_fmt_num(args.edit_phase_retain_recon_weight)}")
             extra_tags.append(f"rc{_fmt_num(args.edit_phase_retain_cl_weight)}")
@@ -812,6 +870,7 @@ if __name__ == "__main__":
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} add_thr={args.decoded_add_threshold} remove_thr={args.decoded_remove_threshold} add_q={args.decoded_add_quantile} remove_q={args.decoded_remove_quantile} max_add={args.decoded_max_add_per_round} max_remove={args.decoded_max_remove_per_round}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} c0p_noncompact_endpoint={int(args.decoded_require_c0p_noncompact_endpoint)} per_node_cap={args.decoded_graph_aug_bound} add_degree_target={args.decoded_add_degree_target} add_degree_target_scope={args.decoded_add_degree_target_scope} add_degree_target_nodes={args.decoded_add_degree_target_nodes} guarantee_degree_target={int(args.decoded_guarantee_degree_target)}")
         print(f"decoded_struct_support_enabled={int(args.decoded_require_structural_support)} decoded_struct_support={args.decoded_struct_support} min_cn={args.decoded_struct_min_cn} min_ra={args.decoded_struct_min_ra} min_aa={args.decoded_struct_min_aa}")
+        print(f"cl_mode={args.cl_mode} prediction_graph={args.prediction_graph} feat_mask_ratio={args.feat_mask_ratio}")
         print(f"prediction_hard_residual_only={int(args.prediction_hard_residual_only)} prediction_hard_margin={args.prediction_hard_margin} prediction_dot_anchor_weight={args.prediction_dot_anchor_weight}")
         print("====================")
 

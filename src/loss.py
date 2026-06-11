@@ -49,6 +49,26 @@ def inter_view_CL_loss(device, Z, bias_Z, adj_label, gamma, temperature):
 
     return CL_Loss
 
+
+def symmetric_node_infonce_loss(Z1, Z2, gamma, temperature):
+    """Symmetric node-level InfoNCE with same node across views as the positive."""
+    if Z1.shape != Z2.shape:
+        raise ValueError(f"InfoNCE views must have the same shape, got {tuple(Z1.shape)} and {tuple(Z2.shape)}")
+    if Z1.dim() != 2:
+        raise ValueError(f"InfoNCE views must be rank-2 tensors, got dim={Z1.dim()}")
+    n_nodes = Z1.size(0)
+    if n_nodes == 0:
+        return Z1.sum() * 0.0
+    temp = max(float(temperature), 1e-6)
+    z1 = F.normalize(Z1, p=2, dim=1)
+    z2 = F.normalize(Z2, p=2, dim=1)
+    logits = torch.matmul(z1, z2.t()) / temp
+    labels = torch.arange(n_nodes, device=Z1.device)
+    loss_12 = F.cross_entropy(logits, labels)
+    loss_21 = F.cross_entropy(logits.t(), labels)
+    return float(gamma) * 0.5 * (loss_12 + loss_21)
+
+
 def Cluster(device, Z, nb_classes):
     kmeans = KMeans(n_clusters = nb_classes)
     kmeans.fit(Z)

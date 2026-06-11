@@ -24,7 +24,7 @@ from ogb.linkproppred import Evaluator
 from tqdm import tqdm
 from preprocessing import *
 from model import VGNAE_ENCODER, VGAE_ENCODER, MaskGAE_ENCODER, CIMAGELite_ENCODER, CIMAGEFull_ENCODER, dot_product_decode, MLP, LogReg
-from loss import loss_function, inter_view_CL_loss, intra_view_CL_loss, Cluster
+from loss import loss_function, inter_view_CL_loss, intra_view_CL_loss, symmetric_node_infonce_loss, Cluster
 from utils import *
 from input_data import CalN2V
 
@@ -43,6 +43,26 @@ C0P_SWEEP_MAX_FRAC  = 1.0     # 最多刪到 100% 的候選邊
 # --- dense helper: works for both sparse and dense tensors
 def _to_dense(A: torch.Tensor) -> torch.Tensor:
     return A.to_dense() if getattr(A, "is_sparse", False) else A
+
+
+def _dense_graph_content_signature(graph_dense: torch.Tensor) -> tuple:
+    graph = _to_dense(graph_dense).detach()
+    shape = tuple(graph.shape)
+    if len(shape) != 2 or shape[0] != shape[1]:
+        return ("invalid", shape)
+    binary = graph > 0
+    edge_count = int(binary.sum().detach().cpu().item())
+    if edge_count == 0:
+        return ("content", shape, str(graph.device), 0, 0, 0, 0)
+    rows, cols = binary.nonzero(as_tuple=True)
+    rows_i = rows.to(torch.int64)
+    cols_i = cols.to(torch.int64)
+    n = int(shape[0])
+    code = rows_i * int(n + 1) + cols_i
+    sum_code = int(code.sum().detach().cpu().item())
+    sum_sq = int((code * code).sum().detach().cpu().item())
+    sum_mix = int(((rows_i + 1) * (cols_i + 1)).sum().detach().cpu().item())
+    return ("content", shape, str(graph.device), edge_count, sum_code, sum_sq, sum_mix)
 
 
 def _default_results_root() -> str:
@@ -306,10 +326,36 @@ class StructuralPairGraphDecoder(nn.Module):
         )
         self.register_buffer("label_ids", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("core_mask", torch.empty(0, dtype=torch.bool), persistent=False)
+        self._graph_context_key = None
         self._pair_feature_cache_key = None
         self._pair_feature_cache = {}
 
+    def _graph_context_signature(self, adj_like) -> tuple:
+        if isinstance(adj_like, torch.Tensor):
+            dense = _to_dense(adj_like)
+            shape = tuple(dense.shape)
+            edge_count = 0
+            if dense.numel() > 0:
+                edge_count = int((dense.detach() > 0).sum().cpu().item())
+            return (
+                "tensor",
+                shape,
+                str(dense.device),
+                int(dense.data_ptr()) if dense.device.type != "meta" else 0,
+                int(getattr(dense, "_version", 0)),
+                edge_count,
+            )
+        if sp.issparse(adj_like):
+            csr = adj_like.tocsr()
+            return ("sparse", tuple(csr.shape), int(csr.nnz), int(id(adj_like)))
+        arr = np.asarray(adj_like)
+        edge_count = int((arr > 0).sum()) if arr.size > 0 else 0
+        return ("array", tuple(arr.shape), int(id(adj_like)), edge_count)
+
     def set_graph_context(self, adj_like) -> None:
+        key = self._graph_context_signature(adj_like)
+        if self._graph_context_key == key:
+            return
         device = next(self.parameters()).device
         deg, cn, ra, aa = _structural_pair_features_from_adj(adj_like)
         self.node_degree_feat = torch.as_tensor(deg, dtype=torch.float32, device=device)
@@ -318,21 +364,32 @@ class StructuralPairGraphDecoder(nn.Module):
         self.aa_feat = torch.as_tensor(aa, dtype=torch.float32, device=device)
         self.adj_feat = torch.as_tensor(_dense_binary_adj_feature(adj_like), dtype=torch.float32, device=device)
         self.adj_sparse_feat = _torch_sparse_binary_adj(adj_like, device=device)
+        self._graph_context_key = key
         self._clear_pair_feature_cache()
 
     def set_cluster_context(self, labels: np.ndarray | None, core_mask: torch.Tensor | None) -> None:
         device = next(self.parameters()).device
         if labels is None:
             n_nodes = int(self.node_degree_feat.numel())
-            self.label_ids = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
+            next_labels = torch.full((n_nodes,), -1, dtype=torch.long, device=device)
         else:
             labels_np = np.asarray(labels, dtype=np.int64)
-            self.label_ids = torch.as_tensor(labels_np, dtype=torch.long, device=device)
+            next_labels = torch.as_tensor(labels_np, dtype=torch.long, device=device)
             n_nodes = int(labels_np.shape[0])
         if core_mask is None:
-            self.core_mask = torch.zeros((n_nodes,), dtype=torch.bool, device=device)
+            next_core = torch.zeros((n_nodes,), dtype=torch.bool, device=device)
         else:
-            self.core_mask = core_mask.to(device=device).bool()
+            next_core = core_mask.to(device=device).bool()
+        if (
+            tuple(self.label_ids.shape) == tuple(next_labels.shape)
+            and tuple(self.core_mask.shape) == tuple(next_core.shape)
+            and torch.equal(self.label_ids, next_labels)
+            and torch.equal(self.core_mask, next_core)
+        ):
+            return
+        self.label_ids = next_labels
+        self.core_mask = next_core
+        self._clear_pair_feature_cache()
 
     def _clear_pair_feature_cache(self) -> None:
         self._pair_feature_cache_key = None
@@ -1815,24 +1872,28 @@ def hybrid_decoder_structure_losses_pairwise(
     rank_strategy: str,
     rank_neg_k: int,
     rank_pool_factor: int,
+    pair_context: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
-    adj_dense = _to_dense(adj_label)
-    ctx = _build_decoded_pair_context(
-        adj_dense,
-        labels,
-        rewrite_mask,
-        degree_floor=degree_floor,
-        same_cluster_only=same_cluster_only,
-        require_c0p_endpoint=require_c0p_endpoint,
-        require_both_c0p=require_both_c0p,
-        require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
-        require_structural_support=require_structural_support,
-        structural_support_mode=structural_support_mode,
-        structural_min_cn=structural_min_cn,
-        structural_min_ra=structural_min_ra,
-        structural_min_aa=structural_min_aa,
-        structural_support_mask=structural_support_mask,
-    )
+    if pair_context is None:
+        adj_dense = _to_dense(adj_label)
+        ctx = _build_decoded_pair_context(
+            adj_dense,
+            labels,
+            rewrite_mask,
+            degree_floor=degree_floor,
+            same_cluster_only=same_cluster_only,
+            require_c0p_endpoint=require_c0p_endpoint,
+            require_both_c0p=require_both_c0p,
+            require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
+            require_structural_support=require_structural_support,
+            structural_support_mode=structural_support_mode,
+            structural_min_cn=structural_min_cn,
+            structural_min_ra=structural_min_ra,
+            structural_min_aa=structural_min_aa,
+            structural_support_mask=structural_support_mask,
+        )
+    else:
+        ctx = pair_context
     debug_info = _empty_decoder_debug_info()
     debug_info.update(
         {
@@ -1956,23 +2017,25 @@ def build_decoded_augmented_graph_from_decoder(
     node_mask: torch.Tensor | None,
     **kwargs,
 ) -> tuple[torch.Tensor, int, int]:
-    ctx = _build_decoded_pair_context(
-        adj_current_dense,
-        labels,
-        node_mask,
-        degree_floor=int(kwargs.get("degree_floor", 0)),
-        same_cluster_only=bool(kwargs.get("same_cluster_only", True)),
-        require_c0p_endpoint=bool(kwargs.get("require_c0p_endpoint", True)),
-        require_both_c0p=bool(kwargs.get("require_both_c0p", False)),
-        require_c0p_noncompact_endpoint=bool(kwargs.get("require_c0p_noncompact_endpoint", False)),
-        deg0_excl_self=kwargs.get("deg0_excl_self", None),
-        require_structural_support=bool(kwargs.get("require_structural_support", False)),
-        structural_support_mode=str(kwargs.get("structural_support_mode", "cn_or_ra")),
-        structural_min_cn=float(kwargs.get("structural_min_cn", 1.0)),
-        structural_min_ra=float(kwargs.get("structural_min_ra", 0.0)),
-        structural_min_aa=float(kwargs.get("structural_min_aa", 0.0)),
-        structural_support_mask=kwargs.get("structural_support_mask", None),
-    )
+    ctx = kwargs.get("pair_context", None)
+    if ctx is None:
+        ctx = _build_decoded_pair_context(
+            adj_current_dense,
+            labels,
+            node_mask,
+            degree_floor=int(kwargs.get("degree_floor", 0)),
+            same_cluster_only=bool(kwargs.get("same_cluster_only", True)),
+            require_c0p_endpoint=bool(kwargs.get("require_c0p_endpoint", True)),
+            require_both_c0p=bool(kwargs.get("require_both_c0p", False)),
+            require_c0p_noncompact_endpoint=bool(kwargs.get("require_c0p_noncompact_endpoint", False)),
+            deg0_excl_self=kwargs.get("deg0_excl_self", None),
+            require_structural_support=bool(kwargs.get("require_structural_support", False)),
+            structural_support_mode=str(kwargs.get("structural_support_mode", "cn_or_ra")),
+            structural_min_cn=float(kwargs.get("structural_min_cn", 1.0)),
+            structural_min_ra=float(kwargs.get("structural_min_ra", 0.0)),
+            structural_min_aa=float(kwargs.get("structural_min_aa", 0.0)),
+            structural_support_mask=kwargs.get("structural_support_mask", None),
+        )
     cand = ctx["add_pairs"] | ctx["removable_pairs"]
     ii, jj = cand.triu(1).nonzero(as_tuple=True)
     scores = adj_current_dense.new_zeros(adj_current_dense.shape)
@@ -2493,24 +2556,28 @@ def hybrid_decoder_structure_losses(
     rank_strategy: str,
     rank_neg_k: int,
     rank_pool_factor: int,
+    pair_context: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
-    adj_dense = _to_dense(adj_label)
-    ctx = _build_decoded_pair_context(
-        adj_dense,
-        labels,
-        rewrite_mask,
-        degree_floor=degree_floor,
-        same_cluster_only=same_cluster_only,
-        require_c0p_endpoint=require_c0p_endpoint,
-        require_both_c0p=require_both_c0p,
-        require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
-        require_structural_support=require_structural_support,
-        structural_support_mode=structural_support_mode,
-        structural_min_cn=structural_min_cn,
-        structural_min_ra=structural_min_ra,
-        structural_min_aa=structural_min_aa,
-        structural_support_mask=structural_support_mask,
-    )
+    if pair_context is None:
+        adj_dense = _to_dense(adj_label)
+        ctx = _build_decoded_pair_context(
+            adj_dense,
+            labels,
+            rewrite_mask,
+            degree_floor=degree_floor,
+            same_cluster_only=same_cluster_only,
+            require_c0p_endpoint=require_c0p_endpoint,
+            require_both_c0p=require_both_c0p,
+            require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
+            require_structural_support=require_structural_support,
+            structural_support_mode=structural_support_mode,
+            structural_min_cn=structural_min_cn,
+            structural_min_ra=structural_min_ra,
+            structural_min_aa=structural_min_aa,
+            structural_support_mask=structural_support_mask,
+        )
+    else:
+        ctx = pair_context
 
     keep_mask = ~ctx["valid_pairs"]
     keep_loss = reconstruction_bce_loss(
@@ -2779,12 +2846,24 @@ def direct_pull_latent_per_cluster(
     pull_strength: float = 0.20,
     *,
     c0p_mask: torch.Tensor | None = None,
+    pull_profile: str = "linear",
+    pull_tau: float = 0.25,
+    pull_deadzone: float = 0.0,
+    pull_anchor: str = "selected",
     push_scope: str = "none",
     noncompact_push_strength: float = 0.0,
     noise_push_strength: float = 0.0,
     push_preserve_norm: bool = True,
     return_diagnostics: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    pull_profile_eff = str(pull_profile or "linear").lower()
+    if pull_profile_eff not in {"linear", "log_distance"}:
+        pull_profile_eff = "linear"
+    pull_anchor_eff = str(pull_anchor or "selected").lower()
+    if pull_anchor_eff not in {"selected", "core"}:
+        pull_anchor_eff = "selected"
+    pull_tau_eff = max(1e-6, float(pull_tau))
+    pull_deadzone_eff = max(0.0, float(pull_deadzone))
     push_scope_eff = str(push_scope or "none").lower()
     if push_scope_eff not in {"none", "noncompact_cp", "noise", "noncompact_cp_and_noise"}:
         push_scope_eff = "none"
@@ -2802,6 +2881,7 @@ def direct_pull_latent_per_cluster(
         node_mask = torch.ones(Z.size(0), dtype=torch.bool, device=Z.device)
     else:
         node_mask = node_mask.to(Z.device).bool()
+    c0p_mask_t = None if c0p_mask is None else c0p_mask.to(Z.device).bool()
 
     for c in sorted(set(labels_np.tolist()) - {-1}):
         idx_np = np.where(labels_np == c)[0]
@@ -2813,8 +2893,22 @@ def direct_pull_latent_per_cluster(
             continue
         sel_idx = idx_t[sel_mask]
         sel_Z = Z.index_select(0, sel_idx)
-        center = sel_Z.mean(dim=0, keepdim=True)
-        Z_edit[sel_idx] = sel_Z + pull_strength * (center - sel_Z)
+        anchor_idx = sel_idx
+        if pull_anchor_eff == "core" and c0p_mask_t is not None:
+            core_mask = c0p_mask_t.index_select(0, idx_t)
+            if int(core_mask.sum().item()) > 0:
+                anchor_idx = idx_t[core_mask]
+        center = Z.index_select(0, anchor_idx).mean(dim=0, keepdim=True)
+        if pull_profile_eff == "log_distance":
+            center_expanded = center.expand_as(sel_Z)
+            dist = (1.0 - F.cosine_similarity(sel_Z, center_expanded, dim=1, eps=1e-12)).clamp_min(0.0)
+            dist_eff = (dist - pull_deadzone_eff).clamp_min(0.0)
+            denom = math.log1p(1.0 / pull_tau_eff)
+            weights = torch.log1p(dist_eff / pull_tau_eff) / max(denom, 1e-12)
+            weights = float(pull_strength) * weights.clamp(0.0, 1.0)
+            Z_edit[sel_idx] = sel_Z + weights.view(-1, 1) * (center - sel_Z)
+        else:
+            Z_edit[sel_idx] = sel_Z + pull_strength * (center - sel_Z)
 
     if push_scope_eff == "none" or (
         float(noncompact_push_strength) <= 0.0 and float(noise_push_strength) <= 0.0
@@ -3201,6 +3295,7 @@ def build_decoded_augmented_graph(
     structural_min_ra: float = 0.0,
     structural_min_aa: float = 0.0,
     structural_support_mask: torch.Tensor | None = None,
+    pair_context: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     """
     Rewrite the current graph using decoder scores from the pulled latent.
@@ -3218,23 +3313,26 @@ def build_decoded_augmented_graph(
     score = 0.5 * (decoded_scores + decoded_scores.t())
     score = score.clone()
     score.fill_diagonal_(1.0)
-    ctx = _build_decoded_pair_context(
-        adj_current_dense,
-        labels,
-        node_mask,
-        degree_floor=degree_floor,
-        same_cluster_only=same_cluster_only,
-        require_c0p_endpoint=require_c0p_endpoint,
-        require_both_c0p=require_both_c0p,
-        require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
-        deg0_excl_self=deg0_excl_self,
-        require_structural_support=require_structural_support,
-        structural_support_mode=structural_support_mode,
-        structural_min_cn=structural_min_cn,
-        structural_min_ra=structural_min_ra,
-        structural_min_aa=structural_min_aa,
-        structural_support_mask=structural_support_mask,
-    )
+    if pair_context is None:
+        ctx = _build_decoded_pair_context(
+            adj_current_dense,
+            labels,
+            node_mask,
+            degree_floor=degree_floor,
+            same_cluster_only=same_cluster_only,
+            require_c0p_endpoint=require_c0p_endpoint,
+            require_both_c0p=require_both_c0p,
+            require_c0p_noncompact_endpoint=require_c0p_noncompact_endpoint,
+            deg0_excl_self=deg0_excl_self,
+            require_structural_support=require_structural_support,
+            structural_support_mode=structural_support_mode,
+            structural_min_cn=structural_min_cn,
+            structural_min_ra=structural_min_ra,
+            structural_min_aa=structural_min_aa,
+            structural_support_mask=structural_support_mask,
+        )
+    else:
+        ctx = pair_context
     g = ctx["graph_dense"].clone().to(score.dtype)
     eye = ctx["eye"]
     existing = ctx["existing"]
@@ -3441,6 +3539,111 @@ def build_decoded_augmented_graph(
     return g, added, removed
 
 
+def sample_constraint_preserving_two_view_graph(
+    graph_dense: torch.Tensor,
+    pair_context: dict[str, torch.Tensor] | None,
+    *,
+    E0: int,
+    add_ratio: float,
+    remove_ratio: float,
+    degree_floor: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Sample one stochastic CL graph view while preserving decoded rewrite constraints."""
+    dense = _to_dense(graph_dense)
+    g = ((dense > 0) | (dense.t() > 0)).to(torch.float32).clone()
+    device = g.device
+    n_nodes = g.size(0)
+    eye = torch.eye(n_nodes, dtype=torch.bool, device=device)
+    g.fill_diagonal_(1.0)
+
+    e0_eff = max(1, int(E0))
+    add_budget = max(0, int(round(float(add_ratio) * float(e0_eff))))
+    remove_budget = max(0, int(round(float(remove_ratio) * float(e0_eff))))
+    degree_floor_eff = max(0, int(degree_floor))
+    deg_now = _deg_excl_self(g).to(torch.long)
+    deg_start = deg_now.clone()
+
+    if pair_context is None:
+        existing = g > 0
+        add_pairs = (~existing) & (~eye)
+        removable_pairs = existing & (~eye)
+    else:
+        existing = g > 0
+        add_pairs = pair_context.get("add_pairs", torch.zeros_like(g, dtype=torch.bool)).to(device=device).bool()
+        removable_pairs = pair_context.get("removable_pairs", torch.zeros_like(g, dtype=torch.bool)).to(device=device).bool()
+        add_pairs = add_pairs & (~existing) & (~eye)
+        removable_pairs = removable_pairs & existing & (~eye)
+
+    removed = 0
+    rem_i, rem_j = removable_pairs.triu(1).nonzero(as_tuple=True)
+    if remove_budget > 0 and rem_i.numel() > 0:
+        order = torch.randperm(rem_i.numel(), device=device)
+        for idx in order.tolist():
+            if removed >= remove_budget:
+                break
+            i = int(rem_i[idx].item())
+            j = int(rem_j[idx].item())
+            if g[i, j] <= 0:
+                continue
+            if int(deg_now[i].item()) <= degree_floor_eff or int(deg_now[j].item()) <= degree_floor_eff:
+                continue
+            g[i, j] = 0.0
+            g[j, i] = 0.0
+            deg_now[i] -= 1
+            deg_now[j] -= 1
+            removed += 1
+
+    added = 0
+    add_i, add_j = add_pairs.triu(1).nonzero(as_tuple=True)
+    if add_budget > 0 and add_i.numel() > 0:
+        order = torch.randperm(add_i.numel(), device=device)
+        for idx in order.tolist():
+            if added >= add_budget:
+                break
+            i = int(add_i[idx].item())
+            j = int(add_j[idx].item())
+            if g[i, j] > 0:
+                continue
+            g[i, j] = 1.0
+            g[j, i] = 1.0
+            deg_now[i] += 1
+            deg_now[j] += 1
+            added += 1
+
+    g.fill_diagonal_(1.0)
+    deg_final = _deg_excl_self(g).to(torch.long)
+    constraint_added = ((g > 0) & (~existing) & (~eye))
+    constraint_add_violations = 0
+    if pair_context is not None:
+        constraint_add_violations = int((constraint_added & (~add_pairs)).triu(1).sum().item())
+    degree_violations = 0
+    if degree_floor_eff > 0:
+        new_violation = (deg_start >= degree_floor_eff) & (deg_final < degree_floor_eff)
+        degree_violations = int(new_violation.sum().item())
+    edge_count = int((g.triu(1) > 0).sum().item())
+    min_degree = int(deg_final.min().item()) if deg_final.numel() > 0 else 0
+    return g, {
+        "added": int(added),
+        "removed": int(removed),
+        "edge_count": int(edge_count),
+        "min_degree": int(min_degree),
+        "degree_violations": int(degree_violations),
+        "constraint_add_violations": int(constraint_add_violations),
+        "add_budget": int(add_budget),
+        "remove_budget": int(remove_budget),
+    }
+
+
+def graph_edge_jaccard(g1: torch.Tensor, g2: torch.Tensor) -> float:
+    a = (_to_dense(g1) > 0).triu(1)
+    b = (_to_dense(g2) > 0).triu(1)
+    union = int((a | b).sum().item())
+    if union == 0:
+        return 1.0
+    inter = int((a & b).sum().item())
+    return float(inter) / float(union)
+
+
 
 def train_encoder(
     dataset_str: str,
@@ -3589,6 +3792,12 @@ def train_encoder(
     prediction_hard_residual_only = bool(kwargs.get("prediction_hard_residual_only", False))
     prediction_hard_margin = float(kwargs.get("prediction_hard_margin", 0.2))
     prediction_dot_anchor_weight = float(kwargs.get("prediction_dot_anchor_weight", 0.0))
+    cl_mode = str(kwargs.get("cl_mode", "legacy") or "legacy").lower()
+    if cl_mode not in {"legacy", "edit_two_aug"}:
+        raise ValueError("cl_mode must be one of: legacy, edit_two_aug")
+    prediction_graph = str(kwargs.get("prediction_graph", "train") or "train").lower()
+    if prediction_graph not in {"train", "edit"}:
+        raise ValueError("prediction_graph must be one of: train, edit")
     mlp_pair_max_rows = int(kwargs.get("mlp_pair_max_rows", 16))
     compactness_weight = float(kwargs.get("compactness_weight", 1.0))
     compactness_objective = str(kwargs.get("compactness_objective", "hybrid"))
@@ -3598,6 +3807,14 @@ def train_encoder(
     preserve_weight = float(kwargs.get("preserve_weight", 0.0))
     editor_hidden = int(kwargs.get("editor_hidden", hidden2 * 2))
     editor_pull_strength = float(kwargs.get("editor_pull_strength", 0.20))
+    editor_pull_profile = str(kwargs.get("editor_pull_profile", "linear") or "linear").lower()
+    if editor_pull_profile not in {"linear", "log_distance"}:
+        raise ValueError("editor_pull_profile must be one of: linear, log_distance")
+    editor_pull_tau = float(kwargs.get("editor_pull_tau", 0.25))
+    editor_pull_deadzone = float(kwargs.get("editor_pull_deadzone", 0.0))
+    editor_pull_anchor = str(kwargs.get("editor_pull_anchor", "selected") or "selected").lower()
+    if editor_pull_anchor not in {"selected", "core"}:
+        raise ValueError("editor_pull_anchor must be one of: selected, core")
     editor_push_scope = str(kwargs.get("editor_push_scope", "none") or "none").lower()
     if editor_push_scope not in {"none", "noncompact_cp", "noise", "noncompact_cp_and_noise"}:
         raise ValueError("editor_push_scope must be one of: none, noncompact_cp, noise, noncompact_cp_and_noise")
@@ -3615,6 +3832,8 @@ def train_encoder(
         prediction_joint_start_epoch = decoded_rewrite_start_epoch
     freeze_c0p_at_edit_start = bool(kwargs.get("freeze_c0p_at_edit_start", True))
     use_decoded_graph_augment = bool(kwargs.get("use_decoded_graph_augment", False))
+    if (cl_mode == "edit_two_aug" or prediction_graph == "edit") and not use_decoded_graph_augment:
+        raise ValueError("cl_mode=edit_two_aug and prediction_graph=edit require --use_decoded_graph_augment")
     decoded_add_ratio = float(kwargs.get("decoded_add_ratio", 0.0))
     decoded_remove_ratio = float(kwargs.get("decoded_remove_ratio", 0.0))
     decoded_add_threshold = kwargs.get("decoded_add_threshold", None)
@@ -3665,6 +3884,11 @@ def train_encoder(
     decoder_warmup_in_phase1 = bool(kwargs.get("decoder_warmup_in_phase1", True))
     decoder_warmup_recon_weight = float(kwargs.get("decoder_warmup_recon_weight", 1.0))
     decoder_warmup_use_pulled_latent = bool(kwargs.get("decoder_warmup_use_pulled_latent", False))
+    phase_cache_path = str(kwargs.get("phase_cache_path", "") or "")
+    phase_cache_epoch_arg = int(kwargs.get("phase_cache_epoch", -1))
+    phase_cache_load_mode = str(kwargs.get("phase_cache_load_mode", "full") or "full").lower()
+    if phase_cache_load_mode not in {"full", "compatible", "encoder_only"}:
+        raise ValueError("phase_cache_load_mode must be one of: full, compatible, encoder_only")
     skip_oom_epoch = bool(kwargs.get("skip_oom_epoch", False))
     pull_mask_scope = str(kwargs.get("pull_mask_scope", "cp"))
     compactness_mask_scope = str(kwargs.get("compactness_mask_scope", "cp"))
@@ -4332,6 +4556,7 @@ def train_encoder(
             f"rank_strategy={decoder_rank_strategy} rank_neg_k={decoder_rank_neg_k} rank_pool_factor={decoder_rank_pool_factor} | "
             f"heart_rank_w={heart_rank_weight} heart_margin={heart_rank_margin} "
             f"heart_neg_k={heart_rank_neg_k} heart_pool_factor={heart_rank_pool_factor} | "
+            f"cl_mode={cl_mode} prediction_graph={prediction_graph} feat_mask_ratio={feat_maske_ratio} | "
             f"compactness_weight={compactness_weight} | preserve_weight={preserve_weight} | "
             f"c0p_noncompact_endpoint={int(decoded_require_c0p_noncompact_endpoint)} | "
             f"decoded_struct_support={int(decoded_require_structural_support)}:{decoded_struct_support} "
@@ -4343,7 +4568,9 @@ def train_encoder(
             f"phase2_freeze_encoder={phase2_freeze_encoder} | edit_phase_encoder_lr_scale={edit_phase_encoder_lr_scale} | "
             f"decoder_warmup_in_phase1={decoder_warmup_in_phase1} | decoder_warmup_recon_weight={decoder_warmup_recon_weight} | "
             f"decoder_warmup_use_pulled_latent={decoder_warmup_use_pulled_latent} | "
-            f"pull_strength={editor_pull_strength} | compactness_weight={compactness_weight} | "
+            f"pull_strength={editor_pull_strength} | pull_profile={editor_pull_profile} "
+            f"pull_tau={editor_pull_tau} pull_deadzone={editor_pull_deadzone} pull_anchor={editor_pull_anchor} | "
+            f"compactness_weight={compactness_weight} | "
             f"push_scope={editor_push_scope} | noncompact_push={editor_noncompact_push_strength} | "
             f"noise_push={editor_noise_push_strength} | push_preserve_norm={int(editor_push_preserve_norm)} | "
             f"pull_scope={pull_mask_scope} | compactness_scope={compactness_mask_scope} | rewrite_scope={rewrite_endpoint_scope}"
@@ -5094,11 +5321,21 @@ def train_encoder(
     static_decoded_graph_added = 0
     static_decoded_graph_removed = 0
     static_decoded_built_epoch = None
+    active_decoded_aug_graph_dense = None
+    active_decoded_aug_edge_index = None
+    active_decoded_labels = None
+    active_decoded_mask = None
+    active_decoded_rewrite_mask = None
+    active_decoded_pair_context = None
+    active_decoded_graph_added = 0
+    active_decoded_graph_removed = 0
+    active_decoded_built_epoch = None
     if decoded_static_view_enabled:
         print("[EDIT-GRAPH] static decoded view cache enabled (freeze targets + freeze encoder + decoder inference-only + temporary view)")
 
     decoded_structural_support_cache: dict[tuple, torch.Tensor] = {}
     decoded_structural_support_cache_logged: set[tuple] = set()
+    decoded_structural_support_cache_limit = 8
 
     def _decoded_structural_support_cached(adj_current_dense: torch.Tensor) -> torch.Tensor | None:
         if not decoded_require_structural_support:
@@ -5114,18 +5351,13 @@ def train_encoder(
             str(adj_current_dense.device),
             int(shape[0]),
         )
-        if (not decoded_accumulate_into_base) and ver == "no":
-            graph_key = ("stable_base",)
-        else:
-            graph_key = (
-                "tensor",
-                int(adj_current_dense.data_ptr()) if adj_current_dense.device.type != "meta" else 0,
-                int(getattr(adj_current_dense, "_version", 0)),
-                float((adj_current_dense > 0).sum().detach().cpu().item()),
-            )
+        graph_key = _dense_graph_content_signature(adj_current_dense)
         key = mode_key + graph_key
         cached = decoded_structural_support_cache.get(key)
-        if cached is None:
+        if cached is not None:
+            decoded_structural_support_cache.pop(key, None)
+            decoded_structural_support_cache[key] = cached
+        else:
             cached = _decoded_structural_support_mask(
                 adj_current_dense,
                 mode=decoded_struct_support,
@@ -5133,6 +5365,8 @@ def train_encoder(
                 min_ra=decoded_struct_min_ra,
                 min_aa=decoded_struct_min_aa,
             ).detach()
+            while len(decoded_structural_support_cache) >= decoded_structural_support_cache_limit:
+                decoded_structural_support_cache.pop(next(iter(decoded_structural_support_cache)))
             decoded_structural_support_cache[key] = cached
             if key not in decoded_structural_support_cache_logged:
                 decoded_structural_support_cache_logged.add(key)
@@ -5144,12 +5378,143 @@ def train_encoder(
                 )
         return cached
 
+    def _decoded_pair_context_for_graph(
+        graph_dense: torch.Tensor,
+        labels_np: np.ndarray | None,
+        rewrite_mask_t: torch.Tensor | None,
+        *,
+        degree_floor: int,
+        structural_support_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return _build_decoded_pair_context(
+            graph_dense,
+            labels_np,
+            rewrite_mask_t,
+            degree_floor=degree_floor,
+            same_cluster_only=decoded_same_cluster_only,
+            require_c0p_endpoint=decoded_require_c0p_endpoint,
+            require_both_c0p=decoded_require_both_c0p,
+            require_c0p_noncompact_endpoint=decoded_require_c0p_noncompact_endpoint,
+            require_structural_support=decoded_require_structural_support,
+            structural_support_mode=decoded_struct_support,
+            structural_min_cn=decoded_struct_min_cn,
+            structural_min_ra=decoded_struct_min_ra,
+            structural_min_aa=decoded_struct_min_aa,
+            structural_support_mask=structural_support_mask,
+        )
+
     # optional: a convenient on-disk checkpoint path (safe default)
     ckpt_dir = os.path.join("checkpoints", dataset_str)
     os.makedirs(ckpt_dir, exist_ok=True)
     best_ckpt_path_runtime = os.path.join(ckpt_dir, f"{ver}_{run_tag or 'run'}_best.pt")
 
-    for epoch in tqdm(range(num_epoch)):
+    start_epoch = 0
+    phase_cache_loaded = False
+    phase_cache_saved = False
+    if phase_cache_path:
+        if phase_cache_epoch_arg >= 0:
+            phase_cache_save_epoch = min(max(0, phase_cache_epoch_arg), max(0, num_epoch - 1))
+        else:
+            phase_cache_save_epoch = min(max(0, decoded_rewrite_start_epoch - 1), max(0, num_epoch - 1))
+        if os.path.exists(phase_cache_path):
+            try:
+                print(f"[PHASE-CACHE] Loading phase cache from {phase_cache_path} (mode={phase_cache_load_mode})")
+                phase_state = torch.load(phase_cache_path, map_location=device)
+
+                def _module_state_compatible(module: nn.Module | None, state: dict | None) -> bool:
+                    if module is None or state is None:
+                        return False
+                    try:
+                        current = module.state_dict()
+                        if set(current.keys()) != set(state.keys()):
+                            return False
+                        for key, value in current.items():
+                            cached_value = state[key]
+                            if tuple(value.shape) != tuple(cached_value.shape):
+                                return False
+                        return True
+                    except Exception:
+                        return False
+
+                def _load_compatible_module(module: nn.Module | None, state: dict | None, name: str) -> bool:
+                    if module is None or state is None:
+                        return False
+                    if phase_cache_load_mode == "full":
+                        module.load_state_dict(state, strict=True)
+                        return True
+                    if _module_state_compatible(module, state):
+                        module.load_state_dict(state, strict=True)
+                        print(f"[PHASE-CACHE] Loaded compatible {name} weights")
+                        return True
+                    print(f"[PHASE-CACHE] Skipped incompatible {name} weights")
+                    return False
+
+                encoder.load_state_dict(phase_state["encoder"], strict=True)
+                if phase_cache_load_mode == "encoder_only":
+                    if phase_state.get("graph_decoder") is not None or phase_state.get("prediction_decoder") is not None:
+                        print("[PHASE-CACHE] Reusing encoder/phase anchors only; decoder, optimizer, and best-state are reset")
+                else:
+                    _load_compatible_module(graph_decoder, phase_state.get("graph_decoder"), "graph_decoder")
+                    _load_compatible_module(prediction_decoder, phase_state.get("prediction_decoder"), "prediction_decoder")
+                    if phase_cache_load_mode == "full" and phase_state.get("optimizer") is not None:
+                        try:
+                            optimizer.load_state_dict(phase_state["optimizer"])
+                        except Exception as e:
+                            print(f"[PHASE-CACHE] optimizer load failed; rebuilding optimizer: {e}")
+                            optimizer = _build_main_optimizer()
+                    elif phase_cache_load_mode == "compatible":
+                        print("[PHASE-CACHE] Compatible load keeps a fresh optimizer and resets best-state selection")
+
+                if phase_cache_load_mode == "full":
+                    if phase_state.get("best_state") is not None:
+                        best_state_cpu = phase_state.get("best_state")
+                    if phase_state.get("best_meta") is not None:
+                        best_meta_cpu = phase_state.get("best_meta")
+                    best_val_roc = float(phase_state.get("best_val_roc", best_val_roc))
+                    best_val_ap = float(phase_state.get("best_val_ap", best_val_ap))
+                    best_epoch = int(phase_state.get("best_epoch", best_epoch))
+                    best_checkpoint_score = float(phase_state.get("best_checkpoint_score", best_checkpoint_score))
+                    best_val_roc_subset = float(phase_state.get("best_val_roc_subset", best_val_roc_subset))
+                    best_val_ap_subset = float(phase_state.get("best_val_ap_subset", best_val_ap_subset))
+                    best_subset_epoch = int(phase_state.get("best_subset_epoch", best_subset_epoch))
+                    best_subset_checkpoint_score = float(
+                        phase_state.get("best_subset_checkpoint_score", best_subset_checkpoint_score)
+                    )
+                if phase_state.get("stage1_anchor_Z") is not None:
+                    stage1_anchor_Z = phase_state["stage1_anchor_Z"].to(device=device)
+                if phase_state.get("stage1_anchor_graph_dense") is not None:
+                    stage1_anchor_graph_dense = phase_state["stage1_anchor_graph_dense"].to(device=device)
+                if phase_state.get("fixed_c0p_labels") is not None:
+                    fixed_c0p_labels = np.asarray(phase_state["fixed_c0p_labels"], dtype=np.int64)
+                if phase_state.get("fixed_c0p_mask") is not None:
+                    fixed_c0p_mask = phase_state["fixed_c0p_mask"].to(device=device).bool()
+                if phase_state.get("frozen_gmm_labels") is not None:
+                    frozen_gmm_labels = np.asarray(phase_state["frozen_gmm_labels"], dtype=np.int64)
+                if phase_state.get("frozen_core_mask") is not None:
+                    frozen_core_mask = np.asarray(phase_state["frozen_core_mask"], dtype=bool)
+                stage1_phase_boundary_logged = bool(phase_state.get("stage1_phase_boundary_logged", False))
+                loaded_epoch = int(phase_state.get("epoch", phase_cache_save_epoch))
+                start_epoch = min(max(0, loaded_epoch + 1), num_epoch)
+                phase_cache_loaded = True
+                phase_cache_saved = True
+                print(
+                    f"[PHASE-CACHE] Loaded epoch={loaded_epoch}; resuming from epoch {start_epoch} "
+                    f"| cached_best_epoch={best_epoch} cached_best_score={best_checkpoint_score:.6f}"
+                )
+            except Exception as e:
+                print(f"[PHASE-CACHE] Load failed; training from epoch 0: {e}")
+                start_epoch = 0
+                phase_cache_loaded = False
+                phase_cache_saved = False
+        else:
+            print(f"[PHASE-CACHE] No cache at {phase_cache_path}; will save after epoch {phase_cache_save_epoch}")
+    else:
+        phase_cache_save_epoch = -1
+
+    aug_edge_index = edge_index
+    aug_feat = features
+
+    for epoch in tqdm(range(start_epoch, num_epoch)):
         t = time.time()
         t1 = time.time()
         added_this_epoch = 0
@@ -5160,6 +5525,21 @@ def train_encoder(
         decoded_pre_rewrite_graph_dense_epoch = None
         decoded_metric_labels_epoch = None
         decoded_metric_mask_epoch = None
+        decoded_rewrite_mask_epoch = None
+        decoded_reuse_active_view_this_epoch = False
+        edit_two_aug_cl_loss = None
+        edit_two_aug_view_stats = {
+            "active": 0,
+            "jaccard": float("nan"),
+            "v1_added": 0,
+            "v1_removed": 0,
+            "v2_added": 0,
+            "v2_removed": 0,
+            "v1_min_degree": float("nan"),
+            "v2_min_degree": float("nan"),
+            "degree_violations": 0,
+            "constraint_add_violations": 0,
+        }
         pull_push_diag_epoch = _empty_pull_push_diagnostics(
             push_scope=editor_push_scope,
             noncompact_push_strength=editor_noncompact_push_strength,
@@ -5245,7 +5625,9 @@ def train_encoder(
             cimage_factor_loss,
             cimage_cluster_loss,
         ) = _encoder_reconstruction_loss(A_pred)
-        if(loss_ver=="nei"):
+        if cl_mode == "edit_two_aug":
+            ori_intra_CL = Z.new_tensor(0.0)
+        elif(loss_ver=="nei"):
             ori_intra_CL = inter_view_CL_loss(device, Z, Z, adj_label, gamma, temperature)
         else:
             ori_intra_CL = intra_view_CL_loss(device, Z, adj_label, gamma, temperature)
@@ -5255,7 +5637,8 @@ def train_encoder(
         decoded_mask_epoch = None
         
         # Generate K graphs
-        if epoch % 10 == 0:
+        graph_refresh_due = (epoch % 10 == 0) or (use_decoded_graph_augment and _decoded_rewrite_due(epoch))
+        if graph_refresh_due:
             if epoch != 0:
                 del aug_edge_index # del aug_edge_weights # del aug_adj_labels # del aug_norms # del aug_weight_tensors
                 torch.cuda.empty_cache()
@@ -5914,17 +6297,39 @@ def train_encoder(
                 raise NotImplementedError(
                     f"[AUG] ver='{ver}' is not implemented. "
                 )
-                            
-            aug_edge_index = g.to_sparse().indices()
+            decoded_labels_epoch = None
+            decoded_mask_epoch = None
+            decoded_graph_added = 0
+            decoded_graph_removed = 0
+            if (
+                use_decoded_graph_augment
+                and _decoded_edit_active(epoch)
+                and (not _decoded_rewrite_due(epoch))
+                and active_decoded_aug_graph_dense is not None
+            ):
+                g = active_decoded_aug_graph_dense
+                aug_edge_index = (
+                    active_decoded_aug_edge_index
+                    if active_decoded_aug_edge_index is not None
+                    else g.to_sparse().indices()
+                )
+                decoded_labels_epoch = active_decoded_labels
+                decoded_mask_epoch = active_decoded_mask
+                decoded_rewrite_mask_epoch = active_decoded_rewrite_mask
+                decoded_reuse_active_view_this_epoch = True
+                if epoch % max(1, eval_log_every) == 0:
+                    print(
+                        f"[EDIT-GRAPH][E{epoch:04d}] reuse_active=1 built_epoch={active_decoded_built_epoch} "
+                        f"rewrite_every={decoded_rewrite_every} add={active_decoded_graph_added} "
+                        f"remove={active_decoded_graph_removed}"
+                    )
+            else:
+                aug_edge_index = g.to_sparse().indices()
 
             # ★★ 只有 remove_only_* 和 prune_* 才更新 base view graph
             if (ver.startswith("remove_only_")) or (ver.startswith("prune_")):
                 edge_index = aug_edge_index
 
-            decoded_labels_epoch = None
-            decoded_mask_epoch = None
-            decoded_graph_added = 0
-            decoded_graph_removed = 0
             if use_decoded_graph_augment and _decoded_rewrite_due(epoch):
                 try:
                     decoded_pre_rewrite_graph_dense_epoch = g.detach().clone()
@@ -5973,6 +6378,10 @@ def train_encoder(
                             decoded_pull_mask_epoch,
                             pull_strength=editor_pull_strength,
                             c0p_mask=decoded_c0p_mask_epoch,
+                            pull_profile=editor_pull_profile,
+                            pull_tau=editor_pull_tau,
+                            pull_deadzone=editor_pull_deadzone,
+                            pull_anchor=editor_pull_anchor,
                             push_scope=editor_push_scope,
                             noncompact_push_strength=editor_noncompact_push_strength,
                             noise_push_strength=editor_noise_push_strength,
@@ -5982,6 +6391,8 @@ def train_encoder(
                         print(
                             f"[PULL-PUSH][E{epoch:04d}] scope={editor_push_scope} "
                             f"pull_scope={pull_mask_scope} pull_strength={editor_pull_strength:.6f} "
+                            f"pull_profile={editor_pull_profile} pull_tau={editor_pull_tau:.6f} "
+                            f"pull_deadzone={editor_pull_deadzone:.6f} pull_anchor={editor_pull_anchor} "
                             f"noncompact_push={editor_noncompact_push_strength:.6f} noise_push={editor_noise_push_strength:.6f} "
                             f"preserve_norm={int(editor_push_preserve_norm)} "
                             f"noncompact_count={int(pull_push_diag_epoch['push_noncompact_count'])} "
@@ -5991,11 +6402,19 @@ def train_encoder(
                             f"noise_cosdist_before={pull_push_diag_epoch['push_noise_anchor_cosdist_before']:.6f} "
                             f"noise_cosdist_after={pull_push_diag_epoch['push_noise_anchor_cosdist_after']:.6f}"
                         )
-                        decoder_graph_context = None if ((not decoded_accumulate_into_base) and ver == "no") else g
+                        decoder_graph_context = g
                         decoded_scorer = _decoded_graph_scorer()
                         if decoded_scorer is None:
                             raise RuntimeError("decoded graph augment requires an edit decoder or prediction decoder scorer")
                         _set_decoded_graph_scorer_context(decoder_graph_context, decoded_labels_epoch, decoded_c0p_mask_epoch)
+                        decoded_structural_support_epoch = _decoded_structural_support_cached(g)
+                        decoded_pair_context_epoch = _decoded_pair_context_for_graph(
+                            g,
+                            decoded_labels_epoch,
+                            decoded_rewrite_mask_epoch,
+                            degree_floor=decoded_degree_floor_eff,
+                            structural_support_mask=decoded_structural_support_epoch,
+                        )
                         if isinstance(decoded_scorer, (MLPPairGraphDecoder, StructuralPairGraphDecoder)):
                             g_decoded, decoded_graph_added, decoded_graph_removed = build_decoded_augmented_graph_from_decoder(
                                 decoded_scorer,
@@ -6028,7 +6447,8 @@ def train_encoder(
                                 structural_min_cn=decoded_struct_min_cn,
                                 structural_min_ra=decoded_struct_min_ra,
                                 structural_min_aa=decoded_struct_min_aa,
-                                structural_support_mask=_decoded_structural_support_cached(g),
+                                structural_support_mask=decoded_structural_support_epoch,
+                                pair_context=decoded_pair_context_epoch,
                             )
                         else:
                             with torch.no_grad():
@@ -6063,10 +6483,27 @@ def train_encoder(
                                 structural_min_cn=decoded_struct_min_cn,
                                 structural_min_ra=decoded_struct_min_ra,
                                 structural_min_aa=decoded_struct_min_aa,
-                                structural_support_mask=_decoded_structural_support_cached(g),
+                                structural_support_mask=decoded_structural_support_epoch,
+                                pair_context=decoded_pair_context_epoch,
                             )
                         g = g_decoded
                         aug_edge_index = g.to_sparse().indices()
+                        active_decoded_aug_graph_dense = g.detach()
+                        active_decoded_aug_edge_index = aug_edge_index.detach().clone()
+                        active_decoded_labels = None if decoded_labels_epoch is None else np.asarray(decoded_labels_epoch, dtype=np.int64).copy()
+                        active_decoded_mask = None if decoded_c0p_mask_epoch is None else decoded_c0p_mask_epoch.detach().clone()
+                        active_decoded_rewrite_mask = None if decoded_rewrite_mask_epoch is None else decoded_rewrite_mask_epoch.detach().clone()
+                        active_decoded_graph_added = int(decoded_graph_added)
+                        active_decoded_graph_removed = int(decoded_graph_removed)
+                        active_decoded_built_epoch = int(epoch)
+                        active_structural_support_epoch = _decoded_structural_support_cached(active_decoded_aug_graph_dense)
+                        active_decoded_pair_context = _decoded_pair_context_for_graph(
+                            active_decoded_aug_graph_dense,
+                            active_decoded_labels,
+                            active_decoded_rewrite_mask,
+                            degree_floor=decoded_degree_floor_eff,
+                            structural_support_mask=active_structural_support_epoch,
+                        )
                         decoded_rewrite_applied_this_epoch = True
                         _audit_decoded_rewrite_quality(
                             epoch,
@@ -6241,6 +6678,16 @@ def train_encoder(
         add_hist.append(int(added_this_epoch))
         remove_hist.append(int(removed_this_epoch))
 
+        if (
+            use_decoded_graph_augment
+            and _decoded_edit_active(epoch)
+            and active_decoded_aug_graph_dense is not None
+            and decoded_labels_epoch is None
+        ):
+            decoded_labels_epoch = active_decoded_labels
+            decoded_mask_epoch = active_decoded_mask
+            decoded_rewrite_mask_epoch = active_decoded_rewrite_mask
+
         # Calcualte Augment View
         # bias_Z = encoder(features, aug_edge_index)
         try:
@@ -6255,32 +6702,109 @@ def train_encoder(
             # This keeps the epoch alive for stability-focused reruns.
             bias_Z = Z
 
+        edit_two_aug_cl_loss = bias_Z.new_tensor(0.0)
         cross_view_loss = bias_Z.new_tensor(0.0)
-        try:
-            cross_view_loss = inter_view_CL_loss(device, hidden_repr, encoder.Z.detach(), adj_label, delta, temperature)
-        except RuntimeError as e:
-            if not (skip_oom_epoch and _is_cuda_oom_like(e)):
-                raise
-            print(f"[OOM-FALLBACK] epoch={epoch} cross_view_loss=0: {e}")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if cl_mode == "edit_two_aug":
+            if (
+                use_decoded_graph_augment
+                and _decoded_edit_active(epoch)
+                and active_decoded_aug_graph_dense is not None
+            ):
+                try:
+                    cl_graph_dense = active_decoded_aug_graph_dense
+                    cl_degree_floor = max(0, int(degree_threshold) - 1) if decoded_degree_floor is None else int(decoded_degree_floor)
+                    cl_pair_context = active_decoded_pair_context
+                    if cl_pair_context is None:
+                        cl_struct_support = _decoded_structural_support_cached(cl_graph_dense)
+                        cl_pair_context = _decoded_pair_context_for_graph(
+                            cl_graph_dense,
+                            decoded_labels_epoch,
+                            decoded_rewrite_mask_epoch,
+                            degree_floor=cl_degree_floor,
+                            structural_support_mask=cl_struct_support,
+                        )
+                    view_add_ratio = max(0.0, float(decoded_add_ratio) * 0.5)
+                    view_remove_ratio = max(0.0, float(decoded_remove_ratio) * 0.5)
+                    cl_g1, cl_stats1 = sample_constraint_preserving_two_view_graph(
+                        cl_graph_dense,
+                        cl_pair_context,
+                        E0=E0,
+                        add_ratio=view_add_ratio,
+                        remove_ratio=view_remove_ratio,
+                        degree_floor=cl_degree_floor,
+                    )
+                    cl_g2, cl_stats2 = sample_constraint_preserving_two_view_graph(
+                        cl_graph_dense,
+                        cl_pair_context,
+                        E0=E0,
+                        add_ratio=view_add_ratio,
+                        remove_ratio=view_remove_ratio,
+                        degree_floor=cl_degree_floor,
+                    )
+                    cl_feat1 = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
+                    cl_feat2 = features if feat_maske_ratio <= 0 else drop_feature(features, feat_maske_ratio)
+                    z_view1 = encoder(cl_feat1, cl_g1.to_sparse().indices())
+                    z_view2 = encoder(cl_feat2, cl_g2.to_sparse().indices())
+                    edit_two_aug_cl_loss = symmetric_node_infonce_loss(z_view1, z_view2, gamma, temperature)
+                    edit_two_aug_view_stats = {
+                        "active": 1,
+                        "jaccard": graph_edge_jaccard(cl_g1, cl_g2),
+                        "v1_added": int(cl_stats1["added"]),
+                        "v1_removed": int(cl_stats1["removed"]),
+                        "v2_added": int(cl_stats2["added"]),
+                        "v2_removed": int(cl_stats2["removed"]),
+                        "v1_min_degree": int(cl_stats1["min_degree"]),
+                        "v2_min_degree": int(cl_stats2["min_degree"]),
+                        "degree_violations": int(cl_stats1["degree_violations"]) + int(cl_stats2["degree_violations"]),
+                        "constraint_add_violations": int(cl_stats1["constraint_add_violations"]) + int(cl_stats2["constraint_add_violations"]),
+                    }
+                    if epoch % max(1, eval_log_every) == 0:
+                        print(
+                            f"[CL-VIEW][E{epoch:04d}] mode=edit_two_aug "
+                            f"g_edit_add={active_decoded_graph_added} g_edit_remove={active_decoded_graph_removed} "
+                            f"v1_add={edit_two_aug_view_stats['v1_added']} v1_remove={edit_two_aug_view_stats['v1_removed']} "
+                            f"v2_add={edit_two_aug_view_stats['v2_added']} v2_remove={edit_two_aug_view_stats['v2_removed']} "
+                            f"jaccard={edit_two_aug_view_stats['jaccard']:.6f} "
+                            f"min_deg_v1={edit_two_aug_view_stats['v1_min_degree']} min_deg_v2={edit_two_aug_view_stats['v2_min_degree']} "
+                            f"degree_viol={edit_two_aug_view_stats['degree_violations']} "
+                            f"constraint_add_viol={edit_two_aug_view_stats['constraint_add_violations']} "
+                            f"cl_loss={float(edit_two_aug_cl_loss.detach().cpu()):.6f}"
+                        )
+                except RuntimeError as e:
+                    if not (skip_oom_epoch and _is_cuda_oom_like(e)):
+                        raise
+                    print(f"[OOM-FALLBACK] epoch={epoch} edit_two_aug_cl_loss=0: {e}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            elif epoch % max(1, eval_log_every) == 0:
+                print(f"[CL-VIEW][E{epoch:04d}] mode=edit_two_aug waiting_for_active_g_edit=1")
+        else:
+            try:
+                cross_view_loss = inter_view_CL_loss(device, hidden_repr, encoder.Z.detach(), adj_label, delta, temperature)
+            except RuntimeError as e:
+                if not (skip_oom_epoch and _is_cuda_oom_like(e)):
+                    raise
+                print(f"[OOM-FALLBACK] epoch={epoch} cross_view_loss=0: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         aug_loss = bias_Z.new_tensor(0.0)
         maskgae_aug_feat_loss = bias_Z.new_tensor(0.0)
         cimage_aug_factor_loss = bias_Z.new_tensor(0.0)
         cimage_aug_cluster_loss = bias_Z.new_tensor(0.0)
-        try:
-            (
-                aug_loss,
-                maskgae_aug_feat_loss,
-                cimage_aug_factor_loss,
-                cimage_aug_cluster_loss,
-            ) = _encoder_reconstruction_loss(dot_product_decode(bias_Z)) # aug_loss = loss_function(dot_product_decode(bias_Z), aug_adj_labels[i], encoder.mean, encoder.logstd, aug_norms[i], aug_weight_tensors[i], alpha, beta, train_mask)
-        except RuntimeError as e:
-            if not (skip_oom_epoch and _is_cuda_oom_like(e)):
-                raise
-            print(f"[OOM-FALLBACK] epoch={epoch} aug_loss=0: {e}")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if cl_mode != "edit_two_aug":
+            try:
+                (
+                    aug_loss,
+                    maskgae_aug_feat_loss,
+                    cimage_aug_factor_loss,
+                    cimage_aug_cluster_loss,
+                ) = _encoder_reconstruction_loss(dot_product_decode(bias_Z)) # aug_loss = loss_function(dot_product_decode(bias_Z), aug_adj_labels[i], encoder.mean, encoder.logstd, aug_norms[i], aug_weight_tensors[i], alpha, beta, train_mask)
+            except RuntimeError as e:
+                if not (skip_oom_epoch and _is_cuda_oom_like(e)):
+                    raise
+                print(f"[OOM-FALLBACK] epoch={epoch} aug_loss=0: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         edit_recon_loss = bias_Z.new_tensor(0.0)
         edit_keep_loss = bias_Z.new_tensor(0.0)
@@ -6326,6 +6850,10 @@ def train_encoder(
                         warm_pull_mask,
                         pull_strength=editor_pull_strength,
                         c0p_mask=warm_c0p_mask,
+                        pull_profile=editor_pull_profile,
+                        pull_tau=editor_pull_tau,
+                        pull_deadzone=editor_pull_deadzone,
+                        pull_anchor=editor_pull_anchor,
                         push_scope=editor_push_scope,
                         noncompact_push_strength=editor_noncompact_push_strength,
                         noise_push_strength=editor_noise_push_strength,
@@ -6371,6 +6899,19 @@ def train_encoder(
                 pull_mask = c0p_mask_epoch if pull_mask_scope == "c0p" else cp_mask_epoch
                 compactness_mask = c0p_mask_epoch if compactness_mask_scope == "c0p" else cp_mask_epoch
                 rewrite_mask = c0p_mask_epoch if rewrite_endpoint_scope == "c0p" else cp_mask_epoch
+                edit_active_graph_context = (
+                    active_decoded_aug_graph_dense
+                    if use_decoded_graph_augment and active_decoded_aug_graph_dense is not None
+                    else None
+                )
+                edit_pair_context = (
+                    active_decoded_pair_context
+                    if edit_active_graph_context is not None and active_decoded_pair_context is not None
+                    else None
+                )
+                edit_structural_support_mask = None
+                if edit_pair_context is None:
+                    edit_structural_support_mask = _decoded_structural_support_cached(_to_dense(adj_label))
 
                 z_edit, pull_push_diag_epoch = direct_pull_latent_per_cluster(
                     edit_seed,
@@ -6378,13 +6919,17 @@ def train_encoder(
                     pull_mask,
                     pull_strength=editor_pull_strength,
                     c0p_mask=c0p_mask_epoch,
+                    pull_profile=editor_pull_profile,
+                    pull_tau=editor_pull_tau,
+                    pull_deadzone=editor_pull_deadzone,
+                    pull_anchor=editor_pull_anchor,
                     push_scope=editor_push_scope,
                     noncompact_push_strength=editor_noncompact_push_strength,
                     noise_push_strength=editor_noise_push_strength,
                     push_preserve_norm=editor_push_preserve_norm,
                     return_diagnostics=True,
                 )
-                _set_struct_decoder_context(None, edit_labels_epoch, c0p_mask_epoch)
+                _set_struct_decoder_context(edit_active_graph_context, edit_labels_epoch, c0p_mask_epoch)
                 pairwise_decoder_training = isinstance(graph_decoder, (MLPPairGraphDecoder, StructuralPairGraphDecoder))
                 if decoder_objective == "recon":
                     if pairwise_decoder_training:
@@ -6434,7 +6979,7 @@ def train_encoder(
                             structural_min_cn=decoded_struct_min_cn,
                             structural_min_ra=decoded_struct_min_ra,
                             structural_min_aa=decoded_struct_min_aa,
-                            structural_support_mask=_decoded_structural_support_cached(_to_dense(adj_label)),
+                            structural_support_mask=edit_structural_support_mask,
                             keep_weight=decoder_keep_weight,
                             add_rank_weight=decoder_add_rank_weight,
                             remove_rank_weight=decoder_remove_rank_weight,
@@ -6442,6 +6987,7 @@ def train_encoder(
                             rank_strategy=decoder_rank_strategy,
                             rank_neg_k=decoder_rank_neg_k,
                             rank_pool_factor=decoder_rank_pool_factor,
+                            pair_context=edit_pair_context,
                         )
                     else:
                         A_edit_pred = graph_decoder(z_edit)
@@ -6478,7 +7024,7 @@ def train_encoder(
                             structural_min_cn=decoded_struct_min_cn,
                             structural_min_ra=decoded_struct_min_ra,
                             structural_min_aa=decoded_struct_min_aa,
-                            structural_support_mask=_decoded_structural_support_cached(_to_dense(adj_label)),
+                            structural_support_mask=edit_structural_support_mask,
                             keep_weight=decoder_keep_weight,
                             add_rank_weight=decoder_add_rank_weight,
                             remove_rank_weight=decoder_remove_rank_weight,
@@ -6486,6 +7032,7 @@ def train_encoder(
                             rank_strategy=decoder_rank_strategy,
                             rank_neg_k=decoder_rank_neg_k,
                             rank_pool_factor=decoder_rank_pool_factor,
+                            pair_context=edit_pair_context,
                         )
                 else:
                     raise ValueError(f"Unsupported decoder_objective={decoder_objective}")
@@ -6543,6 +7090,19 @@ def train_encoder(
             except Exception as e:
                 print(f"[EDIT][TRAIN] edited branch failed at epoch {epoch}: {e}")
 
+        prediction_train_z = Z
+        prediction_context_dense = _to_dense(adj_label)
+        prediction_using_edit_graph_this_epoch = 0
+        if (
+            prediction_graph == "edit"
+            and use_decoded_graph_augment
+            and _decoded_edit_active(epoch)
+            and active_decoded_aug_graph_dense is not None
+        ):
+            prediction_train_z = bias_Z
+            prediction_context_dense = active_decoded_aug_graph_dense
+            prediction_using_edit_graph_this_epoch = 1
+
         prediction_rank_loss = bias_Z.new_tensor(0.0)
         prediction_bce_loss = bias_Z.new_tensor(0.0)
         prediction_joint_rank_loss = bias_Z.new_tensor(0.0)
@@ -6569,7 +7129,7 @@ def train_encoder(
             try:
                 pred_labels, pred_c0p_mask = resolve_edit_targets(
                     pred_z.detach(),
-                    _to_dense(adj_label),
+                    prediction_context_dense,
                     freeze_targets=freeze_c0p_at_edit_start,
                     fixed_labels=fixed_c0p_labels,
                     fixed_mask=fixed_c0p_mask,
@@ -6578,7 +7138,7 @@ def train_encoder(
                     restrict_alpha=restrict_alpha,
                     restrict_gamma=restrict_gamma,
                 )
-                _set_prediction_decoder_context(None, pred_labels, pred_c0p_mask)
+                _set_prediction_decoder_context(prediction_context_dense, pred_labels, pred_c0p_mask)
                 if prediction_rank_weight != 0.0:
                     pred_rank, pred_debug = heart_train_margin_ranking_loss_pairs(
                         prediction_decoder,
@@ -6613,14 +7173,14 @@ def train_encoder(
                 prediction_rank_loss,
                 prediction_bce_loss,
                 prediction_debug,
-            ) = _prediction_objective(Z.detach())
+            ) = _prediction_objective(prediction_train_z.detach())
             if prediction_encoder_weight != 0.0 and epoch >= prediction_joint_start_epoch:
                 (
                     prediction_joint_total_loss,
                     prediction_joint_rank_loss,
                     prediction_joint_bce_loss,
                     _,
-                ) = _prediction_objective(Z)
+                ) = _prediction_objective(prediction_train_z)
                 prediction_total_loss = prediction_total_loss + prediction_encoder_weight * prediction_joint_total_loss
 
         if (
@@ -6641,17 +7201,21 @@ def train_encoder(
             # intra_CL = inter_view_CL_loss(device, bias_Z, bias_Z, adj_label, gamma, temperature)
         # else:
         intra_CL = bias_Z.new_tensor(0.0)
-        try:
-            intra_CL = intra_view_CL_loss(device, bias_Z, adj_label, gamma, temperature)
-        except RuntimeError as e:
-            if not (skip_oom_epoch and _is_cuda_oom_like(e)):
-                raise
-            print(f"[OOM-FALLBACK] epoch={epoch} intra_CL=0: {e}")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if cl_mode != "edit_two_aug":
+            try:
+                intra_CL = intra_view_CL_loss(device, bias_Z, adj_label, gamma, temperature)
+            except RuntimeError as e:
+                if not (skip_oom_epoch and _is_cuda_oom_like(e)):
+                    raise
+                print(f"[OOM-FALLBACK] epoch={epoch} intra_CL=0: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         aug_losses = aug_loss + intra_CL
 
-        base_task_loss = loss + cross_view_loss + aug_losses * aug_graph_weight
+        if cl_mode == "edit_two_aug":
+            base_task_loss = loss + edit_two_aug_cl_loss * aug_graph_weight
+        else:
+            base_task_loss = loss + cross_view_loss + aug_losses * aug_graph_weight
 
         if separate_edit_training and in_edit_phase and use_edited_decoder and (graph_decoder is not None):
             if phase2_task_main_loss:
@@ -6659,7 +7223,7 @@ def train_encoder(
                 if edit_phase_retain_recon_weight != 0.0:
                     loss = loss + edit_phase_retain_recon_weight * (recon_loss + aug_loss)
                 if edit_phase_retain_cl_weight != 0.0:
-                    loss = loss + edit_phase_retain_cl_weight * (ori_intra_CL + cross_view_loss + intra_CL)
+                    loss = loss + edit_phase_retain_cl_weight * (ori_intra_CL + cross_view_loss + intra_CL + edit_two_aug_cl_loss)
                 if edit_phase_edit_weight != 0.0:
                     loss = loss + edit_phase_edit_weight * edit_total_loss
             else:
@@ -6668,7 +7232,7 @@ def train_encoder(
                 if edit_phase_retain_recon_weight != 0.0:
                     loss = loss + edit_phase_retain_recon_weight * (recon_loss + aug_loss)
                 if edit_phase_retain_cl_weight != 0.0:
-                    loss = loss + edit_phase_retain_cl_weight * (ori_intra_CL + cross_view_loss + intra_CL)
+                    loss = loss + edit_phase_retain_cl_weight * (ori_intra_CL + cross_view_loss + intra_CL + edit_two_aug_cl_loss)
         else:
             loss = base_task_loss
             if _decoder_warmup_active(epoch):
@@ -6745,7 +7309,19 @@ def train_encoder(
         # print(f"test time {time.time()-t1:.2f} s")
         with torch.no_grad():
             inference_time_start = time.time()
-            Z = encoder(features, edge_index) # Z = encoder(features, adj_norm)
+            eval_edge_index = edge_index
+            eval_adj_dense = _to_dense(adj_label)
+            eval_prediction_graph_active = 0
+            if prediction_graph == "edit":
+                if active_decoded_aug_edge_index is not None and active_decoded_aug_graph_dense is not None:
+                    eval_edge_index = active_decoded_aug_edge_index
+                    eval_adj_dense = active_decoded_aug_graph_dense
+                    eval_prediction_graph_active = 1
+                elif decoded_static_view_enabled and static_decoded_aug_edge_index is not None and static_decoded_aug_graph_dense is not None:
+                    eval_edge_index = static_decoded_aug_edge_index
+                    eval_adj_dense = static_decoded_aug_graph_dense
+                    eval_prediction_graph_active = 1
+            Z = encoder(features, eval_edge_index) # Z = encoder(features, adj_norm)
             if is_heart:
                 should_eval = (epoch % max(1, heart_eval_every) == 0) or (epoch == num_epoch - 1)
             else:
@@ -6767,7 +7343,7 @@ def train_encoder(
                 try:
                     score_labels, score_c0p_mask = resolve_edit_targets(
                         Z,
-                        _to_dense(adj_label),
+                        eval_adj_dense,
                         freeze_targets=freeze_c0p_at_edit_start,
                         fixed_labels=fixed_c0p_labels,
                         fixed_mask=fixed_c0p_mask,
@@ -6777,9 +7353,9 @@ def train_encoder(
                         restrict_gamma=restrict_gamma,
                     )
                     if score_source == "decoder" and use_edited_decoder and (graph_decoder is not None):
-                        _set_struct_decoder_context(None, score_labels, score_c0p_mask)
+                        _set_struct_decoder_context(eval_adj_dense, score_labels, score_c0p_mask)
                     if prediction_decoder is not None:
-                        _set_prediction_decoder_context(None, score_labels, score_c0p_mask)
+                        _set_prediction_decoder_context(eval_adj_dense, score_labels, score_c0p_mask)
                 except Exception as e:
                     print(f"[DECODER-DIAG] score context failed at epoch {epoch}: {e}")
             A_pred = None
@@ -6886,7 +7462,9 @@ def train_encoder(
                                 noncompact_radius_p90_after = noncompact_radius_p90_before
                                 noncompact_radius_max_after = noncompact_radius_max_before
                         else:
-                            if decoded_static_view_enabled and static_decoded_aug_edge_index is not None:
+                            if active_decoded_aug_edge_index is not None:
+                                Z_eval = encoder(features, active_decoded_aug_edge_index)
+                            elif decoded_static_view_enabled and static_decoded_aug_edge_index is not None:
                                 Z_eval = encoder(features, static_decoded_aug_edge_index)
                             else:
                                 Z_pull_eval = direct_pull_latent_per_cluster(
@@ -6895,6 +7473,10 @@ def train_encoder(
                                     eval_pull_mask,
                                     pull_strength=editor_pull_strength,
                                     c0p_mask=eval_c0p_mask,
+                                    pull_profile=editor_pull_profile,
+                                    pull_tau=editor_pull_tau,
+                                    pull_deadzone=editor_pull_deadzone,
+                                    pull_anchor=editor_pull_anchor,
                                     push_scope=editor_push_scope,
                                     noncompact_push_strength=editor_noncompact_push_strength,
                                     noise_push_strength=editor_noise_push_strength,
@@ -6990,6 +7572,10 @@ def train_encoder(
                             eval_pull_mask,
                             pull_strength=editor_pull_strength,
                             c0p_mask=eval_c0p_mask,
+                            pull_profile=editor_pull_profile,
+                            pull_tau=editor_pull_tau,
+                            pull_deadzone=editor_pull_deadzone,
+                            pull_anchor=editor_pull_anchor,
                             push_scope=editor_push_scope,
                             noncompact_push_strength=editor_noncompact_push_strength,
                             noise_push_strength=editor_noise_push_strength,
@@ -7283,6 +7869,10 @@ def train_encoder(
                 f"pred_rank={float(prediction_rank_loss.detach().cpu()):.6f} pred_bce={float(prediction_bce_loss.detach().cpu()):.6f} "
                 f"pred_joint_rank={float(prediction_joint_rank_loss.detach().cpu()):.6f} pred_joint_bce={float(prediction_joint_bce_loss.detach().cpu()):.6f} "
                 f"pred_extra_reg={float(prediction_extra_reg_loss.detach().cpu()):.6f} "
+                f"cl_mode={cl_mode} edit_two_aug_cl={float(edit_two_aug_cl_loss.detach().cpu()):.6f} "
+                f"cl_view_jaccard={float(edit_two_aug_view_stats['jaccard']):.6f} "
+                f"pred_graph={prediction_graph} pred_graph_train_edit_active={int(prediction_using_edit_graph_this_epoch)} "
+                f"pred_graph_eval_edit_active={int(eval_prediction_graph_active)} "
                 f"compact={float(edit_compact_loss.detach().cpu()):.6f} compact_radius={float(edit_compact_radius_loss.detach().cpu()):.6f} "
                 f"compact_proto={float(edit_compact_proto_loss.detach().cpu()):.6f} "
                 f"preserve={float(edit_preserve_loss.detach().cpu()):.6f} "
@@ -7373,7 +7963,13 @@ def train_encoder(
         # --------- SELECT BEST BY VALIDATION METRIC (NO TEST LEAKAGE) ---------
         checkpoint_metric_label = heart_checkpoint_metric if is_heart else random_checkpoint_metric
         checkpoint_score = _checkpoint_score(checkpoint_metric_label, val_roc, val_ap, val_hit)
-        if ((not is_heart) or ran_full_val) and np.isfinite(checkpoint_score) and (checkpoint_score > best_checkpoint_score):
+        checkpoint_graph_ready = (prediction_graph != "edit") or bool(eval_prediction_graph_active)
+        if (
+            checkpoint_graph_ready
+            and ((not is_heart) or ran_full_val)
+            and np.isfinite(checkpoint_score)
+            and (checkpoint_score > best_checkpoint_score)
+        ):
             best_checkpoint_score = checkpoint_score
             best_val_roc = val_roc
             best_val_ap = val_ap
@@ -7391,7 +7987,10 @@ def train_encoder(
                 best_state_cpu["prediction_decoder"] = {
                     k: v.detach().cpu().clone() for k, v in prediction_decoder.state_dict().items()
                 }
-            if decoded_accumulate_into_base:
+            if prediction_graph == "edit" and active_decoded_aug_graph_dense is not None:
+                best_graph_dense_cpu = active_decoded_aug_graph_dense.detach().cpu().clone()
+                best_state_cpu["graph_dense"] = best_graph_dense_cpu
+            elif decoded_accumulate_into_base:
                 best_graph_dense_cpu = _to_dense(adj_label).detach().cpu().clone()
                 best_state_cpu["graph_dense"] = best_graph_dense_cpu
 
@@ -7464,6 +8063,18 @@ def train_encoder(
                 "prediction_joint_rank": float(prediction_joint_rank_loss.detach().cpu()),
                 "prediction_joint_bce": float(prediction_joint_bce_loss.detach().cpu()),
                 "prediction_extra_reg": float(prediction_extra_reg_loss.detach().cpu()),
+                "cl_mode": cl_mode,
+                "edit_two_aug_cl": float(edit_two_aug_cl_loss.detach().cpu()),
+                "cl_view_jaccard": float(edit_two_aug_view_stats["jaccard"]),
+                "cl_view1_added": int(edit_two_aug_view_stats["v1_added"]),
+                "cl_view1_removed": int(edit_two_aug_view_stats["v1_removed"]),
+                "cl_view2_added": int(edit_two_aug_view_stats["v2_added"]),
+                "cl_view2_removed": int(edit_two_aug_view_stats["v2_removed"]),
+                "cl_view_degree_violations": int(edit_two_aug_view_stats["degree_violations"]),
+                "cl_view_constraint_add_violations": int(edit_two_aug_view_stats["constraint_add_violations"]),
+                "prediction_graph": prediction_graph,
+                "prediction_graph_train_edit_active": int(prediction_using_edit_graph_this_epoch),
+                "prediction_graph_eval_edit_active": int(eval_prediction_graph_active),
                 "prediction_rank_pairs": int(prediction_debug.get("heart_rank_pairs", 0)),
                 "prediction_rank_pos": int(prediction_debug.get("heart_rank_pos", 0)),
                 "prediction_rank_neg_pool": int(prediction_debug.get("heart_rank_neg_pool", 0)),
@@ -7532,6 +8143,82 @@ def train_encoder(
                 print(f"[CKPT] Saved best-by-val {checkpoint_metric_label} at epoch {epoch} -> {best_ckpt_path_runtime}")
             except Exception as e:
                 print(f"[CKPT] Warning: failed to save best checkpoint: {e}")
+
+        if phase_cache_path and (not phase_cache_saved) and epoch == phase_cache_save_epoch:
+            try:
+                phase_dir = os.path.dirname(phase_cache_path)
+                if phase_dir:
+                    os.makedirs(phase_dir, exist_ok=True)
+                phase_state = {
+                    "epoch": int(epoch),
+                    "dataset": str(dataset_str),
+                    "seed": int(seed) if seed is not None else None,
+                    "run_tag": str(run_tag),
+                    "ver": str(ver),
+                    "encoder": encoder.state_dict(),
+                    "graph_decoder": graph_decoder.state_dict() if graph_decoder is not None else None,
+                    "prediction_decoder": prediction_decoder.state_dict() if prediction_decoder is not None else None,
+                    "optimizer": optimizer.state_dict(),
+                    "best_state": best_state_cpu,
+                    "best_meta": best_meta_cpu,
+                    "best_val_roc": float(best_val_roc),
+                    "best_val_ap": float(best_val_ap),
+                    "best_epoch": int(best_epoch),
+                    "best_checkpoint_score": float(best_checkpoint_score),
+                    "best_val_roc_subset": float(best_val_roc_subset),
+                    "best_val_ap_subset": float(best_val_ap_subset),
+                    "best_subset_epoch": int(best_subset_epoch),
+                    "best_subset_checkpoint_score": float(best_subset_checkpoint_score),
+                    "stage1_anchor_Z": stage1_anchor_Z.detach().cpu() if stage1_anchor_Z is not None else None,
+                    "stage1_anchor_graph_dense": (
+                        stage1_anchor_graph_dense.detach().cpu()
+                        if stage1_anchor_graph_dense is not None
+                        else None
+                    ),
+                    "fixed_c0p_labels": (
+                        np.asarray(fixed_c0p_labels, dtype=np.int64)
+                        if fixed_c0p_labels is not None
+                        else None
+                    ),
+                    "fixed_c0p_mask": fixed_c0p_mask.detach().cpu() if fixed_c0p_mask is not None else None,
+                    "frozen_gmm_labels": (
+                        np.asarray(frozen_gmm_labels, dtype=np.int64)
+                        if frozen_gmm_labels is not None
+                        else None
+                    ),
+                    "frozen_core_mask": (
+                        np.asarray(frozen_core_mask, dtype=bool)
+                        if frozen_core_mask is not None
+                        else None
+                    ),
+                    "stage1_phase_boundary_logged": bool(stage1_phase_boundary_logged),
+                    "phase_cache_load_mode": str(phase_cache_load_mode),
+                    "edit_train_start_epoch": int(edit_train_start_epoch),
+                    "decoded_rewrite_start_epoch": int(decoded_rewrite_start_epoch),
+                    "prediction_joint_start_epoch": int(prediction_joint_start_epoch),
+                    "decoder_warmup_in_phase1": int(decoder_warmup_in_phase1),
+                    "decoder_warmup_recon_weight": float(decoder_warmup_recon_weight),
+                    "editor_pull_strength": float(editor_pull_strength),
+                    "editor_pull_profile": str(editor_pull_profile),
+                    "editor_pull_tau": float(editor_pull_tau),
+                    "editor_pull_deadzone": float(editor_pull_deadzone),
+                    "editor_pull_anchor": str(editor_pull_anchor),
+                    "prediction_decoder_type": str(prediction_decoder_type),
+                    "decoder_type": str(decoder_type),
+                    "hidden1": int(hidden1),
+                    "hidden2": int(hidden2),
+                    "dropout": float(dropout),
+                    "learning_rate": float(learning_rate),
+                    "weight_decay": float(weight_decay),
+                    "feat_mask_ratio": float(feat_maske_ratio),
+                    "cl_mode": str(cl_mode),
+                    "prediction_graph": str(prediction_graph),
+                }
+                torch.save(phase_state, phase_cache_path)
+                phase_cache_saved = True
+                print(f"[PHASE-CACHE] Saved phase cache at epoch {epoch} -> {phase_cache_path}")
+            except Exception as e:
+                print(f"[PHASE-CACHE] Warning: failed to save phase cache: {e}")
                 
         # -------- offline C0p sweep with fixed encoder & fixed GMM ---------
     # side experiment：只在你開 ENABLE_C0P_SWEEP 時啟用
@@ -7613,6 +8300,11 @@ def train_encoder(
                 f'cimage_aug_factor_loss = {best_meta_cpu.get("cimage_aug_factor_loss", float("nan")):.6f}, '
                 f'cimage_aug_cluster_loss = {best_meta_cpu.get("cimage_aug_cluster_loss", float("nan")):.6f}, '
                 f'heart_rank_pairs = {best_meta_cpu.get("heart_rank_pairs", float("nan")):.0f}, '
+                f'cl_mode = {best_meta_cpu.get("cl_mode", cl_mode)}, '
+                f'edit_two_aug_cl = {best_meta_cpu.get("edit_two_aug_cl", float("nan")):.6f}, '
+                f'cl_view_jaccard = {best_meta_cpu.get("cl_view_jaccard", float("nan")):.6f}, '
+                f'prediction_graph = {best_meta_cpu.get("prediction_graph", prediction_graph)}, '
+                f'prediction_graph_eval_edit_active = {best_meta_cpu.get("prediction_graph_eval_edit_active", float("nan")):.0f}, '
                 f'prediction_rank = {best_meta_cpu.get("prediction_rank", float("nan")):.6f}, '
                 f'prediction_bce = {best_meta_cpu.get("prediction_bce", float("nan")):.6f}, '
                 f'prediction_extra_reg = {best_meta_cpu.get("prediction_extra_reg", float("nan")):.6f}, '
@@ -7686,7 +8378,7 @@ def train_encoder(
     else:
         print("[CKPT] No best checkpoint found; using last epoch weights.")
 
-    if decoded_accumulate_into_base and best_graph_dense_cpu is not None:
+    if best_graph_dense_cpu is not None:
         best_graph_dense = best_graph_dense_cpu.to(device)
         best_edge_index = best_graph_dense.to_sparse().indices()
         best_adj_label = best_graph_dense.to_sparse().coalesce()
@@ -7719,7 +8411,7 @@ def train_encoder(
                 if use_edited_decoder and (graph_decoder is not None):
                     _set_struct_decoder_context(best_adj_label, final_labels, final_c0p_mask)
                 if prediction_decoder is not None:
-                    _set_prediction_decoder_context(None, final_labels, final_c0p_mask)
+                    _set_prediction_decoder_context(best_adj_label, final_labels, final_c0p_mask)
             except Exception as e:
                 print(f"[DECODER-DIAG] final score context failed: {e}")
         if (use_edited_decoder and (graph_decoder is not None)) or (prediction_decoder is not None):
@@ -7775,7 +8467,7 @@ def train_encoder(
                     if dec_vals.size > 1 and pred_vals.size > 1 and np.std(dec_vals) > 0 and np.std(pred_vals) > 0:
                         final_score_diag["diag_decoder_pred_corr"] = float(np.corrcoef(dec_vals, pred_vals)[0, 1])
 
-    print(f"[SCORE] validation/test score_source={score_source}")
+    print(f"[SCORE] validation/test score_source={score_source} prediction_graph={prediction_graph} best_graph_saved={int(best_graph_dense_cpu is not None)}")
     final_test_roc, final_test_ap, final_test_hit = _evaluate_edges_for_source(
         Z_best,
         test_edges,
