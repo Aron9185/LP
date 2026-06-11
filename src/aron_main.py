@@ -79,6 +79,12 @@ parser.add_argument(
     help="Contrastive-learning mode. legacy keeps the inherited objective; edit_two_aug uses two constrained views sampled from G_edit.",
 )
 parser.add_argument(
+    "--edit_two_aug_cl_weight",
+    type=float,
+    default=1.0,
+    help="Additional weight for edit_two_aug symmetric InfoNCE. Keeps aug_graph_weight available for legacy/edit losses.",
+)
+parser.add_argument(
     "--prediction_graph",
     type=str,
     default="train",
@@ -499,6 +505,7 @@ def main():
         delta=args.delta,
         temperature=args.temperature,
         cl_mode=args.cl_mode,
+        edit_two_aug_cl_weight=args.edit_two_aug_cl_weight,
         prediction_graph=args.prediction_graph,
         labels=labels,
         idx_train=idx_train,
@@ -870,7 +877,7 @@ if __name__ == "__main__":
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} add_thr={args.decoded_add_threshold} remove_thr={args.decoded_remove_threshold} add_q={args.decoded_add_quantile} remove_q={args.decoded_remove_quantile} max_add={args.decoded_max_add_per_round} max_remove={args.decoded_max_remove_per_round}")
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} c0p_noncompact_endpoint={int(args.decoded_require_c0p_noncompact_endpoint)} per_node_cap={args.decoded_graph_aug_bound} add_degree_target={args.decoded_add_degree_target} add_degree_target_scope={args.decoded_add_degree_target_scope} add_degree_target_nodes={args.decoded_add_degree_target_nodes} guarantee_degree_target={int(args.decoded_guarantee_degree_target)}")
         print(f"decoded_struct_support_enabled={int(args.decoded_require_structural_support)} decoded_struct_support={args.decoded_struct_support} min_cn={args.decoded_struct_min_cn} min_ra={args.decoded_struct_min_ra} min_aa={args.decoded_struct_min_aa}")
-        print(f"cl_mode={args.cl_mode} prediction_graph={args.prediction_graph} feat_mask_ratio={args.feat_mask_ratio}")
+        print(f"cl_mode={args.cl_mode} edit_two_aug_cl_weight={args.edit_two_aug_cl_weight} prediction_graph={args.prediction_graph} feat_mask_ratio={args.feat_mask_ratio}")
         print(f"prediction_hard_residual_only={int(args.prediction_hard_residual_only)} prediction_hard_margin={args.prediction_hard_margin} prediction_dot_anchor_weight={args.prediction_dot_anchor_weight}")
         print("====================")
 

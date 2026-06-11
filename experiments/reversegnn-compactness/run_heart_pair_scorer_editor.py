@@ -260,6 +260,12 @@ def parse_args():
     parser.add_argument("--prediction-dot-anchor-weight", type=float, default=0.0)
     parser.add_argument("--prediction-encoder-weight", type=float, default=0.05)
     parser.add_argument("--prediction-joint-start-epoch", type=int, default=-1)
+    parser.add_argument(
+        "--edit-two-aug-cl-weight",
+        type=float,
+        default=1.0,
+        help="Additional weight forwarded to --edit_two_aug_cl_weight for edit_two_aug runs.",
+    )
     parser.add_argument("--prediction-gate-l1-weight", type=float, default=0.0)
     parser.add_argument("--prediction-h3-gate-init", type=float, default=-3.0)
     parser.add_argument("--prediction-residual-gate-init", type=float, default=-4.0)
@@ -469,6 +475,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--prediction_dot_anchor_weight", str(cfg.get("prediction_dot_anchor_weight", args.prediction_dot_anchor_weight)),
         "--prediction_encoder_weight", str(args.prediction_encoder_weight),
         "--prediction_joint_start_epoch", str(args.prediction_joint_start_epoch if args.prediction_joint_start_epoch >= 0 else args.decoded_rewrite_start_epoch),
+        "--edit_two_aug_cl_weight", str(args.edit_two_aug_cl_weight),
         "--prediction_gate_l1_weight", str(args.prediction_gate_l1_weight),
         "--prediction_h3_gate_init", str(args.prediction_h3_gate_init),
         "--prediction_residual_gate_init", str(args.prediction_residual_gate_init),
@@ -663,6 +670,10 @@ def main():
         "prediction_joint_rank",
         "prediction_joint_bce",
         "prediction_extra_reg",
+        "edit_two_aug_cl",
+        "edit_two_aug_cl_weight",
+        "edit_two_aug_cl_contrib",
+        "cl_view_jaccard",
         "prediction_rank_pairs",
         "prediction_rank_weight",
         "prediction_bce_weight",

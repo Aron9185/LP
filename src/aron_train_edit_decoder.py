@@ -3795,6 +3795,7 @@ def train_encoder(
     cl_mode = str(kwargs.get("cl_mode", "legacy") or "legacy").lower()
     if cl_mode not in {"legacy", "edit_two_aug"}:
         raise ValueError("cl_mode must be one of: legacy, edit_two_aug")
+    edit_two_aug_cl_weight = float(kwargs.get("edit_two_aug_cl_weight", 1.0))
     prediction_graph = str(kwargs.get("prediction_graph", "train") or "train").lower()
     if prediction_graph not in {"train", "edit"}:
         raise ValueError("prediction_graph must be one of: train, edit")
@@ -4556,7 +4557,8 @@ def train_encoder(
             f"rank_strategy={decoder_rank_strategy} rank_neg_k={decoder_rank_neg_k} rank_pool_factor={decoder_rank_pool_factor} | "
             f"heart_rank_w={heart_rank_weight} heart_margin={heart_rank_margin} "
             f"heart_neg_k={heart_rank_neg_k} heart_pool_factor={heart_rank_pool_factor} | "
-            f"cl_mode={cl_mode} prediction_graph={prediction_graph} feat_mask_ratio={feat_maske_ratio} | "
+            f"cl_mode={cl_mode} edit_two_aug_cl_weight={edit_two_aug_cl_weight} "
+            f"prediction_graph={prediction_graph} feat_mask_ratio={feat_maske_ratio} | "
             f"compactness_weight={compactness_weight} | preserve_weight={preserve_weight} | "
             f"c0p_noncompact_endpoint={int(decoded_require_c0p_noncompact_endpoint)} | "
             f"decoded_struct_support={int(decoded_require_structural_support)}:{decoded_struct_support} "
@@ -7213,8 +7215,10 @@ def train_encoder(
         aug_losses = aug_loss + intra_CL
 
         if cl_mode == "edit_two_aug":
-            base_task_loss = loss + edit_two_aug_cl_loss * aug_graph_weight
+            edit_two_aug_cl_contrib = edit_two_aug_cl_loss * edit_two_aug_cl_weight
+            base_task_loss = loss + edit_two_aug_cl_contrib
         else:
+            edit_two_aug_cl_contrib = edit_two_aug_cl_loss * 0.0
             base_task_loss = loss + cross_view_loss + aug_losses * aug_graph_weight
 
         if separate_edit_training and in_edit_phase and use_edited_decoder and (graph_decoder is not None):
@@ -7870,6 +7874,8 @@ def train_encoder(
                 f"pred_joint_rank={float(prediction_joint_rank_loss.detach().cpu()):.6f} pred_joint_bce={float(prediction_joint_bce_loss.detach().cpu()):.6f} "
                 f"pred_extra_reg={float(prediction_extra_reg_loss.detach().cpu()):.6f} "
                 f"cl_mode={cl_mode} edit_two_aug_cl={float(edit_two_aug_cl_loss.detach().cpu()):.6f} "
+                f"edit_two_aug_cl_weight={edit_two_aug_cl_weight:.6f} "
+                f"edit_two_aug_cl_contrib={float(edit_two_aug_cl_contrib.detach().cpu()):.6f} "
                 f"cl_view_jaccard={float(edit_two_aug_view_stats['jaccard']):.6f} "
                 f"pred_graph={prediction_graph} pred_graph_train_edit_active={int(prediction_using_edit_graph_this_epoch)} "
                 f"pred_graph_eval_edit_active={int(eval_prediction_graph_active)} "
@@ -8065,6 +8071,8 @@ def train_encoder(
                 "prediction_extra_reg": float(prediction_extra_reg_loss.detach().cpu()),
                 "cl_mode": cl_mode,
                 "edit_two_aug_cl": float(edit_two_aug_cl_loss.detach().cpu()),
+                "edit_two_aug_cl_weight": float(edit_two_aug_cl_weight),
+                "edit_two_aug_cl_contrib": float(edit_two_aug_cl_contrib.detach().cpu()),
                 "cl_view_jaccard": float(edit_two_aug_view_stats["jaccard"]),
                 "cl_view1_added": int(edit_two_aug_view_stats["v1_added"]),
                 "cl_view1_removed": int(edit_two_aug_view_stats["v1_removed"]),
@@ -8302,6 +8310,8 @@ def train_encoder(
                 f'heart_rank_pairs = {best_meta_cpu.get("heart_rank_pairs", float("nan")):.0f}, '
                 f'cl_mode = {best_meta_cpu.get("cl_mode", cl_mode)}, '
                 f'edit_two_aug_cl = {best_meta_cpu.get("edit_two_aug_cl", float("nan")):.6f}, '
+                f'edit_two_aug_cl_weight = {best_meta_cpu.get("edit_two_aug_cl_weight", float("nan")):.6f}, '
+                f'edit_two_aug_cl_contrib = {best_meta_cpu.get("edit_two_aug_cl_contrib", float("nan")):.6f}, '
                 f'cl_view_jaccard = {best_meta_cpu.get("cl_view_jaccard", float("nan")):.6f}, '
                 f'prediction_graph = {best_meta_cpu.get("prediction_graph", prediction_graph)}, '
                 f'prediction_graph_eval_edit_active = {best_meta_cpu.get("prediction_graph_eval_edit_active", float("nan")):.0f}, '
