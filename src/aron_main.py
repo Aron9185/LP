@@ -141,6 +141,12 @@ parser.add_argument(
     help="Validation metric used to select random/cimage-paper split checkpoints.",
 )
 parser.add_argument(
+    "--checkpoint_min_epoch",
+    type=int,
+    default=-1,
+    help="If >0, do not save best validation checkpoints before this 1-based epoch number.",
+)
+parser.add_argument(
     "--lp_train_graph",
     type=str,
     default="train",
@@ -541,6 +547,7 @@ def main():
         heart_val_frac=args.heart_val_frac,
         heart_checkpoint_metric=args.heart_checkpoint_metric,
         random_checkpoint_metric=args.random_checkpoint_metric,
+        checkpoint_min_epoch=args.checkpoint_min_epoch,
         lp_train_graph=args.lp_train_graph,
         # NEW
         dbscan_eps=args.dbscan_eps,
@@ -878,6 +885,7 @@ if __name__ == "__main__":
         print(f"decoded_add_ratio={args.decoded_add_ratio} decoded_remove_ratio={args.decoded_remove_ratio} same_cluster_only={int(args.decoded_same_cluster_only)} c0p_endpoint={int(args.decoded_require_c0p_endpoint)} both_c0p={int(args.decoded_require_both_c0p)} c0p_noncompact_endpoint={int(args.decoded_require_c0p_noncompact_endpoint)} per_node_cap={args.decoded_graph_aug_bound} add_degree_target={args.decoded_add_degree_target} add_degree_target_scope={args.decoded_add_degree_target_scope} add_degree_target_nodes={args.decoded_add_degree_target_nodes} guarantee_degree_target={int(args.decoded_guarantee_degree_target)}")
         print(f"decoded_struct_support_enabled={int(args.decoded_require_structural_support)} decoded_struct_support={args.decoded_struct_support} min_cn={args.decoded_struct_min_cn} min_ra={args.decoded_struct_min_ra} min_aa={args.decoded_struct_min_aa}")
         print(f"cl_mode={args.cl_mode} edit_two_aug_cl_weight={args.edit_two_aug_cl_weight} prediction_graph={args.prediction_graph} feat_mask_ratio={args.feat_mask_ratio}")
+        print(f"checkpoint_min_epoch={args.checkpoint_min_epoch} random_checkpoint_metric={args.random_checkpoint_metric} heart_checkpoint_metric={args.heart_checkpoint_metric}")
         print(f"prediction_hard_residual_only={int(args.prediction_hard_residual_only)} prediction_hard_margin={args.prediction_hard_margin} prediction_dot_anchor_weight={args.prediction_dot_anchor_weight}")
         print("====================")
 

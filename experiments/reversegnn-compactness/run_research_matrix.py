@@ -291,6 +291,7 @@ def extract_metrics(log_path: Path) -> dict:
         "heart_rank_weight": summary.get("heart_rank_weight", float("nan")),
         "heart_rank_margin": summary.get("heart_rank_margin", float("nan")),
         "heart_rank_neg_k": summary.get("heart_rank_neg_k", float("nan")),
+        "checkpoint_min_epoch": summary.get("checkpoint_min_epoch", float("nan")),
         "diag_dot_val_hit10": summary.get("diag_dot_val_hit10", float("nan")),
         "diag_decoder_val_hit10": summary.get("diag_decoder_val_hit10", float("nan")),
         "diag_pred_val_hit10": summary.get("diag_pred_val_hit10", float("nan")),

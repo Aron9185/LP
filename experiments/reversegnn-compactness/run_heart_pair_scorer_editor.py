@@ -113,6 +113,17 @@ PAIR_SCORER_CONFIGS = [
         "prediction_graph": "edit",
     },
     {
+        "name": "edit_two_aug_pred_edit_c0p_budget",
+        "family": "edit_two_aug_pred_edit_c0p_budget",
+        "score_source": "pred_decoder",
+        "prediction_decoder_type": "pair_residual_struct_compact_multi",
+        "use_edit_decoder": True,
+        "remove": False,
+        "prediction_dot_anchor_weight": 0.10,
+        "cl_mode": "edit_two_aug",
+        "prediction_graph": "edit",
+    },
+    {
         "name": "two_decoder_compact_struct_full_pred_remove",
         "family": "two_decoder_compact_struct_push_remove",
         "score_source": "pred_decoder",
@@ -326,6 +337,12 @@ def parse_args():
         default="roc",
         help="Validation metric used by random/cimage-paper split checkpoint selection.",
     )
+    parser.add_argument(
+        "--checkpoint-min-epoch",
+        type=int,
+        default=-1,
+        help="Forwarded to --checkpoint_min_epoch; if >0, best checkpoints are not saved before this 1-based epoch.",
+    )
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -424,6 +441,7 @@ def run_one(task: tuple[int, int, dict, str, int], args) -> dict:
         "--epochs", str(args.epochs),
         "--split_mode", args.split_mode,
         "--random_checkpoint_metric", args.random_checkpoint_metric,
+        "--checkpoint_min_epoch", str(args.checkpoint_min_epoch),
         "--edit_start_epoch", str(args.edit_start_epoch),
         "--edit_train_start_epoch", str(args.edit_train_start_epoch),
         "--decoded_rewrite_start_epoch", str(args.decoded_rewrite_start_epoch),
@@ -690,6 +708,7 @@ def main():
         "heart_rank_weight",
         "heart_rank_margin",
         "heart_rank_neg_k",
+        "checkpoint_min_epoch",
         "selection_score",
         "diag_dot_val_hit10",
         "diag_decoder_val_hit10",

@@ -3959,6 +3959,7 @@ def train_encoder(
     checkpoint_metric_choices = {"roc", "ap", *checkpoint_hit_index.keys()}
     heart_checkpoint_metric = str(kwargs.get("heart_checkpoint_metric", "roc")).lower()
     random_checkpoint_metric = str(kwargs.get("random_checkpoint_metric", "roc")).lower()
+    checkpoint_min_epoch = int(kwargs.get("checkpoint_min_epoch", -1) or -1)
     if heart_checkpoint_metric not in checkpoint_metric_choices:
         raise ValueError(f"Unsupported heart_checkpoint_metric: {heart_checkpoint_metric}")
     if random_checkpoint_metric not in checkpoint_metric_choices:
@@ -4604,7 +4605,8 @@ def train_encoder(
         f"skip_train_acc={int(skip_train_acc)} decoder_diag_every={decoder_diag_every} "
         f"edit_metric_every={edit_metric_every} decoded_audit_every={decoded_audit_every} "
         f"decoded_audit_max_edges={decoded_audit_max_edges} edge_eval={int(edge_eval)} heart_eval_every={heart_eval_every} "
-        f"heart_val_frac={heart_val_frac} random_checkpoint_metric={random_checkpoint_metric}"
+        f"heart_val_frac={heart_val_frac} random_checkpoint_metric={random_checkpoint_metric} "
+        f"checkpoint_min_epoch={checkpoint_min_epoch}"
     )
 
     def _edit_allowed_before_end(ep: int) -> bool:
@@ -7970,8 +7972,10 @@ def train_encoder(
         checkpoint_metric_label = heart_checkpoint_metric if is_heart else random_checkpoint_metric
         checkpoint_score = _checkpoint_score(checkpoint_metric_label, val_roc, val_ap, val_hit)
         checkpoint_graph_ready = (prediction_graph != "edit") or bool(eval_prediction_graph_active)
+        checkpoint_epoch_ready = checkpoint_min_epoch <= 0 or (epoch + 1) >= checkpoint_min_epoch
         if (
             checkpoint_graph_ready
+            and checkpoint_epoch_ready
             and ((not is_heart) or ran_full_val)
             and np.isfinite(checkpoint_score)
             and (checkpoint_score > best_checkpoint_score)
@@ -8141,6 +8145,7 @@ def train_encoder(
                 "edit_preserve": float(edit_preserve_loss.detach().cpu()),
                 "selection_metric": checkpoint_metric_label,
                 "selection_score": float(checkpoint_score),
+                "checkpoint_min_epoch": int(checkpoint_min_epoch),
             }
 
             # also save to disk (optional, helpful for crashes / later reuse)
@@ -8315,6 +8320,7 @@ def train_encoder(
                 f'cl_view_jaccard = {best_meta_cpu.get("cl_view_jaccard", float("nan")):.6f}, '
                 f'prediction_graph = {best_meta_cpu.get("prediction_graph", prediction_graph)}, '
                 f'prediction_graph_eval_edit_active = {best_meta_cpu.get("prediction_graph_eval_edit_active", float("nan")):.0f}, '
+                f'checkpoint_min_epoch = {best_meta_cpu.get("checkpoint_min_epoch", checkpoint_min_epoch):.0f}, '
                 f'prediction_rank = {best_meta_cpu.get("prediction_rank", float("nan")):.6f}, '
                 f'prediction_bce = {best_meta_cpu.get("prediction_bce", float("nan")):.6f}, '
                 f'prediction_extra_reg = {best_meta_cpu.get("prediction_extra_reg", float("nan")):.6f}, '
@@ -8598,6 +8604,7 @@ def train_encoder(
             f"heart_rank_weight={float(best_meta_cpu.get('heart_rank_weight', float('nan'))):.6f} "
             f"heart_rank_margin={float(best_meta_cpu.get('heart_rank_margin', float('nan'))):.6f} "
             f"heart_rank_neg_k={float(best_meta_cpu.get('heart_rank_neg_k', float('nan'))):.0f} "
+            f"checkpoint_min_epoch={float(best_meta_cpu.get('checkpoint_min_epoch', checkpoint_min_epoch)):.0f} "
             f"selection_score={float(best_meta_cpu.get('selection_score', float('nan'))):.6f} "
             f"diag_dot_val_hit10={float(best_meta_cpu.get('diag_dot_val_hit10', float('nan'))):.6f} "
             f"diag_decoder_val_hit10={float(best_meta_cpu.get('diag_decoder_val_hit10', float('nan'))):.6f} "
